@@ -1,0 +1,72 @@
+{
+  "name": "pi-web",
+  "version": "0.1.0",
+  "description": "A lightweight web UI/server for the pi coding agent.",
+  "type": "module",
+  "bin": {
+    "pi-web": "dist/server/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "APP.md"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "tsx watch src/server/cli.ts --dev",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "npm run build:web && npm run build:server",
+    "build:web": "vite build",
+    "build:server": "tsc -p tsconfig.server.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
+    "start": "node dist/server/cli.js"
+  },
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "web",
+    "solidjs",
+    "fastify"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.1",
+    "@fastify/cookie": "^11.0.0",
+    "@fastify/multipart": "^10.0.0",
+    "@fastify/static": "^9.1.3",
+    "@fastify/websocket": "^11.0.0",
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/jetbrains-mono": "^5.2.8",
+    "@tailwindcss/postcss": "^4.3.0",
+    "@tanstack/solid-query": "^5.101.0",
+    "@tanstack/solid-virtual": "^3.13.28",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "fastify": "^5.6.0",
+    "lucide-solid": "^1.17.0",
+    "marked": "^18.0.5",
+    "monaco-editor": "^0.55.0",
+    "node-pty": "^1.1.0",
+    "shiki": "^4.2.0",
+    "solid-js": "^1.9.0",
+    "sortablejs": "^1.15.7"
+  },
+  "overrides": {
+    "dompurify": "^3.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/sortablejs": "^1.15.9",
+    "@vitejs/plugin-basic-ssl": "^2.1.0",
+    "autoprefixer": "^10.4.0",
+    "postcss": "^8.5.0",
+    "tailwindcss": "^3.4.19",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vite-plugin-solid": "^2.11.0"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}

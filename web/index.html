@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pi Web</title>
+    <script>
+      (() => {
+        const systemTheme = () => window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        let theme = systemTheme();
+
+        try {
+          const stored = localStorage.getItem('pi-web-theme-preference');
+          if (stored === 'dark' || stored === 'light') theme = stored;
+        } catch {
+          // Keep the system preference if storage is unavailable.
+        }
+
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.classList.toggle('dark', theme === 'dark');
+      })();
+    </script>
+    <style>
+      html {
+        background: #ffffff;
+        background: oklch(1 0 0);
+        color-scheme: light;
+      }
+
+      html.dark,
+      html[data-theme='dark'] {
+        background: #1b1b1b;
+        background: oklch(0.16 0 0);
+        color-scheme: dark;
+      }
+
+      body {
+        margin: 0;
+        background: inherit;
+      }
+
+      #root {
+        min-height: 100vh;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

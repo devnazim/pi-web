@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output
+/dist/
+
+# Local app/runtime state
+.pi-web/
+.pi/
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+.envrc
+.npmrc
+
+# Secrets / credentials / certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cert
+*.jks
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Tooling caches and coverage
+.cache/
+.vite/
+coverage/
+
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp

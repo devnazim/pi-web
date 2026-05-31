@@ -1,0 +1,5 @@
+@font-face {
+  font-family: 'Pi GeistMono Nerd Font Mono';
+  src: url('./assets/fonts/GeistMonoNerdFontMono-Regular.otf') format('opentype');
+  font-display: swap;
+}
