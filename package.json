@@ -19,6 +19,7 @@
     "build:web": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
+    "test": "node --import tsx --test \"web/src/**/*.test.ts\"",
     "start": "node dist/server/cli.js"
   },
   "keywords": [

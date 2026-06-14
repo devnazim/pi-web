@@ -70,6 +70,17 @@ import cssWorker from 'monaco-editor/esm/vs/language/css/css.worker?worker';
 import htmlWorker from 'monaco-editor/esm/vs/language/html/html.worker?worker';
 import jsonWorker from 'monaco-editor/esm/vs/language/json/json.worker?worker';
 import tsWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
+import {
+  canStartComposerHistoryNavigation,
+  cloneUploadAssets,
+  composerHistoryModeForDraft,
+  prependComposerHistory,
+  readComposerHistory,
+  writeComposerHistory,
+  type ComposerHistoryItem,
+  type ComposerHistoryMode,
+  type UploadAsset,
+} from './composerHistory';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -119,7 +130,6 @@ type AgentStatusInfo = {
 };
 type AgentStatusPart = { text: string; title?: string; tone?: 'warning' | 'danger' };
 type ModelListItem = { value: string; label: string; provider: string; id: string; reasoning: boolean };
-type UploadAsset = { path: string; filename?: string; bytes?: number };
 type RichTextPart = { text: string; kind?: 'code' | 'file' | 'strong' };
 type MarkdownTableCell = { text?: string; tokens?: Token[]; align?: 'center' | 'left' | 'right' | null };
 type MarkdownListItemToken = { tokens?: Token[]; text?: string; task?: boolean; checked?: boolean };
@@ -3897,6 +3907,9 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   let handledSearchRequestSeq = props.searchRequest.seq;
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
+  let composerHistoryIndex: number | undefined;
+  let composerHistoryMode: ComposerHistoryMode | undefined;
+  let composerHistoryDraft: ComposerHistoryItem = { text: '', uploads: [] };
   const [text, setText] = createSignal('');
   const [stickToBottom, setStickToBottom] = createSignal(true);
   const [uploads, setUploads] = createSignal<UploadAsset[]>([]);
@@ -3913,6 +3926,8 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   const [runningCommand, setRunningCommand] = createSignal<string>();
   const [commandSessionId, setCommandSessionId] = createSignal<string>();
   const [pendingUserMessage, setPendingUserMessage] = createSignal<{ sessionId: string; text: string; userMessageCount: number }>();
+  const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
+  const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
   const [sessionControlsHydratedKey, setSessionControlsHydratedKey] = createSignal<string>();
   const autocompleteSessionId = createMemo(() => props.sessionId ?? commandSessionId());
@@ -4072,6 +4087,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   });
 
   createEffect(() => {
+    props.project.id;
     props.sessionId;
     setText('');
     setUploads([]);
@@ -4081,6 +4097,9 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     setHighlightedFileIndex(0);
     setHighlightedCommandIndex(0);
     setHighlightedCompletionIndex(0);
+    resetComposerHistory();
+    setComposerHistory(readComposerHistory(props.project.id, 'normal'));
+    setComposerShellHistory(readComposerHistory(props.project.id, 'shell'));
     setPendingUserMessage((pending) => pending && props.sessionId && pending.sessionId === props.sessionId ? pending : undefined);
     setModel('');
     setThinkingLevel('');
@@ -4215,12 +4234,15 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     const form = new FormData();
     files.forEach((file) => form.append('file', file));
     const result = await api<{ uploaded: Array<{ filename: string; path: string; bytes: number }> }>(`/api/projects/${props.project.id}/uploads?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST', body: form });
+    resetComposerHistory();
     setUploads((items) => uniqueUploadAssets([...items, ...result.uploaded]));
   }
 
   createEffect(() => {
     const selection = props.treeSelection;
-    if (selection) setText(selection.text);
+    if (!selection) return;
+    resetComposerHistory();
+    setText(selection.text);
   });
 
   function updateFileMention(target: HTMLTextAreaElement) {
@@ -4265,6 +4287,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   function replaceComposerRange(target: HTMLTextAreaElement, start: number, end: number, insert = '') {
     const cursor = start + insert.length;
     const nextText = `${target.value.slice(0, start)}${insert}${target.value.slice(end)}`;
+    resetComposerHistory();
     setText(nextText);
     updateComposerMentions(nextText, cursor);
     requestAnimationFrame(() => {
@@ -4273,6 +4296,76 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
       element.setSelectionRange(cursor, cursor);
       syncComposerLayout();
     });
+  }
+
+  function resetComposerHistory() {
+    composerHistoryIndex = undefined;
+    composerHistoryMode = undefined;
+    composerHistoryDraft = { text: '', uploads: [] };
+  }
+
+  function addComposerHistory(item: ComposerHistoryItem, mode: ComposerHistoryMode = 'normal') {
+    const current = mode === 'shell' ? composerShellHistory() : composerHistory();
+    const next = prependComposerHistory(current, item);
+    if (next === current) return;
+    if (mode === 'shell') setComposerShellHistory(next);
+    else setComposerHistory(next);
+    writeComposerHistory(props.project.id, mode, next);
+  }
+
+  function setComposerFromHistory(target: HTMLTextAreaElement, item: ComposerHistoryItem, cursor: 'start' | 'end') {
+    setText(item.text);
+    setUploads(cloneUploadAssets(item.uploads));
+    setFileMention(undefined);
+    setSlashCommandMention(undefined);
+    setCommandArgumentMention(undefined);
+    requestAnimationFrame(() => {
+      const element = composerRef ?? target;
+      const position = cursor === 'start' ? 0 : item.text.length;
+      element.focus();
+      element.setSelectionRange(position, position);
+      syncComposerLayout();
+    });
+  }
+
+  function handleComposerHistoryNavigation(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
+    if (event.isComposing || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return false;
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return false;
+    const target = event.currentTarget;
+    if ((target.selectionStart ?? 0) !== (target.selectionEnd ?? 0)) return false;
+    const cursor = textareaActivePosition(target);
+    const mode = composerHistoryIndex === undefined ? composerHistoryModeForDraft(target.value) : composerHistoryMode;
+    if (!mode) return false;
+    const history = mode === 'shell' ? composerShellHistory() : composerHistory();
+
+    if (event.key === 'ArrowUp') {
+      if (!history.length) return false;
+      if (composerHistoryIndex === undefined && !canStartComposerHistoryNavigation(mode, target.value, cursor)) return false;
+      if (composerHistoryIndex !== undefined && cursor !== 0 && cursor !== target.value.length) return false;
+      if (composerHistoryIndex === history.length - 1) return false;
+      event.preventDefault();
+      if (composerHistoryIndex === undefined) {
+        composerHistoryMode = mode;
+        composerHistoryDraft = { text: target.value, uploads: cloneUploadAssets(uploads()) };
+      }
+      composerHistoryIndex = (composerHistoryIndex ?? -1) + 1;
+      setComposerFromHistory(target, history[composerHistoryIndex], 'start');
+      return true;
+    }
+
+    if (composerHistoryIndex === undefined || (cursor !== 0 && cursor !== target.value.length)) return false;
+    event.preventDefault();
+    const nextIndex = composerHistoryIndex - 1;
+    if (nextIndex < 0) {
+      composerHistoryIndex = undefined;
+      composerHistoryMode = undefined;
+      setComposerFromHistory(target, composerHistoryDraft, 'end');
+      composerHistoryDraft = { text: '', uploads: [] };
+      return true;
+    }
+    composerHistoryIndex = nextIndex;
+    setComposerFromHistory(target, history[composerHistoryIndex], 'end');
+    return true;
   }
 
   function handleComposerNavigationShortcut(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
@@ -4363,6 +4456,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     const insert = `@${file.path}${suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' '}`;
     const nextText = `${text().slice(0, mention.start)}${insert}${suffix}`;
     const cursor = mention.start + insert.length;
+    resetComposerHistory();
     setText(nextText);
     setUploads((items) => uniqueUploadAssets([...items, { path: file.path, filename: file.name }]));
     setFileMention(undefined);
@@ -4381,6 +4475,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     const insert = `/${command.name}${suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' '}`;
     const nextText = `${text().slice(0, mention.start)}${insert}${suffix}`;
     const cursor = mention.start + insert.length;
+    resetComposerHistory();
     setText(nextText);
     setSlashCommandMention(undefined);
     setCommandArgumentMention(activeCommandArgument(nextText, cursor));
@@ -4397,6 +4492,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     const suffix = text().slice(mention.end);
     const nextText = `${text().slice(0, mention.start)}${completion.value}${suffix}`;
     const cursor = mention.start + completion.value.length;
+    resetComposerHistory();
     setText(nextText);
     setCommandArgumentMention(activeCommandArgument(nextText, cursor));
     requestAnimationFrame(() => {
@@ -4407,6 +4503,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   }
 
   function removeUpload(path: string) {
+    resetComposerHistory();
     setUploads((items) => items.filter((item) => item.path !== path));
   }
 
@@ -4566,6 +4663,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
       return;
     }
 
+    if (handleComposerHistoryNavigation(event)) return;
     if (handleComposerNavigationShortcut(event)) return;
 
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
@@ -4595,6 +4693,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     }
 
     setText('');
+    resetComposerHistory();
     setFileMention(undefined);
     setSlashCommandMention(undefined);
     setCommandArgumentMention(undefined);
@@ -4603,6 +4702,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
 
     try {
       if (shellCommand) {
+        addComposerHistory({ text: prompt, uploads: [] }, 'shell');
         await executeShellCommand(sessionId, shellCommand, mirrorActiveStream);
         if (mirrorActiveStream) props.onSession(sessionId);
         setUploads([]);
@@ -4611,6 +4711,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
         return;
       }
       if (compactCommand !== undefined) {
+        addComposerHistory({ text: prompt, uploads: [] });
         await compactSession(sessionId, compactCommand, mirrorActiveStream);
         if (mirrorActiveStream) props.onSession(sessionId);
         setUploads([]);
@@ -4618,6 +4719,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
         scrollTranscriptToBottom(true);
         return;
       }
+      addComposerHistory({ text: prompt, uploads: cloneUploadAssets(uploads()) });
       setPendingUserMessage({ sessionId, text: prompt, userMessageCount: userMessageCount(transcriptEntries()) });
       await api(`/api/projects/${props.project.id}/agent/prompt`, {
         method: 'POST',
@@ -4780,7 +4882,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
               placeholder={props.treeSelection ? 'Prompt for selected tree node...' : 'Ask anything...'}
               value={text()}
               rows={1}
-              onInput={(event) => { setText(event.currentTarget.value); updateFileMention(event.currentTarget); syncComposerLayout(); }}
+              onInput={(event) => { resetComposerHistory(); setText(event.currentTarget.value); updateFileMention(event.currentTarget); syncComposerLayout(); }}
               onClick={(event) => updateFileMention(event.currentTarget)}
               onScroll={(event) => {
                 if (!composerHighlightsRef) return;
