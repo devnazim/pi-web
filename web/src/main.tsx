@@ -129,7 +129,7 @@ type AgentStatusInfo = {
   statuses: Array<{ key: string; text: string }>;
 };
 type AgentStatusPart = { text: string; title?: string; tone?: 'warning' | 'danger' };
-type ModelListItem = { value: string; label: string; provider: string; id: string; reasoning: boolean };
+type ModelListItem = { value: string; label: string; provider: string; id: string; reasoning: boolean; thinkingLevels?: ThinkingLevel[] };
 type RichTextPart = { text: string; kind?: 'code' | 'file' | 'strong' };
 type MarkdownTableCell = { text?: string; tokens?: Token[]; align?: 'center' | 'left' | 'right' | null };
 type MarkdownListItemToken = { tokens?: Token[]; text?: string; task?: boolean; checked?: boolean };
@@ -203,6 +203,7 @@ type WorkspaceLookupEntry = { workspace: ProjectWorkspace; project: Project; roo
 
 type WorkspaceNotificationServerEvent = { type?: string; projectId?: string; sessionId?: string; message?: string; data?: unknown };
 
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 const THINKING_LEVEL_VALUE_OPTIONS: SelectOption[] = [
   { value: 'off', label: 'Off' },
   { value: 'minimal', label: 'Minimal' },
@@ -219,7 +220,6 @@ const SETTINGS_CACHE_STALE_TIME_MS = 60_000;
 const SESSION_DETAIL_CACHE_STALE_TIME_MS = 30_000;
 const CHAT_CODE_HIGHLIGHT_MAX_LENGTH = 200_000;
 const CHAT_ROW_ESTIMATED_HEIGHT = 120;
-const SETTINGS_THINKING_LEVEL_OPTIONS: SelectOption[] = [{ value: '', label: 'Inherited' }, ...THINKING_LEVEL_VALUE_OPTIONS];
 const CHAT_TOOL_OUTPUT_OPTIONS: SelectOption[] = [
   { value: '', label: 'Inherited' },
   { value: 'compact', label: 'Compact/collapsed' },
@@ -2132,6 +2132,11 @@ function SettingsModal(props: {
     queryFn: ({ signal }) => api<PiSettingsResponse>(`/api/projects/${props.project.id}/settings`, { signal }),
     staleTime: SETTINGS_CACHE_STALE_TIME_MS,
   }));
+  const models = createQuery(() => ({
+    queryKey: ['models', props.project.id],
+    queryFn: ({ signal }) => api<{ models: ModelListItem[] }>(`/api/projects/${props.project.id}/agent/models`, { signal }),
+    staleTime: 5 * 60_000,
+  }));
 
   createEffect(() => {
     const data = settings.data;
@@ -2168,6 +2173,24 @@ function SettingsModal(props: {
   }
 
   const effective = createMemo(() => settings.data?.effective ?? {});
+  const settingsModelValue = createMemo(() => defaultModelReference(form()) ?? '');
+  const inheritedSettingsModel = createMemo(() => scope() === 'project' ? defaultModelReference(settings.data?.global) : undefined);
+  const selectedSettingsModel = createMemo(() => settingsModelValue() || inheritedSettingsModel() || defaultModelReference(effective()));
+  const settingsModelOptions = createMemo(() => settingsDefaultModelOptions(scope(), inheritedSettingsModel(), models.data?.models ?? [], settingsModelValue()));
+  const settingsThinkingOptions = createMemo(() => settingsThinkingLevelOptions(scope(), scope() === 'project' ? settings.data?.global.defaultThinkingLevel : undefined, modelThinkingLevels(models.data?.models ?? [], selectedSettingsModel()), form().defaultThinkingLevel));
+
+  function updateDefaultModel(reference: string) {
+    setForm((current) => {
+      if (!reference) return { ...current, defaultProvider: undefined, defaultModel: undefined };
+      const parsed = parseModelReference(reference);
+      if (!parsed) return current;
+      return {
+        ...current,
+        defaultProvider: parsed.provider,
+        defaultModel: parsed.modelId,
+      };
+    });
+  }
 
   return (
     <div class="project-modal-backdrop" onMouseDown={props.onClose}>
@@ -2215,9 +2238,8 @@ function SettingsModal(props: {
                     <button type="button" class={`settings-tab ${scope() === 'project' ? 'settings-tab-active' : ''}`} onClick={() => setScope('project')}>Project override</button>
                   </div>
                   <SettingsSection title="AI and Model">
-                    <label class="settings-field"><span>Default provider</span><input class="input" placeholder={effective().defaultProvider ?? 'provider'} value={form().defaultProvider ?? ''} onInput={(event) => update('defaultProvider', event.currentTarget.value || undefined)} /></label>
-                    <label class="settings-field"><span>Default model</span><input class="input" placeholder={effective().defaultModel ?? 'model id'} value={form().defaultModel ?? ''} onInput={(event) => update('defaultModel', event.currentTarget.value || undefined)} /></label>
-                    <div class="settings-field"><span>Thinking level</span><UiSelect class="w-full" value={form().defaultThinkingLevel ?? ''} onChange={(value) => update('defaultThinkingLevel', (value || undefined) as ThinkingLevel | undefined)} options={SETTINGS_THINKING_LEVEL_OPTIONS} ariaLabel="Thinking level" /></div>
+                    <div class="settings-field"><span>Default model</span><UiSelect class="w-full" value={settingsModelValue()} onChange={updateDefaultModel} options={settingsModelOptions()} ariaLabel="Default model" disabled={models.isLoading && !models.data} /></div>
+                    <div class="settings-field"><span>Thinking level</span><UiSelect class="w-full" value={form().defaultThinkingLevel ?? ''} onChange={(value) => update('defaultThinkingLevel', (value || undefined) as ThinkingLevel | undefined)} options={settingsThinkingOptions()} ariaLabel="Thinking level" /></div>
                   </SettingsSection>
 
                   <SettingsSection title="Chat and Tree">
@@ -4003,6 +4025,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   const toolOutputMode = createMemo(() => chatToolOutputMode(effectiveSettings()));
   const syntaxTheme = createMemo(() => shikiSyntaxTheme(props.themeMode, effectiveSettings()));
   const modelOptions = createMemo(() => composerModelOptions(effectiveSettings(), models.data?.models ?? [], model()));
+  const thinkingLevelOptions = createMemo(() => composerThinkingLevelOptions(effectiveSettings(), models.data?.models ?? [], model()));
   const transcriptEntries = createMemo(() => {
     const detail = session.data;
     if (!detail) return [];
@@ -4114,8 +4137,9 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     setComposerHistory(readComposerHistory(props.project.id, 'normal'));
     setComposerShellHistory(readComposerHistory(props.project.id, 'shell'));
     setPendingUserMessage((pending) => pending && props.sessionId && pending.sessionId === props.sessionId ? pending : undefined);
-    setModel('');
-    setThinkingLevel('');
+    const storedControls = props.sessionId ? readSessionComposerControls(props.project.id, props.sessionId) : undefined;
+    setModel(storedControls && 'model' in storedControls ? storedControls.model ?? '' : '');
+    setThinkingLevel(storedControls && 'thinking' in storedControls ? storedControls.thinking ?? '' : '');
     setSessionControlsHydratedKey(undefined);
     if (props.sessionId) setCommandSessionId(undefined);
     setRunningCommand(undefined);
@@ -4162,6 +4186,11 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   createEffect(() => {
     const selectedModel = model();
     if (selectedModel && !modelOptions().some((option) => option.value === selectedModel)) setModel('');
+  });
+
+  createEffect(() => {
+    const selectedThinkingLevel = thinkingLevel();
+    if (selectedThinkingLevel && !thinkingLevelOptions().some((option) => option.value === selectedThinkingLevel)) setThinkingLevel('');
   });
 
   createEffect(() => {
@@ -4591,9 +4620,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
 
   function promptModelOverride() {
     if (model()) return model();
-    const sessionId = props.sessionId ?? commandSessionId();
-    const stored = sessionId ? readSessionComposerControls(props.project.id, sessionId) : undefined;
-    return stored && 'model' in stored ? defaultModelReference(effectiveSettings()) : undefined;
+    return defaultModelReference(effectiveSettings());
   }
 
   function promptThinkingOverride(): ThinkingLevel | undefined {
@@ -4714,6 +4741,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
       }
       if (!sessionId) return;
     }
+    if (model() || thinkingLevel()) writeSessionComposerControls(props.project.id, sessionId, { model: model(), thinking: thinkingLevel() });
     const extensionCommand = !shellCommand && compactCommand === undefined
       ? await isExtensionComposerCommand(sessionId, prompt).catch(() => false)
       : false;
@@ -4931,7 +4959,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
               triggerWidth="content"
               value={thinkingLevel()}
               onChange={(value) => handleThinkingLevelChange(value as ThinkingLevel | '')}
-              options={[{ value: '', label: 'Default' }, ...THINKING_LEVEL_VALUE_OPTIONS]}
+              options={thinkingLevelOptions()}
               ariaLabel="Thinking level"
             />
             <div class="composer-toolbar-spacer flex-1" />
@@ -8403,6 +8431,80 @@ function composerModelOptions(settings?: PiSettings, models: ModelListItem[] = [
   ];
 }
 
+function settingsDefaultModelOptions(scope: 'global' | 'project', inheritedReference: string | undefined, models: ModelListItem[], selectedReference: string): SelectOption[] {
+  const labels = new Map(models.map((model) => [model.value, model.label]));
+  const references = uniqueStrings([...models.map((model) => model.value), selectedReference]);
+  return [
+    { value: '', label: scope === 'project' ? `Inherited${inheritedReference ? `: ${modelReferenceLabel(inheritedReference)}` : ''}` : 'Pi default' },
+    ...references.map((reference) => ({
+      value: reference,
+      label: labels.get(reference) ?? (reference === selectedReference ? `Current: ${modelReferenceLabel(reference)}` : modelReferenceLabel(reference)),
+    })),
+  ];
+}
+
+function settingsThinkingLevelOptions(scope: 'global' | 'project', inheritedLevel: ThinkingLevel | undefined, levels?: ThinkingLevel[], selectedLevel?: ThinkingLevel): SelectOption[] {
+  const inherited = inheritedLevel ?? 'medium';
+  const effective = clampThinkingLevel(inherited, levels);
+  const currentOption = selectedLevel && levels && !levels.includes(selectedLevel)
+    ? [{ value: selectedLevel, label: `Current: ${thinkingLevelLabel(selectedLevel)} (unsupported by selected model)` }]
+    : [];
+  return [
+    { value: '', label: scope === 'project' ? `Inherited: ${thinkingLevelLabel(effective)}${effective !== inherited ? ` (from ${thinkingLevelLabel(inherited)})` : ''}` : `Pi default: ${thinkingLevelLabel(effective)}` },
+    ...currentOption,
+    ...thinkingLevelValueOptionsForLevels(levels),
+  ];
+}
+
+function composerThinkingLevelOptions(settings: PiSettings | undefined, models: ModelListItem[], selectedModel: string): SelectOption[] {
+  const levels = modelThinkingLevels(models, selectedModel || defaultModelReference(settings));
+  const defaultLevel = clampThinkingLevel(settings?.defaultThinkingLevel ?? 'medium', levels);
+  return [
+    { value: '', label: thinkingLevelLabel(defaultLevel) },
+    ...thinkingLevelValueOptionsForLevels(levels),
+  ];
+}
+
+function thinkingLevelValueOptionsForLevels(levels?: ThinkingLevel[]) {
+  return THINKING_LEVEL_VALUE_OPTIONS.filter((option) => !levels || levels.includes(option.value as ThinkingLevel));
+}
+
+function modelThinkingLevels(models: ModelListItem[], reference?: string): ThinkingLevel[] | undefined {
+  if (!reference) return undefined;
+  const levels = models.find((model) => model.value === reference)?.thinkingLevels;
+  return levels?.filter(isThinkingLevel);
+}
+
+function clampThinkingLevel(level: ThinkingLevel, levels?: ThinkingLevel[]): ThinkingLevel {
+  if (!levels || levels.includes(level)) return level;
+  const requestedIndex = THINKING_LEVELS.indexOf(level);
+  if (requestedIndex === -1) return levels[0] ?? 'off';
+  for (let index = requestedIndex; index < THINKING_LEVELS.length; index += 1) {
+    const candidate = THINKING_LEVELS[index];
+    if (levels.includes(candidate)) return candidate;
+  }
+  for (let index = requestedIndex - 1; index >= 0; index -= 1) {
+    const candidate = THINKING_LEVELS[index];
+    if (levels.includes(candidate)) return candidate;
+  }
+  return levels[0] ?? 'off';
+}
+
+function thinkingLevelLabel(level: ThinkingLevel) {
+  if (level === 'off') return 'Off';
+  if (level === 'minimal') return 'Minimal';
+  if (level === 'low') return 'Low';
+  if (level === 'medium') return 'Medium';
+  if (level === 'high') return 'High';
+  return 'Xhigh';
+}
+
+function parseModelReference(reference: string) {
+  const slashIndex = reference.indexOf('/');
+  if (slashIndex <= 0 || slashIndex === reference.length - 1) return undefined;
+  return { provider: reference.slice(0, slashIndex), modelId: reference.slice(slashIndex + 1) };
+}
+
 function defaultModelReference(settings?: PiSettings) {
   if (settings?.defaultProvider && settings.defaultModel) return `${settings.defaultProvider}/${settings.defaultModel}`;
   return settings?.defaultModel;
@@ -8435,7 +8537,14 @@ function chatToolOutputMode(settings?: PiSettings): ChatToolOutputMode {
 }
 
 function pruneSettings(settings: PiSettings): PiSettings {
-  return JSON.parse(JSON.stringify(settings, (_key, value) => value === '' ? undefined : value)) as PiSettings;
+  return pruneSettingValue(settings) as PiSettings;
+}
+
+function pruneSettingValue(value: unknown): unknown {
+  if (value === undefined || value === '') return null;
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, pruneSettingValue(item)]));
 }
 
 function uniqueStrings(items: Array<string | undefined>) {

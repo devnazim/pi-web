@@ -72,6 +72,8 @@ function settingsPayload(manager: SettingsManager) {
     effective: {
       ...global,
       ...project,
+      defaultProvider: manager.getDefaultProvider(),
+      defaultModel: manager.getDefaultModel(),
       compaction: manager.getCompactionSettings(),
       branchSummary: manager.getBranchSummarySettings(),
       retry: { ...manager.getRetrySettings(), provider: manager.getProviderRetrySettings() },
@@ -130,8 +132,14 @@ function writeJson(filePath: string, value: Partial<Settings>) {
 function deepMerge<T extends Record<string, unknown>>(base: T, updates: Partial<T>): T {
   const result = { ...base };
   for (const [key, value] of Object.entries(updates)) {
-    if (value && typeof value === 'object' && !Array.isArray(value) && result[key] && typeof result[key] === 'object' && !Array.isArray(result[key])) {
-      result[key as keyof T] = deepMerge(result[key] as Record<string, unknown>, value as Record<string, unknown>) as T[keyof T];
+    if (value === null) {
+      delete result[key as keyof T];
+    } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+      const current = result[key];
+      result[key as keyof T] = deepMerge(
+        current && typeof current === 'object' && !Array.isArray(current) ? current as Record<string, unknown> : {},
+        value as Record<string, unknown>,
+      ) as T[keyof T];
     } else {
       result[key as keyof T] = value as T[keyof T];
     }

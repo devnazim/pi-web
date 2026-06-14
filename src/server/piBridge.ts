@@ -67,7 +67,7 @@ type CommandInfo = {
 
 type CommandCompletion = { value: string; label?: string; description?: string };
 
-type ModelInfo = { value: string; label: string; provider: string; id: string; reasoning: boolean };
+type ModelInfo = { value: string; label: string; provider: string; id: string; reasoning: boolean; thinkingLevels: ThinkingLevel[] };
 
 type AgentStatus = {
   branch?: string;
@@ -313,6 +313,7 @@ export class PiBridge {
         provider: model.provider,
         id: model.id,
         reasoning: Boolean(model.reasoning),
+        thinkingLevels: supportedThinkingLevels(model),
       }))
       .sort((a, b) => a.label.localeCompare(b.label));
   }
@@ -699,9 +700,29 @@ export class PiBridge {
   }
 
   private async applySessionControls(session: any, body: { model?: string; thinking?: string }) {
-    if (body.model?.trim()) await this.setSessionModel(session, body.model.trim());
-    if (body.thinking && isThinkingLevel(body.thinking) && typeof session?.setThinkingLevel === 'function') {
-      if (session?.thinkingLevel !== body.thinking) session.setThinkingLevel(body.thinking);
+    const modelReference = body.model?.trim();
+    const thinkingLevel = body.thinking && isThinkingLevel(body.thinking) ? body.thinking : undefined;
+    if (!modelReference && !thinkingLevel) return;
+
+    if (modelReference) await this.setSessionModel(session, modelReference);
+    if (thinkingLevel && typeof session?.setThinkingLevel === 'function' && session?.thinkingLevel !== thinkingLevel) {
+      this.withoutDefaultControlPersistence(session, () => session.setThinkingLevel(thinkingLevel));
+    }
+  }
+
+  private withoutDefaultControlPersistence<T>(session: any, action: () => T): T {
+    const manager = session?.settingsManager;
+    if (!manager) return action();
+    const originals: Array<[string, unknown]> = [];
+    for (const method of ['setDefaultProvider', 'setDefaultModel', 'setDefaultModelAndProvider', 'setDefaultThinkingLevel']) {
+      if (typeof manager[method] !== 'function') continue;
+      originals.push([method, manager[method]]);
+      manager[method] = () => undefined;
+    }
+    try {
+      return action();
+    } finally {
+      for (const [method, original] of originals) manager[method] = original;
     }
   }
 
@@ -710,7 +731,8 @@ export class PiBridge {
     const model = await this.resolveModelReference(session, reference);
     if (!model) throw new Error(`Model not found: ${reference}`);
     if (session?.model?.provider === model.provider && session.model.id === model.id) return;
-    await session.setModel(model);
+    // SDK setModel persists the chosen chat model as a global default before its first await.
+    await this.withoutDefaultControlPersistence(session, () => session.setModel(model));
   }
 
   private async resolveModelReference(session: any, reference: string) {
@@ -1157,8 +1179,20 @@ function isWorkspaceNotificationEvent(event: AgentEvent) {
     || /approval|permission|confirm|input|notify|review/i.test(type);
 }
 
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+
 function isThinkingLevel(value: string): value is ThinkingLevel {
-  return ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value);
+  return (THINKING_LEVELS as string[]).includes(value);
+}
+
+function supportedThinkingLevels(model: any): ThinkingLevel[] {
+  if (!model?.reasoning) return ['off'];
+  return THINKING_LEVELS.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) return false;
+    if (level === 'xhigh') return mapped !== undefined;
+    return true;
+  });
 }
 
 function sanitizeStatusText(text: string) {
