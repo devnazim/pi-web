@@ -325,6 +325,7 @@ const WORKSPACE_NOTIFICATIONS_LIMIT = 40;
 const WORKSPACE_NOTIFICATION_TOAST_TTL_MS = 8000;
 const SESSION_SIDEBAR_OPEN_KEY = 'pi-web-session-sidebar-open';
 const THEME_MODE_KEY = 'pi-web-theme-preference';
+const CONTRAST_USER_MESSAGES_KEY = 'pi-web-contrast-user-messages';
 const SESSION_COMPOSER_CONTROLS_KEY = 'pi-web-session-composer-controls';
 const PROJECT_ORDER_KEY = 'pi-web-project-order';
 const SESSION_PAGE_SIZE = 30;
@@ -546,6 +547,7 @@ function Shell() {
   const [restoredOpenProjects, setRestoredOpenProjects] = createSignal(false);
   const [restoringOpenProjects, setRestoringOpenProjects] = createSignal(false);
   const [themeMode, setThemeMode] = createSignal<ThemeMode>(readThemeMode());
+  const [contrastUserMessages, setContrastUserMessages] = createSignal(readContrastUserMessages());
   const [systemThemeMode, setSystemThemeMode] = createSignal<ResolvedThemeMode>(readSystemThemeMode());
   const [appError, setAppError] = createSignal<{ title: string; description: string }>();
   const [sessionMenuOpen, setSessionMenuOpen] = createSignal(false);
@@ -756,6 +758,11 @@ function Shell() {
   function setNotificationSoundChoice(sound: NotificationSoundId) {
     setNotificationSoundId(sound);
     localStorage.setItem(WORKSPACE_NOTIFICATIONS_SOUND_CHOICE_KEY, sound);
+  }
+
+  function setContrastUserMessagePreference(enabled: boolean) {
+    setContrastUserMessages(enabled);
+    localStorage.setItem(CONTRAST_USER_MESSAGES_KEY, String(enabled));
   }
 
   async function previewNotificationSound() {
@@ -1597,7 +1604,7 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={sessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={sessionId()} events={events()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={sessionId()} events={events()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -1608,9 +1615,11 @@ function Shell() {
           <SettingsModal
             project={project()}
             themeMode={themeMode()}
+            contrastUserMessages={contrastUserMessages()}
             notificationSoundEnabled={notificationSoundEnabled()}
             notificationSoundId={notificationSoundId()}
             onThemeMode={setThemeMode}
+            onContrastUserMessages={setContrastUserMessagePreference}
             onNotificationSoundEnabled={setNotificationSound}
             onNotificationSound={setNotificationSoundChoice}
             onPreviewNotificationSound={previewNotificationSound}
@@ -2105,9 +2114,11 @@ function SettingsDivider(props: { label?: string }) {
 function SettingsModal(props: {
   project: Project;
   themeMode: ThemeMode;
+  contrastUserMessages: boolean;
   notificationSoundEnabled: boolean;
   notificationSoundId: NotificationSoundId;
   onThemeMode: (mode: ThemeMode) => void;
+  onContrastUserMessages: (enabled: boolean) => void;
   onNotificationSoundEnabled: (enabled: boolean) => void;
   onNotificationSound: (sound: NotificationSoundId) => void;
   onPreviewNotificationSound: () => void | Promise<void>;
@@ -2176,6 +2187,7 @@ function SettingsModal(props: {
                   <span>App theme</span>
                   <UiSelect class="w-full" value={props.themeMode} onChange={(value) => props.onThemeMode(value === 'dark' || value === 'light' ? value : 'system')} options={APP_THEME_OPTIONS} ariaLabel="App theme" />
                 </div>
+                <SettingsToggleRow label="Contrasting user messages" description="Use inverted primary bubbles: dark in light theme and light in dark theme." checked={props.contrastUserMessages} onChange={props.onContrastUserMessages} />
                 <div class="settings-field"><span>Syntax theme (light)</span><UiSelect class="w-full" value={form().syntaxHighlightThemeLight ?? ''} onChange={(value) => update('syntaxHighlightThemeLight', (value || undefined) as SyntaxHighlightTheme | undefined)} options={SYNTAX_HIGHLIGHT_LIGHT_THEME_OPTIONS} ariaLabel="Light syntax highlight theme" /></div>
                 <div class="settings-field"><span>Syntax theme (dark)</span><UiSelect class="w-full" value={form().syntaxHighlightThemeDark ?? ''} onChange={(value) => update('syntaxHighlightThemeDark', (value || undefined) as SyntaxHighlightTheme | undefined)} options={SYNTAX_HIGHLIGHT_DARK_THEME_OPTIONS} ariaLabel="Dark syntax highlight theme" /></div>
               </SettingsSection>
@@ -2189,7 +2201,7 @@ function SettingsModal(props: {
                   </div>
                 </div>
               </SettingsSection>
-              <p class="text-xs text-muted-foreground">Theme and notification changes apply immediately on this browser.</p>
+              <p class="text-xs text-muted-foreground">Theme, user message bubble, and notification changes apply immediately on this browser.</p>
             </div>
 
             <SettingsDivider label="Pi settings" />
@@ -3731,7 +3743,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string) => void; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string) => void; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -3861,14 +3873,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
                     class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
                     style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
                   >
-                    <Chat project={project()} sessionId={props.sessionId} events={props.events} treeSelection={treeSelection()} themeMode={props.themeMode} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onTreeSelection={setTreeSelection} />
+                    <Chat project={project()} sessionId={props.sessionId} events={props.events} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                     <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
                 <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} events={props.events} treeSelection={treeSelection()} themeMode={props.themeMode} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onTreeSelection={setTreeSelection} />
+                  <Chat project={project()} sessionId={props.sessionId} events={props.events} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onTreeSelection={setTreeSelection} />
                   <div
                     class="terminal-resize-handle"
                     role="separator"
@@ -3898,7 +3910,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
   );
 }
 
-function Chat(props: { project: Project; sessionId?: string; events: string[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string) => void; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; events: string[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string) => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
@@ -4750,7 +4762,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   }
 
   return (
-    <div class="grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden">
+    <div class={`grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden${props.contrastUserMessages ? '' : ' chat-user-bubbles-surface'}`}>
       <div
         ref={transcriptScrollerRef}
         class={`min-h-0 overflow-y-auto overflow-x-hidden px-6 pb-6 pt-24 ${centerTranscript() ? 'grid place-items-center' : ''}`}
@@ -8586,6 +8598,10 @@ function readThemeMode(): ThemeMode {
   const stored = localStorage.getItem(THEME_MODE_KEY);
   if (stored === 'system' || stored === 'light' || stored === 'dark') return stored;
   return 'system';
+}
+
+function readContrastUserMessages() {
+  return localStorage.getItem(CONTRAST_USER_MESSAGES_KEY) !== 'false';
 }
 
 function readSystemThemeMode(): ResolvedThemeMode {

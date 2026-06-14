@@ -1764,6 +1764,47 @@ body {
     @apply bg-primary-foreground/15 text-primary-foreground;
   }
 
+  .chat-user-bubbles-surface .chat-bubble-user {
+    @apply bg-secondary text-secondary-foreground ring-foreground/5;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-link {
+    @apply text-secondary-foreground decoration-secondary-foreground/40;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-blockquote {
+    @apply border-secondary-foreground/25 text-secondary-foreground/80;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-code-frame {
+    @apply bg-background/70;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-table-wrap,
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-table td {
+    @apply border-secondary-foreground/15;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-table th {
+    @apply bg-secondary-foreground/10;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-task-box {
+    @apply border-secondary-foreground/40 text-secondary-foreground;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .markdown-task-box-checked {
+    @apply border-secondary-foreground bg-secondary-foreground text-secondary;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .rich-code {
+    @apply bg-secondary-foreground/10 text-secondary-foreground ring-secondary-foreground/10;
+  }
+
+  .chat-user-bubbles-surface .chat-bubble-user .rich-file {
+    @apply bg-secondary-foreground/10 text-secondary-foreground;
+  }
+
   .chat-bubble-assistant {
     @apply bg-card text-card-foreground;
   }
