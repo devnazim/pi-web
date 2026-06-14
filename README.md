@@ -27,6 +27,15 @@ npm run dev -- --host 0.0.0.0 --port 43110 --webPort 5173
 
 In dev mode, open the Vite URL (`5173` by default), not the API server port.
 
+## Logging
+
+`pi-web` defaults to quiet server logging: it prints the startup URLs plus warnings/errors, but not every HTTP/WebSocket request. Use `--log verbose` when you need request logs, `--log debug` for debug logs, or `--log silent` to disable Fastify logs entirely. The same setting is available as `PI_WEB_LOG`; `--quiet`, `--verbose`, `--debug`, and `--silent` are shorthands.
+
+```bash
+pi-web --log verbose
+PI_WEB_LOG=silent pi-web
+```
+
 ## Build and run
 
 ```bash

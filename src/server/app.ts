@@ -15,7 +15,12 @@ import { registerTerminalRoutes } from './terminal.js';
 import type { ServerOptions } from './types.js';
 
 export async function buildApp(options: ServerOptions) {
-  const app = Fastify({ logger: true });
+  const logMode = options.logMode ?? 'quiet';
+  const app = Fastify({
+    logger: logMode === 'silent'
+      ? false
+      : { level: logMode === 'debug' ? 'debug' : logMode === 'verbose' ? 'info' : 'warn' },
+  });
   const registry = new ProjectRegistry(options.workspace);
   const bridge = new PiBridge();
 
@@ -46,7 +51,7 @@ export async function buildApp(options: ServerOptions) {
         return reply.sendFile('index.html');
       });
     } else {
-      app.log.warn(`Web assets not found at ${webRoot}; run npm run build before npm start, or use npm run dev.`);
+      console.warn(`Warning: web assets not found at ${webRoot}; run npm run build before npm start, or use npm run dev.`);
     }
   }
 

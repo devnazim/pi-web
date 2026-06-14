@@ -1,5 +1,5 @@
 {
-  "name": "pi-web",
+  "name": "@devnazim/pi-web",
   "version": "0.1.0",
   "description": "A lightweight web UI/server for the pi coding agent.",
   "type": "module",

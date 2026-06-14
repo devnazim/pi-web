@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { networkInterfaces } from 'node:os';
 import { buildApp } from './app.js';
+import type { ServerLogMode } from './types.js';
 import { isLocalHost, parseArgs } from './util.js';
 
 const args = parseArgs(process.argv.slice(2));
@@ -12,7 +13,8 @@ const workspace = typeof args.workspace === 'string' ? args.workspace : undefine
 const dev = Boolean(args.dev) || process.env.NODE_ENV === 'development';
 
 try {
-  const app = await buildApp({ host, port, password, workspace, expose, dev });
+  const logMode = resolveLogMode(args);
+  const app = await buildApp({ host, port, password, workspace, expose, dev, logMode });
   await app.listen({ host, port });
 
   const urls = new Set<string>();
@@ -45,11 +47,25 @@ try {
   console.log('');
 
   if (!isLocalHost(host)) {
-    app.log.warn(password
-      ? 'Remote access is enabled. Use a strong password and prefer a private network/reverse proxy.'
-      : 'Remote access is enabled without a password. pi-web can read/write files and run agent tools; prefer a private network or reverse proxy.');
+    console.warn(password
+      ? 'Warning: remote access is enabled. Use a strong password and prefer a private network/reverse proxy.'
+      : 'Warning: remote access is enabled without a password. pi-web can read/write files and run agent tools; prefer a private network or reverse proxy.');
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   process.exit(1);
+}
+
+function resolveLogMode(args: Record<string, string | boolean>): ServerLogMode {
+  if (args.debug) return 'debug';
+  if (args.verbose) return 'verbose';
+  if (args.silent) return 'silent';
+  if (args.quiet) return 'quiet';
+
+  const raw = String(args.log ?? process.env.PI_WEB_LOG ?? 'quiet').trim().toLowerCase();
+  if (raw === 'quiet' || raw === 'normal' || raw === 'warn' || raw === 'warning' || raw === 'warnings') return 'quiet';
+  if (raw === 'verbose' || raw === 'info' || raw === 'request' || raw === 'requests') return 'verbose';
+  if (raw === 'debug') return 'debug';
+  if (raw === 'silent' || raw === 'off' || raw === 'none' || raw === 'false') return 'silent';
+  throw new Error(`Invalid log mode "${raw}". Use quiet, verbose, debug, or silent.`);
 }

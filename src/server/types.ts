@@ -1,11 +1,13 @@
 import type { SessionEntry as PiSessionEntry } from '@earendil-works/pi-coding-agent';
 
 export type AppMode = 'chat' | 'tree' | 'review';
+export type ServerLogMode = 'quiet' | 'verbose' | 'debug' | 'silent';
 
 export interface ServerOptions {
   host: string;
   port: number;
   dev: boolean;
+  logMode?: ServerLogMode;
   password?: string;
   workspace?: string;
   expose: boolean;
