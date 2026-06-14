@@ -1558,6 +1558,29 @@ body {
     @apply grid h-7 w-7 shrink-0 place-items-center rounded-xl text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground;
   }
 
+  .session-panel-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(var(--muted-foreground) / 0.45) transparent;
+  }
+
+  .session-panel-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .session-panel-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .session-panel-scrollbar::-webkit-scrollbar-thumb {
+    border-radius: 9999px;
+    background: oklch(var(--muted-foreground) / 0.35);
+  }
+
+  .session-panel-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: oklch(var(--muted-foreground) / 0.55);
+  }
+
   .session {
     @apply flex w-full items-start gap-2 rounded-xl px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground;
   }

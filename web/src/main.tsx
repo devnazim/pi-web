@@ -2612,7 +2612,7 @@ function Sidebar(props: {
                 )}
               </Show>
               <button class="button-secondary mb-5 w-full" title={`New session (${formatBinding(getShortcutBinding('newSession'))})`} onClick={() => newSession()}><SquarePen class="size-4" />New session</button>
-              <div class="min-h-0 flex-1 overflow-auto pr-1">
+              <div class="session-panel-scrollbar min-h-0 flex-1 overflow-auto pr-1">
                 <SessionList
                   sessions={sessionItems()}
                   selectedSessionId={props.selectedSessionId}
@@ -2649,7 +2649,7 @@ function Sidebar(props: {
               </div>
             </div>
           </Show>
-          <div class="min-h-0 flex-1 space-y-3 overflow-auto p-1">
+          <div class="session-panel-scrollbar min-h-0 flex-1 space-y-3 overflow-auto p-1">
             <For each={props.workspaces ?? []}>
               {(workspace, index) => (
                 <WorkspaceSessionGroup
