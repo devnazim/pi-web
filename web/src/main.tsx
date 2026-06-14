@@ -3938,7 +3938,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   const [highlightedCompletionIndex, setHighlightedCompletionIndex] = createSignal(0);
   const [runningCommand, setRunningCommand] = createSignal<string>();
   const [commandSessionId, setCommandSessionId] = createSignal<string>();
-  const [pendingUserMessage, setPendingUserMessage] = createSignal<{ sessionId: string; text: string; userMessageCount: number }>();
+  const [pendingUserMessage, setPendingUserMessage] = createSignal<{ sessionId: string; text: string; attachments: UploadAsset[]; userMessageCount: number }>();
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
@@ -4697,7 +4697,8 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   async function send(event: SubmitEvent) {
     event.preventDefault();
     const prompt = text().trim();
-    const attachments = uploads().map((asset) => asset.path);
+    const uploadAssets = cloneUploadAssets(uploads());
+    const attachments = uploadAssets.map((asset) => asset.path);
     if (!prompt || busy()) return;
     const shellCommand = parseShellComposerCommand(prompt);
     const compactCommand = parseCompactComposerCommand(prompt);
@@ -4744,8 +4745,8 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
         scrollTranscriptToBottom(true);
         return;
       }
-      addComposerHistory({ text: prompt, uploads: cloneUploadAssets(uploads()) });
-      if (!extensionCommand) setPendingUserMessage({ sessionId, text: prompt, userMessageCount: userMessageCount(transcriptEntries()) });
+      addComposerHistory({ text: prompt, uploads: uploadAssets });
+      if (!extensionCommand) setPendingUserMessage({ sessionId, text: prompt, attachments: uploadAssets, userMessageCount: userMessageCount(transcriptEntries()) });
       await api(`/api/projects/${props.project.id}/agent/prompt`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -4805,13 +4806,13 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
                     data-index={index()}
                     class={`chat-search-entry ${chatSearchMatchIds().has(item.id) ? 'chat-search-entry-match' : ''} ${activeSearchEntryId() === item.id ? 'chat-search-entry-active' : ''}`}
                   >
-                    <TranscriptEntry entry={item} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} toolCalls={toolCalls()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} />
+                    <TranscriptEntry entry={item} project={props.project} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} toolCalls={toolCalls()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
                   </div>
                 );
               }}
             </For>
             <Show when={pendingUserMessageVisible() ? pendingUserMessage() : undefined}>
-              {(pending) => <div class="chat-row chat-row-user"><div class="chat-bubble chat-bubble-user"><MessageParts parts={[{ type: 'text', text: pending().text }]} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} /></div></div>}
+              {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending().text }]} attachments={pending().attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
             </Show>
             <LiveAgentActivity activity={liveActivity()} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
             <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
@@ -6787,7 +6788,39 @@ function PanelSection(props: { title: string; children: JSX.Element }) {
   );
 }
 
-function TranscriptEntry(props: { entry: SessionEntry; hideThinking: boolean; toolOutputMode: ChatToolOutputMode; toolCalls: Map<string, ToolCallInfo>; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string }) {
+function UserMessage(props: { project: Project; parts: ChatContentPart[]; attachments?: UploadAsset[]; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; onPreviewAttachment: (path: string) => void }) {
+  return (
+    <div class="chat-row chat-row-user">
+      <div class="chat-user-message">
+        <Show when={(props.attachments?.length ?? 0) > 0}>
+          <ChatAttachmentPreviews project={props.project} attachments={props.attachments ?? []} onPreviewAttachment={props.onPreviewAttachment} />
+        </Show>
+        <div class="chat-bubble chat-bubble-user"><MessageParts parts={props.parts} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} /></div>
+      </div>
+    </div>
+  );
+}
+
+function ChatAttachmentPreviews(props: { project: Project; attachments: UploadAsset[]; onPreviewAttachment: (path: string) => void }) {
+  return (
+    <div class="chat-attachments" aria-label="Attachments">
+      <For each={props.attachments}>
+        {(asset) => (
+          <div class="chat-attachment-wrap">
+            <button type="button" class={`chat-attachment ${isImagePath(asset.path) ? 'chat-attachment-image' : 'chat-attachment-document'}`} aria-label={`Preview ${uploadAssetLabel(asset)}`} onClick={() => props.onPreviewAttachment(asset.path)}>
+              <Show when={isImagePath(asset.path)} fallback={<span class="chat-attachment-file"><FileTypeIcon name={asset.filename ?? asset.path} class="size-6" /><span>{uploadAssetLabel(asset)}</span></span>}>
+                <img class="chat-attachment-thumb" src={assetUrl(props.project.id, asset.path)} alt="" />
+              </Show>
+            </button>
+            <span class="chat-attachment-tooltip" role="tooltip">{uploadAssetLabel(asset)}</span>
+          </div>
+        )}
+      </For>
+    </div>
+  );
+}
+
+function TranscriptEntry(props: { entry: SessionEntry; project: Project; hideThinking: boolean; toolOutputMode: ChatToolOutputMode; toolCalls: Map<string, ToolCallInfo>; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; onPreviewAttachment: (path: string) => void }) {
   const role = () => entryRole(props.entry);
   const parts = createMemo(() => entryContentParts(props.entry, { hideThinking: props.hideThinking, toolOutputMode: props.toolOutputMode }));
 
@@ -6836,7 +6869,7 @@ function TranscriptEntry(props: { entry: SessionEntry; hideThinking: boolean; to
   }
 
   if (isUserMessageEntry(props.entry)) {
-    return <div class="chat-row chat-row-user"><div class="chat-bubble chat-bubble-user"><MessageParts parts={parts()} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} /></div></div>;
+    return <UserMessage project={props.project} parts={parts()} attachments={userMessageAttachments(props.entry)} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} onPreviewAttachment={props.onPreviewAttachment} />;
   }
 
   if (props.entry.type === 'message' && props.entry.message?.role === 'bashExecution') {
@@ -7913,7 +7946,7 @@ function entryContentParts(entry: SessionEntry, options: { hideThinking: boolean
   if (entry.type === 'message') {
     const role = entry.message?.role;
     if (role === 'toolResult') return options.toolOutputMode === 'hidden' ? [] : [{ type: 'tool', text: contentText(entry.message?.content).trim() || '(no output)' }];
-    const parts = contentParts(entry.message?.content, options);
+    const parts = role === 'user' ? stripAttachmentTrailerFromParts(contentParts(entry.message?.content, options)) : contentParts(entry.message?.content, options);
     if (role === 'assistant') {
       const stopReason = typeof entry.message?.stopReason === 'string' ? entry.message.stopReason : undefined;
       const errorMessage = typeof entry.message?.errorMessage === 'string' ? entry.message.errorMessage : undefined;
@@ -7925,6 +7958,51 @@ function entryContentParts(entry: SessionEntry, options: { hideThinking: boolean
   if (entry.type === 'custom_message') return contentParts(entry.content, options);
   if (entry.type === 'compaction' || entry.type === 'branch_summary') return [{ type: 'text', text: contentText(entry.summary) }];
   return [{ type: 'text', text: entryText(entry) }];
+}
+
+function userMessageAttachments(entry: SessionEntry): UploadAsset[] {
+  if (!isUserMessageEntry(entry)) return [];
+  return splitAttachmentTrailer(userMessageTextContent(entry.message?.content)).attachments;
+}
+
+function userMessageTextContent(content: unknown) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (typeof part === 'string') return part;
+      if (part && typeof part === 'object') {
+        const text = (part as Record<string, unknown>).text;
+        if (typeof text === 'string') return text;
+      }
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  return contentText(content);
+}
+
+function stripAttachmentTrailerFromParts(parts: ChatContentPart[]): ChatContentPart[] {
+  let index = -1;
+  for (let partIndex = parts.length - 1; partIndex >= 0; partIndex -= 1) {
+    if (parts[partIndex].type === 'text') {
+      index = partIndex;
+      break;
+    }
+  }
+  if (index === -1) return parts;
+  const split = splitAttachmentTrailer(parts[index].text);
+  if (!split.attachments.length) return parts;
+  return parts.map((part, partIndex) => partIndex === index ? { ...part, text: split.text } : part).filter((part) => part.text.trim());
+}
+
+function splitAttachmentTrailer(text: string): { text: string; attachments: UploadAsset[] } {
+  const match = /(?:\r?\n){2,}Attached files in the workspace:\r?\n((?:- [^\r\n]+(?:\r?\n|$))+)[\t ]*$/.exec(text);
+  if (!match) return { text, attachments: [] };
+  const attachments = match[1].split(/\r?\n/).flatMap((line): UploadAsset[] => {
+    const filePath = line.startsWith('- ') ? line.slice(2).trim() : '';
+    return filePath ? [{ path: filePath }] : [];
+  });
+  if (!attachments.length) return { text, attachments: [] };
+  return { text: text.slice(0, match.index).trimEnd(), attachments: uniqueUploadAssets(attachments) };
 }
 
 function contentParts(content: unknown, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): ChatContentPart[] {

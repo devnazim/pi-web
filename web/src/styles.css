@@ -1750,6 +1750,55 @@ body {
     @apply justify-end;
   }
 
+  .chat-user-message {
+    @apply flex max-w-[78%] flex-col items-end gap-2;
+  }
+
+  .chat-user-message .chat-bubble {
+    @apply max-w-full;
+  }
+
+  .chat-attachments {
+    @apply flex max-w-full flex-wrap justify-end gap-2;
+  }
+
+  .chat-attachment-wrap {
+    @apply relative shrink-0;
+  }
+
+  .chat-attachment {
+    @apply overflow-hidden rounded-xl border border-border bg-card text-muted-foreground shadow-sm outline-none transition-all hover:border-ring/60 hover:bg-accent hover:text-accent-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50;
+  }
+
+  .chat-attachment-image {
+    @apply grid h-16 w-16 bg-muted;
+  }
+
+  .chat-attachment-document {
+    @apply flex h-11 max-w-64 items-center px-3 text-sm;
+  }
+
+  .chat-attachment-thumb {
+    @apply h-full w-full object-cover;
+  }
+
+  .chat-attachment-file {
+    @apply flex min-w-0 items-center gap-2;
+  }
+
+  .chat-attachment-file span {
+    @apply truncate;
+  }
+
+  .chat-attachment-tooltip {
+    @apply pointer-events-none absolute bottom-full right-0 z-50 mb-2 block max-w-64 truncate rounded-lg bg-popover px-2.5 py-1.5 text-xs font-medium text-popover-foreground opacity-0 shadow-md ring-1 ring-foreground/5 transition-opacity;
+  }
+
+  .chat-attachment-wrap:hover .chat-attachment-tooltip,
+  .chat-attachment-wrap:focus-within .chat-attachment-tooltip {
+    @apply opacity-100;
+  }
+
   .chat-search-entry {
     @apply flow-root rounded-2xl transition-colors;
     scroll-margin-top: 5rem;
@@ -2188,6 +2237,10 @@ body {
   }
 
   .chat-bubble {
+    max-width: 92%;
+  }
+
+  .chat-user-message {
     max-width: 92%;
   }
 
