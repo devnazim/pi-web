@@ -223,12 +223,13 @@ export class PiBridge {
     let subscription: (() => void) | undefined;
     try {
       markSessionIdle = await this.markSessionActive(projectPath, body.sessionId);
-      if (options.startEvent ?? true) this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
       const session = await this.getSession(projectPath, body.sessionId);
       await this.bindWebExtensions(session, projectPath, body.sessionId, key);
-      subscription = typeof session?.subscribe === 'function'
-        ? session.subscribe((event: unknown) => this.broadcast(key, { type: 'agent:event', sessionId: body.sessionId, data: event }))
-        : undefined;
+      const extensionCommand = this.isExtensionCommandPrompt(session, body.prompt);
+      const lifecycle = { started: false, finished: false };
+      subscription = this.subscribeSessionEvents(session, key, body.sessionId, { mirrorLifecycle: extensionCommand, lifecycle });
+      const useSyntheticStart = (options.startEvent ?? true) && !extensionCommand;
+      if (useSyntheticStart) this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
 
       if (body.treeTargetId) {
         if (typeof session?.navigateTree !== 'function') throw new Error('Loaded pi SDK session does not expose navigateTree()');
@@ -255,8 +256,14 @@ export class PiBridge {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
       }
 
-      if (typeof subscription === 'function') subscription();
-      this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
+      if (extensionCommand) await this.waitForCommandActivity(session, lifecycle);
+      subscription?.();
+      subscription = undefined;
+      const needsSyntheticFinish = !extensionCommand || (!lifecycle.started && options.startEvent === false);
+      if (needsSyntheticFinish) this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
+      else if (lifecycle.started && !lifecycle.finished && !this.cachedSessionInUse(session)) {
+        this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
+      }
     } catch (error) {
       subscription?.();
       this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Agent failed' });
@@ -416,6 +423,52 @@ export class PiBridge {
     if (typeof session?.abortCompaction === 'function' && session.isCompacting) session.abortCompaction();
     if (typeof session?.abortRetry === 'function' && session.isRetrying) session.abortRetry();
     if (typeof session?.abort === 'function') await session.abort();
+  }
+
+  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean } } = {}) {
+    if (typeof session?.subscribe !== 'function') return undefined;
+    return session.subscribe((event: unknown) => {
+      const type = agentEventType(event);
+      if (options.mirrorLifecycle && isCommandActivityStartEvent(type) && !options.lifecycle?.started) {
+        if (options.lifecycle) options.lifecycle.started = true;
+        this.broadcast(key, { type: 'agent:start', sessionId });
+      }
+      this.broadcast(key, { type: 'agent:event', sessionId, data: event });
+      if (options.mirrorLifecycle && type === 'agent_end') {
+        if (options.lifecycle) options.lifecycle.finished = true;
+        this.broadcast(key, { type: 'agent:finish', sessionId });
+      }
+    });
+  }
+
+  private isExtensionCommandPrompt(session: any, prompt: string) {
+    const commandName = slashCommandName(prompt);
+    return Boolean(commandName && typeof session?.extensionRunner?.getCommand === 'function' && session.extensionRunner.getCommand(commandName));
+  }
+
+  private async waitForCommandActivity(session: any, lifecycle: { started: boolean; finished: boolean }) {
+    if (this.cachedSessionInUse(session)) {
+      await this.waitForSessionIdle(session);
+      return;
+    }
+
+    const deadline = Date.now() + 250;
+    while (!lifecycle.started && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (this.cachedSessionInUse(session)) {
+        await this.waitForSessionIdle(session);
+        return;
+      }
+    }
+
+    if (lifecycle.started && !lifecycle.finished && this.cachedSessionInUse(session)) await this.waitForSessionIdle(session);
+  }
+
+  private async waitForSessionIdle(session: any) {
+    while (this.cachedSessionInUse(session)) {
+      if (this.cachedSessionIsStreaming(session) && typeof session?.agent?.waitForIdle === 'function') await session.agent.waitForIdle();
+      else await new Promise((resolve) => setTimeout(resolve, 100));
+    }
   }
 
   private async bindWebExtensions(session: any, projectPath: string, sessionId: string | undefined, key: string | string[]) {
@@ -851,6 +904,20 @@ export class PiBridge {
     });
   }
 
+  private cachedSessionIsStreaming(session: unknown) {
+    const candidates = [session];
+    if (session && typeof session === 'object') candidates.push((session as { session?: unknown }).session);
+    return candidates.some((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return false;
+      try {
+        const value = candidate as { isStreaming?: unknown; state?: { isStreaming?: unknown }; agent?: { state?: { isStreaming?: unknown } } };
+        return Boolean(value.isStreaming || value.state?.isStreaming || value.agent?.state?.isStreaming);
+      } catch {
+        return false;
+      }
+    });
+  }
+
   private async disposeCachedSession(session: unknown) {
     if (!session || typeof session !== 'object') return;
     const disposable = session as { dispose?: () => unknown; close?: () => unknown; destroy?: () => unknown };
@@ -1061,6 +1128,19 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
 
 function streamKey(projectId: string, sessionId?: string) {
   return `${projectId}:${sessionId ?? 'active'}`;
+}
+
+function slashCommandName(prompt: string) {
+  const match = prompt.trim().match(/^\/([^\s/]+)/);
+  return match?.[1];
+}
+
+function agentEventType(event: unknown) {
+  return event && typeof event === 'object' && typeof (event as { type?: unknown }).type === 'string' ? (event as { type: string }).type : undefined;
+}
+
+function isCommandActivityStartEvent(type: string | undefined) {
+  return type === 'agent_start' || type === 'compaction_start' || type === 'auto_retry_start' || type === 'message_update' || type === 'tool_execution_start';
 }
 
 function projectIdFromStreamKey(key: string) {

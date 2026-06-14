@@ -1136,11 +1136,12 @@ function Shell() {
     socket.addEventListener('message', (event) => {
       try {
         const parsed = JSON.parse(event.data) as { type?: string; sessionId?: string; data?: unknown };
-        if (parsed.type === 'agent:start') resetAgentEvents([event.data]);
+        const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
+        if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([event.data]);
         else if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
         const eventSessionId = parsed.sessionId ?? activeSessionId;
         if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
-        if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error') && eventSessionId) {
+        if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
           queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
           queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
           queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
@@ -4564,6 +4565,15 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     }
   }
 
+  async function isExtensionComposerCommand(sessionId: string, prompt: string) {
+    const commandName = composerSlashCommandName(prompt);
+    if (!commandName) return false;
+    const cached = slashCommands.data?.commands.find((command) => command.name === commandName);
+    if (cached) return cached.source === 'extension';
+    const result = await api<{ commands: SlashCommand[] }>(`/api/projects/${props.project.id}/agent/commands?sessionId=${encodeURIComponent(sessionId)}`);
+    return result.commands.find((command) => command.name === commandName)?.source === 'extension';
+  }
+
   function handleModelChange(value: string) {
     setModel(value);
     saveComposerControls({ model: value, thinking: thinkingLevel() });
@@ -4703,6 +4713,9 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
       }
       if (!sessionId) return;
     }
+    const extensionCommand = !shellCommand && compactCommand === undefined
+      ? await isExtensionComposerCommand(sessionId, prompt).catch(() => false)
+      : false;
 
     setText('');
     resetComposerHistory();
@@ -4732,7 +4745,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
         return;
       }
       addComposerHistory({ text: prompt, uploads: cloneUploadAssets(uploads()) });
-      setPendingUserMessage({ sessionId, text: prompt, userMessageCount: userMessageCount(transcriptEntries()) });
+      if (!extensionCommand) setPendingUserMessage({ sessionId, text: prompt, userMessageCount: userMessageCount(transcriptEntries()) });
       await api(`/api/projects/${props.project.id}/agent/prompt`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -7319,7 +7332,7 @@ function shouldShowAgentEvent(payload: string) {
     const parsed = JSON.parse(payload) as { type?: string; data?: unknown };
     if (parsed.type !== 'agent:event') return ['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'bash:start', 'bash:update', 'bash:finish', 'bash:error', 'error'].includes(parsed.type ?? '');
     const dataType = agentEventDataType(parsed.data);
-    return ['message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
+    return ['agent_start', 'agent_end', 'message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
   } catch {
     return true;
   }
@@ -7345,6 +7358,8 @@ function agentEventSummary(event: { type?: string; message?: string; data?: unkn
   const data = event.data && typeof event.data === 'object' ? event.data as Record<string, unknown> : {};
   const type = typeof data.type === 'string' ? data.type : 'event';
   const toolName = typeof data.toolName === 'string' ? data.toolName : 'tool';
+  if (type === 'agent_start') return { label: 'agent', text: 'started' };
+  if (type === 'agent_end') return { label: 'agent', text: 'finished' };
   if (type === 'tool_execution_start') return { label: 'tool', text: `started ${toolName}` };
   if (type === 'tool_execution_end') return { label: data.isError ? 'tool error' : 'tool', text: `finished ${toolName}` };
   if (type === 'auto_retry_start') return { label: 'retry', text: `attempt ${data.attempt ?? ''} after ${data.errorMessage ?? 'provider error'}` };
@@ -7427,6 +7442,19 @@ function agentActivity(events: string[]): AgentActivity {
     if (parsed.type !== 'agent:event' || !parsed.data || typeof parsed.data !== 'object') continue;
     const data = parsed.data as Record<string, unknown>;
     const type = typeof data.type === 'string' ? data.type : '';
+    if (type === 'agent_start') {
+      running = true;
+      error = undefined;
+      text = '';
+      thinking = '';
+      tools.clear();
+      notices.length = 0;
+      continue;
+    }
+    if (type === 'agent_end') {
+      running = false;
+      continue;
+    }
     if (['message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'compaction_start'].includes(type)) running = true;
     if (type === 'message_update') {
       const event = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
@@ -8181,6 +8209,11 @@ function activeSlashCommand(value: string, cursor: number): SlashCommandMention 
   const match = beforeCursor.match(/^\/([^\s/]*)$/);
   if (!match) return undefined;
   return { query: match[1], start: 0, end: cursor };
+}
+
+function composerSlashCommandName(prompt: string) {
+  const match = prompt.trim().match(/^\/([^\s/]+)/);
+  return match?.[1];
 }
 
 function activeCommandArgument(value: string, cursor: number): CommandArgumentMention | undefined {
