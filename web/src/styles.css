@@ -851,16 +851,11 @@ body {
   }
 
   .topbar-tool {
-    @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-transparent px-3 py-1.5 text-xs font-medium text-muted-foreground transition-all hover:bg-background/65 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground;
+    @apply inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl px-3 py-1.5 text-xs font-medium text-muted-foreground transition-all hover:bg-background/65 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted-foreground;
   }
 
   .topbar-tool-active {
     @apply bg-background text-foreground font-semibold dark:bg-primary dark:text-primary-foreground;
-    box-shadow: 0 1px 3px 0 oklch(0 0 0 / 0.12), 0 1px 2px 0 oklch(0 0 0 / 0.08);
-  }
-
-  .dark .topbar-tool-active {
-    box-shadow: 0 1px 4px 0 oklch(0 0 0 / 0.4);
   }
 
   .session-tree-list {
@@ -1016,12 +1011,11 @@ body {
     box-shadow: none;
   }
 
-  @media (max-width: 900px) {
+  @media (max-width: 900px) and (orientation: portrait) {
     .review-workspace.review-workspace {
       grid-template-columns: minmax(0, 1fr) !important;
-      grid-template-rows: auto minmax(22rem, 1fr);
-      overflow-x: hidden;
-      overflow-y: auto;
+      grid-template-rows: minmax(0, 42%) minmax(0, 1fr);
+      overflow: hidden;
       -webkit-overflow-scrolling: touch;
       overscroll-behavior: contain;
     }
@@ -1031,7 +1025,7 @@ body {
     }
 
     .review-workspace > main {
-      min-height: 22rem;
+      min-height: 0;
     }
 
     .review-resize-handle {
@@ -1041,7 +1035,7 @@ body {
 
   @media (max-width: 900px) and (orientation: landscape) {
     .review-workspace.review-workspace {
-      grid-template-columns: clamp(12rem, 38vw, 18rem) minmax(0, 1fr) !important;
+      grid-template-columns: clamp(12rem, 38vw, 18rem) auto minmax(0, 1fr) !important;
       grid-template-rows: minmax(0, 1fr);
       overflow: hidden;
     }
@@ -1056,26 +1050,26 @@ body {
   }
 
   .review-source-toggle-mobile {
+    display: inline-grid;
+  }
+
+  .review-workspace.review-source-hidden {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .review-source-hidden > .review-source-panel,
+  .review-source-hidden > .review-resize-handle {
     display: none;
   }
 
-  @media (max-width: 900px) {
-    .review-source-toggle-mobile {
-      display: inline-grid;
-    }
+  .review-source-hidden > main {
+    min-height: 0;
+  }
 
+  @media (max-width: 900px) {
     .review-workspace.review-source-hidden {
-      grid-template-columns: minmax(0, 1fr) !important;
       grid-template-rows: minmax(0, 1fr);
       overflow: hidden;
-    }
-
-    .review-source-hidden > .review-source-panel {
-      display: none;
-    }
-
-    .review-source-hidden > main {
-      min-height: 0;
     }
   }
 

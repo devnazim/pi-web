@@ -5249,7 +5249,80 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
 }
 
 let monacoWorkerInstalled = false;
+let monacoClipboardFallbackInstalled = false;
+let monacoClipboardFallbackText = '';
+
+function installMonacoClipboardFallback() {
+  if (monacoClipboardFallbackInstalled) return;
+  monacoClipboardFallbackInstalled = true;
+
+  const existingClipboard = (navigator as unknown as { clipboard?: Partial<Clipboard> }).clipboard;
+  if (existingClipboard?.write && existingClipboard.writeText && existingClipboard.readText && existingClipboard.read) return;
+
+  async function writeFallbackText(text: string) {
+    monacoClipboardFallbackText = text;
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    textarea.style.pointerEvents = 'none';
+    document.body.append(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+    } catch {
+      // Clipboard access can be unavailable on insecure origins.
+    } finally {
+      textarea.remove();
+    }
+  }
+
+  if (!window.ClipboardItem) {
+    class FallbackClipboardItem {
+      readonly presentationStyle = 'unspecified';
+      readonly types: string[];
+
+      constructor(private readonly items: Record<string, Blob | string | PromiseLike<Blob | string>>) {
+        this.types = Object.keys(items);
+      }
+
+      async getType(type: string) {
+        const value = await this.items[type];
+        return value instanceof Blob ? value : new Blob([value ?? ''], { type });
+      }
+
+      static supports() {
+        return false;
+      }
+    }
+
+    window.ClipboardItem = FallbackClipboardItem as unknown as typeof ClipboardItem;
+  }
+
+  const clipboardFallback = {
+    write: existingClipboard?.write?.bind(existingClipboard) ?? (async (items: ClipboardItem[]) => {
+      try {
+        const blob = await items[0]?.getType('text/plain');
+        if (blob) await writeFallbackText(await blob.text());
+      } catch {
+        // Ignore cancelled Monaco clipboard workaround promises.
+      }
+    }),
+    writeText: existingClipboard?.writeText?.bind(existingClipboard) ?? writeFallbackText,
+    read: existingClipboard?.read?.bind(existingClipboard) ?? (async () => []),
+    readText: existingClipboard?.readText?.bind(existingClipboard) ?? (async () => monacoClipboardFallbackText),
+  };
+
+  try {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: clipboardFallback });
+  } catch {
+    // Some browsers expose navigator.clipboard as non-configurable. Monaco will fall back to browser behavior there.
+  }
+}
+
 function installMonacoWorker() {
+  installMonacoClipboardFallback();
   if (monacoWorkerInstalled) return;
   (self as unknown as { MonacoEnvironment?: { getWorker: (_workerId: string, label: string) => Worker } }).MonacoEnvironment = {
     getWorker: (_workerId, label) => {
@@ -6432,8 +6505,10 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
   }
 
   return (
-    <section ref={reviewSplitRef} class={`review-workspace grid min-h-0 overflow-hidden bg-background ${sourceControlOpen() ? '' : 'review-source-hidden'}`} style={{ 'grid-template-columns': `${sourceControlPanel.size()}px auto minmax(0,1fr)` }}>
-      <aside id="review-source-control-panel" class="review-source-panel grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card">
+    <section ref={reviewSplitRef} class={`review-workspace grid min-h-0 overflow-hidden bg-background ${sourceControlOpen() ? '' : 'review-source-hidden'}`} style={{ 'grid-template-columns': sourceControlOpen() ? `${sourceControlPanel.size()}px auto minmax(0,1fr)` : 'minmax(0,1fr)' }}>
+      <Show when={sourceControlOpen()}>
+        <>
+          <aside id="review-source-control-panel" class="review-source-panel grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card">
         <div class="border-b border-border p-4">
           <div class="flex items-start justify-between gap-3">
             <div class="min-w-0">
@@ -6527,6 +6602,8 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
         onKeyDown={sourceControlPanel.resizeWithKeyboard}
         onPointerDown={sourceControlPanel.startResize}
       />
+        </>
+      </Show>
       <main class="grid min-h-0 grid-rows-[auto_1fr] overflow-hidden">
         <div class="review-preview-header">
           <div class="flex min-w-0 items-center gap-2">
