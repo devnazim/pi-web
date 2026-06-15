@@ -113,7 +113,7 @@ export async function getGitStatus(cwd: string): Promise<GitStatus> {
 
   const [{ stdout: branchOut }, { stdout: statusOut }, stagedStats, unstagedStats] = await Promise.all([
     runGit(cwd, ['branch', '--show-current']).catch(() => ({ stdout: '' })),
-    runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--', '.']).catch(() => ({ stdout: '' })),
+    runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch(() => ({ stdout: '' })),
     diffStats(cwd, true, context),
     diffStats(cwd, false, context),
   ]);
