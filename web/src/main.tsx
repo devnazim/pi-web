@@ -115,7 +115,7 @@ type LabelEditorState = { entry: SessionEntry; label?: string };
 
 type TreeContextAction = 'none' | 'summary' | 'custom';
 type TreeSelection = { entry: SessionEntry; branchFromId: string | null; text: string; contextAction: TreeContextAction; customInstructions: string; replaceInstructions: boolean };
-type FileMention = { query: string; start: number; end: number };
+type FileMention = { query: string; start: number; end: number; quoted?: boolean };
 type SlashCommandMention = { query: string; start: number; end: number };
 type CommandArgumentMention = { commandName: string; query: string; start: number; end: number };
 type SlashCommand = { name: string; description?: string; source: 'builtin' | 'extension' | 'prompt' | 'skill'; location?: string; path?: string; argumentHint?: string; hasArgumentCompletions?: boolean };
@@ -191,6 +191,7 @@ type AgentActivity = { running: boolean; error?: string; text: string; thinking:
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean };
 type SessionComposerControls = { model?: string; thinking?: ThinkingLevel | '' };
+type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; model?: string; thinking?: ThinkingLevel | '' };
 type ChatSearchState = { activeIndex: number; total: number };
 type ChatSearchRequest = { seq: number; direction: 1 | -1 };
 type WorkspaceNotificationLevel = 'info' | 'success' | 'warning' | 'error';
@@ -312,6 +313,7 @@ const REVIEW_SOURCE_CONTROL_RESIZE_KEY_STEP = 24;
 const RECENT_PROJECTS_KEY = 'pi-web-recent-projects';
 const RECENT_FILES_KEY_PREFIX = 'pi-web-recent-files:';
 const fileExplorerPaths = new Map<string, string>();
+const composerDrafts = new Map<string, ComposerDraft>();
 const OPEN_PROJECTS_KEY = 'pi-web-open-projects';
 const ACTIVE_PROJECT_KEY = 'pi-web-active-project';
 const PROJECT_QUERY_KEY = 'project';
@@ -1336,8 +1338,12 @@ function Shell() {
     });
   }
 
-  function selectSession(id: string) {
-    if (sessionId() === id) return;
+  function selectSession(id: string, workspaceId = workspaceProject()?.id, expectedSessionId?: string | null) {
+    const currentWorkspaceId = workspaceProject()?.id;
+    const currentSessionId = sessionId();
+    if (workspaceId && currentWorkspaceId !== workspaceId) return;
+    if (expectedSessionId !== undefined && currentSessionId !== (expectedSessionId ?? undefined)) return;
+    if (currentSessionId === id) return;
     const keepEvents = eventsBelongToSession(events(), id);
     setSessionId(id);
     if (!keepEvents) resetAgentEvents([]);
@@ -3779,7 +3785,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string) => void; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -3946,13 +3952,18 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
   );
 }
 
-function Chat(props: { project: Project; sessionId?: string; events: string[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string) => void; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; events: string[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
-  let commandSessionPromise: Promise<string | undefined> | undefined;
+  const commandSessionPromises = new Map<string, Promise<string | undefined>>();
+  const clearedComposerDraftKeys = new Set<string>();
   let previousSearchKey = '';
   let handledSearchRequestSeq = props.searchRequest.seq;
+  let activeComposerDraftKey: string | undefined;
+  let activeComposerDraftTreeSelection: TreeSelection | undefined;
+  let restoringComposerDraftTreeSelection: TreeSelection | undefined;
+  let runningCommandToken: symbol | undefined;
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
   let composerHistoryIndex: number | undefined;
@@ -4136,10 +4147,30 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   });
 
   createEffect(() => {
-    props.project.id;
-    props.sessionId;
-    setText('');
-    setUploads([]);
+    const nextComposerDraftKey = composerDraftKey(props.project.id, props.sessionId);
+    const nextTreeSelection = props.treeSelection;
+    if (activeComposerDraftKey === nextComposerDraftKey) {
+      activeComposerDraftTreeSelection = nextTreeSelection;
+      return;
+    }
+    if (activeComposerDraftKey) saveActiveComposerDraft(activeComposerDraftKey);
+    activeComposerDraftKey = nextComposerDraftKey;
+
+    const draft = readComposerDraft(nextComposerDraftKey);
+    activeComposerDraftTreeSelection = draft.treeSelection ?? nextTreeSelection;
+    if (draft.treeSelection) {
+      const treeSelection = draft.treeSelection;
+      restoringComposerDraftTreeSelection = treeSelection;
+      if (treeSelection !== nextTreeSelection) {
+        queueMicrotask(() => {
+          if (activeComposerDraftKey !== nextComposerDraftKey) return;
+          restoringComposerDraftTreeSelection = treeSelection;
+          props.onTreeSelection(treeSelection);
+        });
+      }
+    }
+    setText(draft.text);
+    setUploads(draft.uploads);
     setFileMention(undefined);
     setSlashCommandMention(undefined);
     setCommandArgumentMention(undefined);
@@ -4150,11 +4181,13 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     setComposerHistory(readComposerHistory(props.project.id, 'normal'));
     setComposerShellHistory(readComposerHistory(props.project.id, 'shell'));
     setPendingUserMessage((pending) => pending && props.sessionId && pending.sessionId === props.sessionId ? pending : undefined);
-    const storedControls = props.sessionId ? readSessionComposerControls(props.project.id, props.sessionId) : undefined;
-    setModel(storedControls && 'model' in storedControls ? storedControls.model ?? '' : '');
-    setThinkingLevel(storedControls && 'thinking' in storedControls ? storedControls.thinking ?? '' : '');
+    const controlsSessionId = props.sessionId ?? draft.commandSessionId;
+    const storedControls = controlsSessionId ? readSessionComposerControls(props.project.id, controlsSessionId) : undefined;
+    setModel(storedControls && 'model' in storedControls ? storedControls.model ?? '' : draft.model ?? '');
+    setThinkingLevel(storedControls && 'thinking' in storedControls ? storedControls.thinking ?? '' : draft.thinking ?? '');
     setSessionControlsHydratedKey(undefined);
-    if (props.sessionId) setCommandSessionId(undefined);
+    setCommandSessionId(props.sessionId ? undefined : draft.commandSessionId);
+    runningCommandToken = undefined;
     setRunningCommand(undefined);
     setStickToBottom(true);
     scrollTranscriptToBottom(true);
@@ -4211,6 +4244,13 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     syncComposerLayout();
   });
 
+  onCleanup(() => {
+    if (!activeComposerDraftKey) return;
+    const draftKey = activeComposerDraftKey;
+    activeComposerDraftKey = undefined;
+    saveActiveComposerDraft(draftKey);
+  });
+
   onMount(() => {
     let lastEscapeAt = 0;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -4232,6 +4272,25 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
       observer?.disconnect();
     });
   });
+
+  function saveActiveComposerDraft(key: string) {
+    const draft = {
+      text: untrack(text),
+      uploads: cloneUploadAssets(untrack(uploads)),
+      commandSessionId: untrack(commandSessionId),
+      treeSelection: activeComposerDraftTreeSelection,
+      model: untrack(model),
+      thinking: untrack(thinkingLevel),
+    };
+    if (clearedComposerDraftKeys.has(key)) {
+      clearedComposerDraftKeys.delete(key);
+      if (!draft.text && !draft.uploads.length) {
+        saveComposerDraft(key, { text: '', uploads: [] });
+        return;
+      }
+    }
+    saveComposerDraft(key, draft);
+  }
 
   function transcriptDistanceFromBottom(element: HTMLElement) {
     return element.scrollHeight - element.scrollTop - element.clientHeight;
@@ -4265,37 +4324,62 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     });
   }
 
-  async function ensureCommandSession() {
+  async function ensureCommandSession(draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId)) {
     const existing = autocompleteSessionId();
     if (existing) return existing;
-    if (commandSessionPromise) return commandSessionPromise;
-    commandSessionPromise = (async () => {
-      const result = await api<{ session: SessionSummary }>(`/api/projects/${props.project.id}/sessions`, { method: 'POST' });
-      setCommandSessionId(result.session.id);
-      queryClient.invalidateQueries({ queryKey: ['sessions', props.project.id] });
+    const pending = commandSessionPromises.get(draftKey);
+    if (pending) return pending;
+    const projectId = props.project.id;
+    const promise = (async () => {
+      const result = await api<{ session: SessionSummary }>(`/api/projects/${projectId}/sessions`, { method: 'POST' });
+      if (activeComposerDraftKey === draftKey) setCommandSessionId(result.session.id);
+      queryClient.invalidateQueries({ queryKey: ['sessions', projectId] });
       return result.session.id;
     })();
+    commandSessionPromises.set(draftKey, promise);
     try {
-      return await commandSessionPromise;
+      return await promise;
     } finally {
-      commandSessionPromise = undefined;
+      if (commandSessionPromises.get(draftKey) === promise) commandSessionPromises.delete(draftKey);
     }
   }
 
   async function attach(files: Array<globalThis.File> | null) {
     if (!files?.length) return;
-    const sessionId = props.sessionId ?? await ensureCommandSession();
+    const draftKey = activeComposerDraftKey;
+    const draftSessionId = props.sessionId;
+    const projectId = props.project.id;
+    let sessionId = draftSessionId ?? commandSessionId();
+    if (!sessionId) sessionId = await ensureCommandSession(draftKey);
     if (!sessionId) return;
     const form = new FormData();
     files.forEach((file) => form.append('file', file));
-    const result = await api<{ uploaded: Array<{ filename: string; path: string; bytes: number }> }>(`/api/projects/${props.project.id}/uploads?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST', body: form });
-    resetComposerHistory();
-    setUploads((items) => uniqueUploadAssets([...items, ...result.uploaded]));
+    const result = await api<{ uploaded: Array<{ filename: string; path: string; bytes: number }> }>(`/api/projects/${projectId}/uploads?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST', body: form });
+    if (activeComposerDraftKey === draftKey) {
+      resetComposerHistory();
+      setUploads((items) => composerUploadAssets([...items, ...result.uploaded]));
+      return;
+    }
+    if (!draftKey) return;
+    const draft = readComposerDraft(draftKey);
+    saveComposerDraft(draftKey, {
+      ...draft,
+      uploads: uniqueUploadAssets([...draft.uploads, ...result.uploaded]),
+      commandSessionId: draft.commandSessionId ?? (draftSessionId ? undefined : sessionId),
+    });
   }
 
   createEffect(() => {
     const selection = props.treeSelection;
-    if (!selection) return;
+    if (!selection) {
+      restoringComposerDraftTreeSelection = undefined;
+      return;
+    }
+    if (selection === restoringComposerDraftTreeSelection) {
+      restoringComposerDraftTreeSelection = undefined;
+      return;
+    }
+    if (activeComposerDraftKey) clearedComposerDraftKeys.delete(activeComposerDraftKey);
     resetComposerHistory();
     setText(selection.text);
   });
@@ -4359,13 +4443,18 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     composerHistoryDraft = { text: '', uploads: [] };
   }
 
-  function addComposerHistory(item: ComposerHistoryItem, mode: ComposerHistoryMode = 'normal') {
-    const current = mode === 'shell' ? composerShellHistory() : composerHistory();
+  function addComposerHistory(item: ComposerHistoryItem, mode: ComposerHistoryMode = 'normal', projectId = props.project.id) {
+    const currentProject = projectId === props.project.id;
+    const current = currentProject
+      ? (mode === 'shell' ? composerShellHistory() : composerHistory())
+      : readComposerHistory(projectId, mode);
     const next = prependComposerHistory(current, item);
     if (next === current) return;
-    if (mode === 'shell') setComposerShellHistory(next);
-    else setComposerHistory(next);
-    writeComposerHistory(props.project.id, mode, next);
+    if (currentProject) {
+      if (mode === 'shell') setComposerShellHistory(next);
+      else setComposerHistory(next);
+    }
+    writeComposerHistory(projectId, mode, next);
   }
 
   function setComposerFromHistory(target: HTMLTextAreaElement, item: ComposerHistoryItem, cursor: 'start' | 'end') {
@@ -4401,7 +4490,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
       event.preventDefault();
       if (composerHistoryIndex === undefined) {
         composerHistoryMode = mode;
-        composerHistoryDraft = { text: target.value, uploads: cloneUploadAssets(uploads()) };
+        composerHistoryDraft = { text: target.value, uploads: composerUploadAssets(uploads()) };
       }
       composerHistoryIndex = (composerHistoryIndex ?? -1) + 1;
       setComposerFromHistory(target, history[composerHistoryIndex], 'start');
@@ -4508,18 +4597,19 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     const mention = fileMention();
     if (!mention) return;
     const suffix = text().slice(mention.end);
-    const insert = `@${file.path}${suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' '}`;
+    const fileReference = formatComposerFileReference(file.path, mention.quoted);
+    const insert = `${fileReference}${suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' '}`;
     const nextText = `${text().slice(0, mention.start)}${insert}${suffix}`;
     const cursor = mention.start + insert.length;
     resetComposerHistory();
     setText(nextText);
-    setUploads((items) => uniqueUploadAssets([...items, { path: file.path, filename: file.name }]));
     setFileMention(undefined);
     setSlashCommandMention(undefined);
     setCommandArgumentMention(undefined);
     requestAnimationFrame(() => {
       composerRef?.focus();
       composerRef?.setSelectionRange(cursor, cursor);
+      syncComposerLayout();
     });
   }
 
@@ -4578,50 +4668,59 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     }
   }
 
-  async function compactSession(sessionId: string, instructions: string | undefined, mirrorActiveStream: boolean) {
-    await api(`/api/projects/${props.project.id}/agent/compact`, {
+  async function compactSession(projectId: string, sessionId: string, instructions: string | undefined, mirrorActiveStream: boolean) {
+    await api(`/api/projects/${projectId}/agent/compact`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId, instructions, mirrorActiveStream }),
     });
-    await queryClient.invalidateQueries({ queryKey: ['session', props.project.id, sessionId] });
-    await queryClient.invalidateQueries({ queryKey: ['session-tree', props.project.id, sessionId] });
-    await queryClient.invalidateQueries({ queryKey: ['sessions', props.project.id] });
-    await queryClient.invalidateQueries({ queryKey: ['agent-status', props.project.id, sessionId] });
+    await queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] });
+    await queryClient.invalidateQueries({ queryKey: ['session-tree', projectId, sessionId] });
+    await queryClient.invalidateQueries({ queryKey: ['sessions', projectId] });
+    await queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, sessionId] });
   }
 
-  async function executeShellCommand(sessionId: string, command: { command: string; excludeFromContext: boolean }, mirrorActiveStream: boolean) {
-    setRunningCommand(command.command);
+  async function executeShellCommand(projectId: string, sessionId: string, command: { command: string; excludeFromContext: boolean }, mirrorActiveStream: boolean, reflectActivity: () => boolean) {
+    const token = Symbol('running-command');
+    if (reflectActivity()) {
+      runningCommandToken = token;
+      setRunningCommand(command.command);
+    }
     try {
-      await api<BashCommandResult>(`/api/projects/${props.project.id}/agent/bash`, {
+      await api<BashCommandResult>(`/api/projects/${projectId}/agent/bash`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId, command: command.command, excludeFromContext: command.excludeFromContext, mirrorActiveStream }),
       });
-      await queryClient.invalidateQueries({ queryKey: ['session', props.project.id, sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ['session-tree', props.project.id, sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ['sessions', props.project.id] });
-      await queryClient.invalidateQueries({ queryKey: ['agent-status', props.project.id, sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ['session-tree', projectId, sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ['sessions', projectId] });
+      await queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, sessionId] });
     } finally {
-      setRunningCommand(undefined);
+      if (reflectActivity() && runningCommandToken === token) {
+        runningCommandToken = undefined;
+        setRunningCommand(undefined);
+      }
     }
   }
 
-  async function isExtensionComposerCommand(sessionId: string, prompt: string) {
+  async function isExtensionComposerCommand(projectId: string, sessionId: string, prompt: string) {
     const commandName = composerSlashCommandName(prompt);
     if (!commandName) return false;
     const cached = slashCommands.data?.commands.find((command) => command.name === commandName);
     if (cached) return cached.source === 'extension';
-    const result = await api<{ commands: SlashCommand[] }>(`/api/projects/${props.project.id}/agent/commands?sessionId=${encodeURIComponent(sessionId)}`);
+    const result = await api<{ commands: SlashCommand[] }>(`/api/projects/${projectId}/agent/commands?sessionId=${encodeURIComponent(sessionId)}`);
     return result.commands.find((command) => command.name === commandName)?.source === 'extension';
   }
 
   function handleModelChange(value: string) {
+    if (activeComposerDraftKey) clearedComposerDraftKeys.delete(activeComposerDraftKey);
     setModel(value);
     saveComposerControls({ model: value, thinking: thinkingLevel() });
   }
 
   function handleThinkingLevelChange(value: ThinkingLevel | '') {
+    if (activeComposerDraftKey) clearedComposerDraftKeys.delete(activeComposerDraftKey);
     setThinkingLevel(value);
     saveComposerControls({ model: model(), thinking: value });
   }
@@ -4631,16 +4730,10 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     if (sessionId) writeSessionComposerControls(props.project.id, sessionId, controls);
   }
 
-  function promptModelOverride() {
-    if (model()) return model();
-    return defaultModelReference(effectiveSettings());
-  }
-
-  function promptThinkingOverride(): ThinkingLevel | undefined {
-    if (thinkingLevel()) return thinkingLevel() as ThinkingLevel;
-    const sessionId = props.sessionId ?? commandSessionId();
-    const stored = sessionId ? readSessionComposerControls(props.project.id, sessionId) : undefined;
-    return stored && 'thinking' in stored ? effectiveSettings()?.defaultThinkingLevel ?? 'medium' : undefined;
+  function promptThinkingOverride(selectedThinkingLevel: ThinkingLevel | '', sessionId: string, projectId: string, defaultThinkingLevel: ThinkingLevel | undefined): ThinkingLevel | undefined {
+    if (selectedThinkingLevel) return selectedThinkingLevel;
+    const stored = readSessionComposerControls(projectId, sessionId);
+    return stored && 'thinking' in stored ? defaultThinkingLevel ?? 'medium' : undefined;
   }
 
   function handleComposerKeyDown(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
@@ -4737,80 +4830,111 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   async function send(event: SubmitEvent) {
     event.preventDefault();
     const prompt = text().trim();
-    const uploadAssets = cloneUploadAssets(uploads());
-    const attachments = uploadAssets.map((asset) => asset.path);
+    const uploadAssets = composerUploadAssets(uploads());
     if (!prompt || busy()) return;
+    const projectId = props.project.id;
+    const routeSessionId = props.sessionId;
+    const submittedDraftKey = activeComposerDraftKey;
+    const submittedTreeSelection = props.treeSelection ?? activeComposerDraftTreeSelection;
+    const submittedModel = model();
+    const submittedThinkingLevel = thinkingLevel();
+    const submittedDefaultModel = defaultModelReference(effectiveSettings());
+    const submittedDefaultThinkingLevel = effectiveSettings()?.defaultThinkingLevel;
+    let submittedCommandSessionId = commandSessionId();
     const shellCommand = parseShellComposerCommand(prompt);
     const compactCommand = parseCompactComposerCommand(prompt);
-    let sessionId = props.sessionId ?? commandSessionId();
-    const mirrorActiveStream = !props.sessionId;
+    let sessionId = routeSessionId ?? commandSessionId();
+    const mirrorActiveStream = !routeSessionId;
     if (compactCommand !== undefined && !sessionId) return;
     if (!sessionId) {
       try {
-        sessionId = await ensureCommandSession();
+        sessionId = await ensureCommandSession(submittedDraftKey);
       } catch (error) {
         console.error('Could not create chat session', error);
         return;
       }
       if (!sessionId) return;
     }
-    if (model() || thinkingLevel()) writeSessionComposerControls(props.project.id, sessionId, { model: model(), thinking: thinkingLevel() });
+    const submittedSessionId = sessionId;
+    if (mirrorActiveStream) submittedCommandSessionId = submittedSessionId;
+    if (submittedModel || submittedThinkingLevel) writeSessionComposerControls(projectId, submittedSessionId, { model: submittedModel, thinking: submittedThinkingLevel });
     const extensionCommand = !shellCommand && compactCommand === undefined
-      ? await isExtensionComposerCommand(sessionId, prompt).catch(() => false)
+      ? await isExtensionComposerCommand(projectId, submittedSessionId, prompt).catch(() => false)
       : false;
+    const submittedComposerStillActive = () => activeComposerDraftKey === submittedDraftKey;
+    const submittedWorkspaceStillCurrent = () => props.project.id === projectId && (!props.sessionId || props.sessionId === submittedSessionId);
+    const selectSubmittedSession = () => {
+      if (mirrorActiveStream && submittedWorkspaceStillCurrent()) props.onSession(submittedSessionId, projectId, routeSessionId ?? null);
+    };
 
-    setText('');
-    resetComposerHistory();
-    setFileMention(undefined);
-    setSlashCommandMention(undefined);
-    setCommandArgumentMention(undefined);
-    setStickToBottom(true);
-    scrollTranscriptToBottom(true);
+    if (submittedComposerStillActive()) {
+      setText('');
+      setUploads([]);
+      resetComposerHistory();
+      setFileMention(undefined);
+      setSlashCommandMention(undefined);
+      setCommandArgumentMention(undefined);
+      setStickToBottom(true);
+      scrollTranscriptToBottom(true);
+    }
+    if (submittedDraftKey) {
+      clearedComposerDraftKeys.add(submittedDraftKey);
+      saveComposerDraft(submittedDraftKey, { text: '', uploads: [] });
+    }
 
     try {
       if (shellCommand) {
-        addComposerHistory({ text: prompt, uploads: [] }, 'shell');
-        await executeShellCommand(sessionId, shellCommand, mirrorActiveStream);
-        if (mirrorActiveStream) props.onSession(sessionId);
-        setUploads([]);
-        props.onTreeSelection(undefined);
-        scrollTranscriptToBottom(true);
+        addComposerHistory({ text: prompt, uploads: [] }, 'shell', projectId);
+        await executeShellCommand(projectId, submittedSessionId, shellCommand, mirrorActiveStream, submittedComposerStillActive);
+        selectSubmittedSession();
+        if (submittedComposerStillActive()) {
+          props.onTreeSelection(undefined);
+          scrollTranscriptToBottom(true);
+        }
         return;
       }
       if (compactCommand !== undefined) {
-        addComposerHistory({ text: prompt, uploads: [] });
-        await compactSession(sessionId, compactCommand, mirrorActiveStream);
-        if (mirrorActiveStream) props.onSession(sessionId);
-        setUploads([]);
-        props.onTreeSelection(undefined);
-        scrollTranscriptToBottom(true);
+        addComposerHistory({ text: prompt, uploads: [] }, 'normal', projectId);
+        await compactSession(projectId, submittedSessionId, compactCommand, mirrorActiveStream);
+        selectSubmittedSession();
+        if (submittedComposerStillActive()) {
+          props.onTreeSelection(undefined);
+          scrollTranscriptToBottom(true);
+        }
         return;
       }
-      addComposerHistory({ text: prompt, uploads: uploadAssets });
-      if (!extensionCommand) setPendingUserMessage({ sessionId, text: prompt, attachments: uploadAssets, userMessageCount: userMessageCount(transcriptEntries()) });
-      await api(`/api/projects/${props.project.id}/agent/prompt`, {
+      const attachmentAssets = uniqueUploadAssets([...uploadAssets, ...await resolveComposerFileReferenceAssets(projectId, prompt)]);
+      const attachments = attachmentAssets.map((asset) => asset.path);
+      addComposerHistory({ text: prompt, uploads: uploadAssets }, 'normal', projectId);
+      if (!extensionCommand && submittedComposerStillActive()) setPendingUserMessage({ sessionId: submittedSessionId, text: prompt, attachments: attachmentAssets, userMessageCount: userMessageCount(transcriptEntries()) });
+      await api(`/api/projects/${projectId}/agent/prompt`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          sessionId,
-          treeTargetId: props.treeSelection?.entry.id,
-          treeSummary: props.treeSelection ? treeSummaryOptions(props.treeSelection) : undefined,
+          sessionId: submittedSessionId,
+          treeTargetId: submittedTreeSelection?.entry.id,
+          treeSummary: submittedTreeSelection ? treeSummaryOptions(submittedTreeSelection) : undefined,
           prompt,
           attachments,
           mirrorActiveStream,
-          model: promptModelOverride(),
-          thinking: promptThinkingOverride(),
+          model: submittedModel || submittedDefaultModel,
+          thinking: promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel),
         }),
       });
-      if (mirrorActiveStream) props.onSession(sessionId);
-      setUploads([]);
-      props.onTreeSelection(undefined);
-      scrollTranscriptToBottom(true);
+      selectSubmittedSession();
+      if (submittedComposerStillActive()) {
+        props.onTreeSelection(undefined);
+        scrollTranscriptToBottom(true);
+      }
     } catch (error) {
-      setPendingUserMessage(undefined);
-      if (!text().trim()) {
+      if (submittedDraftKey) clearedComposerDraftKeys.delete(submittedDraftKey);
+      setPendingUserMessage((pending) => pending?.sessionId === submittedSessionId ? undefined : pending);
+      if (activeComposerDraftKey === submittedDraftKey && !text().trim() && composerUploadAssets(uploads()).length === 0) {
         setText(prompt);
+        setUploads(uploadAssets);
         syncComposerLayout();
+      } else if (submittedDraftKey && !composerDrafts.has(submittedDraftKey)) {
+        saveComposerDraft(submittedDraftKey, { text: prompt, uploads: uploadAssets, commandSessionId: submittedCommandSessionId, treeSelection: submittedTreeSelection, model: submittedModel, thinking: submittedThinkingLevel });
       }
       console.error('Could not send chat message', error);
     }
@@ -4942,7 +5066,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
             </div>
           </Show>
           <div class="composer-editor">
-            <ComposerHighlights text={text()} attachments={uploads()} setRef={(element) => { composerHighlightsRef = element; }} />
+            <ComposerHighlights text={text()} setRef={(element) => { composerHighlightsRef = element; }} />
             <textarea
               ref={composerRef}
               class="composer-textarea"
@@ -4989,10 +5113,10 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   );
 }
 
-function ComposerHighlights(props: { text: string; attachments: UploadAsset[]; setRef?: (element: HTMLDivElement) => void }) {
+function ComposerHighlights(props: { text: string; setRef?: (element: HTMLDivElement) => void }) {
   return (
     <div ref={props.setRef} class="composer-highlights" aria-hidden="true">
-      <For each={composerHighlightParts(props.text, props.attachments)}>
+      <For each={composerHighlightParts(props.text)}>
         {(part) => <span class={part.kind === 'file' ? 'composer-highlight-file' : ''}>{part.text}</span>}
       </For>
     </div>
@@ -8470,31 +8594,37 @@ function richTextParts(text: string): RichTextPart[] {
 
 function plainRichTextParts(text: string): RichTextPart[] {
   const result: RichTextPart[] = [];
-  const textPattern = /\*\*([^*\n]+)\*\*|@[A-Za-z0-9._~/-]+/g;
+  const textPattern = /\*\*([^*\n]+)\*\*/g;
   let cursor = 0;
   let match: RegExpExecArray | null;
   while ((match = textPattern.exec(text))) {
-    if (match.index > cursor) result.push({ text: text.slice(cursor, match.index) });
-    result.push(match[1] ? { text: match[1], kind: 'strong' } : { text: match[0], kind: 'file' });
+    if (match.index > cursor) appendFileMentionParts(result, text.slice(cursor, match.index));
+    result.push({ text: match[1], kind: 'strong' });
     cursor = match.index + match[0].length;
   }
-  if (cursor < text.length) result.push({ text: text.slice(cursor) });
+  if (cursor < text.length) appendFileMentionParts(result, text.slice(cursor));
   return result;
 }
 
-function composerHighlightParts(text: string, attachments: UploadAsset[]): RichTextPart[] {
-  const attachedPaths = new Set(attachments.map((asset) => asset.path));
+function composerHighlightParts(text: string): RichTextPart[] {
   const result: RichTextPart[] = [];
-  const mentionPattern = /@[A-Za-z0-9._~/-]+/g;
+  appendFileMentionParts(result, text);
+  return result.length ? result : [{ text }];
+}
+
+function appendFileMentionParts(result: RichTextPart[], text: string) {
+  const mentionPattern = /(^|[\s([{])(@(?:"(?:\\.|[^"\n])*(?:"|$)|[A-Za-z0-9._~/-]*))/g;
   let cursor = 0;
   let match: RegExpExecArray | null;
   while ((match = mentionPattern.exec(text))) {
-    if (match.index > cursor) result.push({ text: text.slice(cursor, match.index) });
-    result.push({ text: match[0], kind: attachedPaths.has(match[0].slice(1)) ? 'file' : undefined });
-    cursor = match.index + match[0].length;
+    const leading = match[1] ?? '';
+    const mention = match[2] ?? '';
+    const mentionStart = match.index + leading.length;
+    if (mentionStart > cursor) result.push({ text: text.slice(cursor, mentionStart) });
+    result.push({ text: mention, kind: 'file' });
+    cursor = mentionStart + mention.length;
   }
   if (cursor < text.length) result.push({ text: text.slice(cursor) });
-  return result.length ? result : [{ text }];
 }
 
 function assetUrl(projectId: string, filePath: string) {
@@ -8519,9 +8649,21 @@ function isTextPath(filePath: string) {
 
 function activeFileMention(value: string, cursor: number): FileMention | undefined {
   const beforeCursor = value.slice(0, cursor);
-  const match = beforeCursor.match(/(^|[\s([{])@([^\s@]*)$/);
+  const quotedMatch = beforeCursor.match(/(^|[\s([{])@"((?:\\.|[^"\n])*)$/);
+  if (quotedMatch) return { query: unescapeComposerFileReferenceQuery(quotedMatch[2]), start: cursor - quotedMatch[2].length - 2, end: cursor, quoted: true };
+  const match = beforeCursor.match(/(^|[\s([{])@([A-Za-z0-9._~/-]*)$/);
   if (!match) return undefined;
   return { query: match[2], start: cursor - match[2].length - 1, end: cursor };
+}
+
+function formatComposerFileReference(filePath: string, forceQuoted = false) {
+  const normalizedPath = filePath.replace(/\\/g, '/');
+  if (!forceQuoted && /^[A-Za-z0-9._~/-]+$/.test(normalizedPath)) return `@${normalizedPath}`;
+  return `@"${normalizedPath.replace(/["\\]/g, (character) => `\\${character}`)}"`;
+}
+
+function unescapeComposerFileReferenceQuery(value: string) {
+  return value.replace(/\\(["\\])/g, '$1');
 }
 
 function activeSlashCommand(value: string, cursor: number): SlashCommandMention | undefined {
@@ -8769,6 +8911,59 @@ function uniqueUploadAssets(items: UploadAsset[]) {
   const byPath = new Map<string, UploadAsset>();
   for (const item of items) byPath.set(item.path, { ...byPath.get(item.path), ...item });
   return [...byPath.values()];
+}
+
+function composerUploadAssets(items: UploadAsset[]) {
+  return uniqueUploadAssets(cloneUploadAssets(items).flatMap((asset): UploadAsset[] => {
+    const path = asset.path.trim();
+    return isWorkspaceUploadPath(path) ? [{ ...asset, path }] : [];
+  }));
+}
+
+function isWorkspaceUploadPath(filePath: string) {
+  return filePath.replace(/\\/g, '/').startsWith('.pi-web/uploads/');
+}
+
+async function resolveComposerFileReferenceAssets(projectId: string, value: string): Promise<UploadAsset[]> {
+  const paths = uniqueStrings(composerFileReferencePaths(value)).slice(0, 50);
+  const assets = await Promise.all(paths.map(async (filePath): Promise<UploadAsset | undefined> => {
+    const result = await api<{ files: ProjectFileSearchEntry[] }>(`/api/projects/${projectId}/files/search?query=${encodeURIComponent(filePath)}`).catch(() => undefined);
+    const file = result?.files.find((item) => item.path === filePath);
+    return file ? { path: file.path, filename: file.name } : undefined;
+  }));
+  return uniqueUploadAssets(assets.filter((asset): asset is UploadAsset => Boolean(asset)));
+}
+
+function composerFileReferencePaths(value: string) {
+  const paths: string[] = [];
+  const mentionPattern = /(^|[\s([{])@(?:"((?:\\.|[^"\n])*)(?:"|$)|([A-Za-z0-9._~/-]+))/g;
+  let match: RegExpExecArray | null;
+  while ((match = mentionPattern.exec(value))) {
+    const filePath = (match[2]
+      ? unescapeComposerFileReferenceQuery(match[2])
+      : (match[3] ?? '').replace(/[.,!?;:)}\]"']+$/, '')
+    ).trim();
+    if (filePath) paths.push(filePath);
+  }
+  return paths;
+}
+
+function composerDraftKey(projectId: string, sessionId?: string) {
+  return `${projectId}\0${sessionId ?? ''}`;
+}
+
+function readComposerDraft(key: string): ComposerDraft {
+  const draft = composerDrafts.get(key);
+  return draft ? { text: draft.text, uploads: composerUploadAssets(draft.uploads), commandSessionId: draft.commandSessionId, treeSelection: draft.treeSelection, model: draft.model, thinking: draft.thinking } : { text: '', uploads: [] };
+}
+
+function saveComposerDraft(key: string, draft: ComposerDraft) {
+  const uploads = composerUploadAssets(draft.uploads);
+  if (!draft.text && !uploads.length && !draft.treeSelection && !draft.model && !draft.thinking) {
+    composerDrafts.delete(key);
+    return;
+  }
+  composerDrafts.set(key, { text: draft.text, uploads, commandSessionId: draft.commandSessionId, treeSelection: draft.treeSelection, model: draft.model, thinking: draft.thinking });
 }
 
 function uploadAssetLabel(asset: UploadAsset) {

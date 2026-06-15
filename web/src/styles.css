@@ -1226,11 +1226,11 @@ body {
   }
 
   .composer-highlight-file {
-    @apply rounded bg-primary/10 px-0.5 text-foreground;
+    @apply text-indigo-600 dark:text-indigo-400;
   }
 
   .composer-textarea {
-    @apply relative w-full resize-none overflow-y-auto overflow-x-hidden bg-transparent py-4 pl-4 text-sm leading-6 text-transparent caret-foreground outline-none placeholder:text-muted-foreground;
+    @apply relative w-full resize-none overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-words bg-transparent py-4 pl-4 text-sm leading-6 text-transparent caret-foreground outline-none placeholder:text-muted-foreground;
     font-family: inherit;
     min-height: calc((1.5rem * 2) + 2rem);
     max-height: calc((1.5rem * 7) + 2rem);

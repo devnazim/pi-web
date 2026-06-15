@@ -8,8 +8,6 @@ export const COMPOSER_HISTORY_LIMIT = 100;
 const COMPOSER_HISTORY_KEY = 'pi-web-composer-history';
 const COMPOSER_SHELL_HISTORY_KEY = 'pi-web-composer-shell-history';
 const WORKSPACE_UPLOADS_ROOT = '.pi-web/uploads/';
-const SESSION_UPLOAD_PATH_PREFIX = `${WORKSPACE_UPLOADS_ROOT}sessions/`;
-const LEGACY_SESSION_UPLOAD_DIR_PATTERN = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[A-Za-z0-9_-]{32,})$/i;
 
 export function composerHistoryModeForDraft(value: string): ComposerHistoryMode | undefined {
   if (!value) return 'normal';
@@ -77,17 +75,13 @@ export function writeComposerHistory(projectId: string, mode: ComposerHistoryMod
 function durableComposerHistoryUploads(items: UploadAsset[]) {
   return uniqueUploadAssets(cloneUploadAssets(items).flatMap((asset): UploadAsset[] => {
     const path = asset.path.trim();
-    if (!path || isSessionScopedUploadPath(path)) return [];
+    if (!path || !isProjectScopedUploadPath(path)) return [];
     return [{ ...asset, path }];
   }));
 }
 
-function isSessionScopedUploadPath(filePath: string) {
-  const normalized = filePath.replace(/\\/g, '/');
-  if (normalized.startsWith(SESSION_UPLOAD_PATH_PREFIX)) return true;
-  if (!normalized.startsWith(WORKSPACE_UPLOADS_ROOT)) return false;
-  const uploadDir = normalized.slice(WORKSPACE_UPLOADS_ROOT.length).split('/')[0] ?? '';
-  return uploadDir !== 'project' && uploadDir !== 'sessions' && LEGACY_SESSION_UPLOAD_DIR_PATTERN.test(uploadDir);
+function isProjectScopedUploadPath(filePath: string) {
+  return filePath.replace(/\\/g, '/').startsWith(`${WORKSPACE_UPLOADS_ROOT}project/`);
 }
 
 function composerHistoryItemsEqual(a: ComposerHistoryItem, b: ComposerHistoryItem) {

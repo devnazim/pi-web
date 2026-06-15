@@ -58,7 +58,6 @@ describe('composer history', () => {
       {
         text: 'hello',
         uploads: [
-          { path: 'src/a.ts', filename: 'a.ts' },
           { path: '.pi-web/uploads/project/logo.png', filename: 'logo.png', bytes: 42 },
         ],
       },
@@ -89,7 +88,7 @@ describe('composer history', () => {
     writeComposerHistory('project-1', 'shell', [{ text: '!git status', uploads: [] }], storage);
 
     assert.deepEqual(readComposerHistory('project-1', 'normal', storage), [
-      { text: 'normal prompt', uploads: [{ path: 'src/a.ts', filename: undefined, bytes: undefined }] },
+      { text: 'normal prompt', uploads: [] },
     ]);
     assert.deepEqual(readComposerHistory('project-1', 'shell', storage), [{ text: '!git status', uploads: [] }]);
   });
@@ -113,7 +112,6 @@ describe('composer history', () => {
 
     assert.deepEqual(readComposerHistory('project-1', 'normal', storage), [
       { text: 'keep', uploads: [{ path: '.pi-web/uploads/project/logo.png', filename: 'logo.png', bytes: 123 }] },
-      { text: '', uploads: [{ path: 'src/context.md', filename: undefined, bytes: undefined }] },
     ]);
   });
 });
