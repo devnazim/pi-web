@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Pi Web</title>
+  <desc id="desc">A clear pi symbol cut across a golden pie chart on a dark rounded tile.</desc>
+  <defs>
+    <linearGradient id="tile" x1="72" y1="44" x2="440" y2="468" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#27272a" />
+      <stop offset="0.55" stop-color="#111113" />
+      <stop offset="1" stop-color="#18181b" />
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(256 256) rotate(90) scale(244)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f59e0b" stop-opacity="0.24" />
+      <stop offset="0.62" stop-color="#f97316" stop-opacity="0.12" />
+      <stop offset="1" stop-color="#f97316" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="crust" x1="126" y1="104" x2="382" y2="414" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fde68a" />
+      <stop offset="0.46" stop-color="#f59e0b" />
+      <stop offset="1" stop-color="#b45309" />
+    </linearGradient>
+    <linearGradient id="filling" x1="160" y1="132" x2="352" y2="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fed7aa" />
+      <stop offset="0.42" stop-color="#fb923c" />
+      <stop offset="1" stop-color="#c2410c" />
+    </linearGradient>
+    <linearGradient id="slice" x1="276" y1="100" x2="426" y2="286" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fef3c7" />
+      <stop offset="0.55" stop-color="#fbbf24" />
+      <stop offset="1" stop-color="#ea580c" />
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#tile)" />
+  <rect width="512" height="512" rx="112" fill="url(#glow)" />
+  <rect x="40" y="40" width="432" height="432" rx="88" fill="none" stroke="#ffffff" stroke-opacity="0.11" stroke-width="8" />
+
+  <ellipse cx="256" cy="402" rx="134" ry="24" fill="#000000" opacity="0.28" />
+  <circle cx="256" cy="256" r="164" fill="url(#crust)" />
+  <circle cx="256" cy="256" r="126" fill="url(#filling)" />
+  <path d="M256 256L352 123A164 164 0 0 1 420 256Z" fill="url(#slice)" stroke="#fff7ed" stroke-opacity="0.72" stroke-width="10" stroke-linejoin="round" />
+  <circle cx="256" cy="256" r="164" fill="none" stroke="#fff7ed" stroke-opacity="0.38" stroke-width="12" />
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M140 171H374M205 171V351M313 171V306C313 347 337 369 377 369" stroke="#111113" stroke-width="64" opacity="0.9" />
+    <path d="M140 171H374M205 171V351M313 171V306C313 347 337 369 377 369" stroke="#fff7ed" stroke-width="34" opacity="0.96" />
+    <path d="M152 171H362" stroke="#fef3c7" stroke-width="12" opacity="0.75" />
+  </g>
+</svg>
