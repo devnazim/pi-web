@@ -103,6 +103,25 @@ type GitFileSelection = { path: string; staged: boolean };
 type GitFileActionMenuState = { file: GitFile; staged: boolean; x: number; y: number };
 type GitFileDiff = { path: string; staged: boolean; original: string; modified: string; unavailable?: boolean; message?: string; patch?: string };
 type GitStatus = { branch: string; files: GitFile[] };
+type ReviewEditorKind = 'diff' | 'patch';
+type ReviewDiffEditorViewState = import('monaco-editor').editor.IDiffEditorViewState;
+type ReviewPatchEditorViewState = import('monaco-editor').editor.ICodeEditorViewState;
+type ReviewEditorState =
+  | { kind: 'diff'; key: string; viewState: ReviewDiffEditorViewState }
+  | { kind: 'patch'; key: string; viewState: ReviewPatchEditorViewState };
+type ReviewWorkspaceState = {
+  selected?: GitFileSelection;
+  sourceControlOpen: boolean;
+  sourceControlWidth: number;
+  stagedOpen: boolean;
+  unstagedOpen: boolean;
+  fileListScrollTop: number;
+  fileListScrollLeft: number;
+  previewPath?: string;
+  commitDialogOpen: boolean;
+  commitMessage: string;
+  editorState?: ReviewEditorState;
+};
 type ProjectFileEntry = { name: string; type: 'directory' | 'file' };
 type ProjectFilesResponse = { path: string; entries: ProjectFileEntry[] };
 type ProjectFilePreview = { path: string; content: string; truncated?: boolean; mtimeMs?: number; size?: number; etag?: string; contentHash?: string };
@@ -450,6 +469,27 @@ function createResizableDimension(options: {
   onCleanup(() => stopResize?.());
 
   return { size, resizing, maxSize: options.maxSize, setClampedSize, startResize, resizeWithKeyboard };
+}
+
+function createReviewWorkspaceState(): ReviewWorkspaceState {
+  return {
+    sourceControlOpen: true,
+    sourceControlWidth: REVIEW_SOURCE_CONTROL_DEFAULT_WIDTH,
+    stagedOpen: true,
+    unstagedOpen: true,
+    fileListScrollTop: 0,
+    fileListScrollLeft: 0,
+    commitDialogOpen: false,
+    commitMessage: '',
+  };
+}
+
+function reviewFileSelectionKey(selection?: GitFileSelection) {
+  return selection ? `${selection.staged ? 'staged' : 'unstaged'}:${selection.path}` : '';
+}
+
+function reviewEditorStateKey(path: string, staged: boolean, kind: ReviewEditorKind) {
+  return `${staged ? 'staged' : 'unstaged'}:${kind}:${path}`;
 }
 
 const PROJECT_COLORS: ProjectColor[] = [
@@ -3328,8 +3368,13 @@ function CheckboxControl(props: { checked: boolean; label: string; onChange: (ch
   );
 }
 
-function Collapsible(props: { title: JSX.Element; children: JSX.Element; class?: string; triggerClass?: string; defaultOpen?: boolean }) {
-  const [open, setOpen] = createSignal(Boolean(props.defaultOpen));
+function Collapsible(props: { title: JSX.Element; children: JSX.Element; class?: string; triggerClass?: string; defaultOpen?: boolean; open?: boolean; onOpenChange?: (open: boolean) => void }) {
+  const [uncontrolledOpen, setUncontrolledOpen] = createSignal(Boolean(props.defaultOpen));
+  const open = () => props.open ?? uncontrolledOpen();
+  const setOpen = (value: boolean) => {
+    if (props.open === undefined) setUncontrolledOpen(value);
+    props.onOpenChange?.(value);
+  };
   return (
     <div class={props.class} data-open={open() ? 'true' : 'false'}>
       <button type="button" class={`collapsible-trigger ${props.triggerClass ?? ''}`} aria-expanded={open()} onClick={() => setOpen(!open())}>
@@ -3790,6 +3835,15 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
   let terminalServerFileInvalidationTimer: number | undefined;
+  const reviewWorkspaceStates = new Map<string, ReviewWorkspaceState>();
+  function reviewWorkspaceState(projectId: string) {
+    let state = reviewWorkspaceStates.get(projectId);
+    if (!state) {
+      state = createReviewWorkspaceState();
+      reviewWorkspaceStates.set(projectId, state);
+    }
+    return state;
+  }
   const terminalFileInvalidationProjectIds = new Set<string>();
   const terminalServerFileInvalidationProjectIds = new Set<string>();
   const [treeSelection, setTreeSelection] = createSignal<TreeSelection>();
@@ -3944,7 +3998,9 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
               </Show>
             }
           >
-            <ReviewWorkspace project={project()} themeMode={props.themeMode} onClose={props.onClosePanel} />
+            <Show when={project()} keyed>
+              {(reviewProject) => <ReviewWorkspace project={reviewProject} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} onClose={props.onClosePanel} />}
+            </Show>
           </Show>
         )}
       </Show>
@@ -6437,8 +6493,13 @@ function FileRenameDialog(props: { entry: FileEntryMenuState; onCancel: () => vo
   );
 }
 
-function GitCommitDialog(props: { stagedCount: number; busy: boolean; error: string; onCancel: () => void; onConfirm: (message: string) => void | Promise<void> }) {
-  const [message, setMessage] = createSignal('');
+function GitCommitDialog(props: { stagedCount: number; busy: boolean; error: string; message?: string; onMessage?: (message: string) => void; onCancel: () => void; onConfirm: (message: string) => void | Promise<void> }) {
+  const [uncontrolledMessage, setUncontrolledMessage] = createSignal(props.message ?? '');
+  const message = () => props.message ?? uncontrolledMessage();
+  const setMessage = (value: string) => {
+    if (props.message === undefined) setUncontrolledMessage(value);
+    props.onMessage?.(value);
+  };
   const canSubmit = createMemo(() => Boolean(message().trim()) && props.stagedCount > 0 && !props.busy);
 
   createEffect(() => {
@@ -6485,10 +6546,11 @@ function GitCommitDialog(props: { stagedCount: number; busy: boolean; error: str
   );
 }
 
-function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode; onClose: () => void }) {
+function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState; themeMode: ResolvedThemeMode; onClose: () => void }) {
   let reviewSplitRef: HTMLDivElement | undefined;
+  let fileListRef: HTMLDivElement | undefined;
   const sourceControlPanel = createResizableDimension({
-    defaultSize: REVIEW_SOURCE_CONTROL_DEFAULT_WIDTH,
+    defaultSize: props.state.sourceControlWidth,
     minSize: REVIEW_SOURCE_CONTROL_MIN_WIDTH,
     maxSize: () => Math.max(REVIEW_SOURCE_CONTROL_MIN_WIDTH, (reviewSplitRef?.getBoundingClientRect().width ?? window.innerWidth) - REVIEW_PREVIEW_MIN_WIDTH),
     keyStep: REVIEW_SOURCE_CONTROL_RESIZE_KEY_STEP,
@@ -6498,11 +6560,14 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
     decreaseKey: 'ArrowLeft',
     cursor: 'ew-resize',
   });
-  const [selected, setSelected] = createSignal<GitFileSelection>();
-  const [sourceControlOpen, setSourceControlOpen] = createSignal(true);
-  const [previewPath, setPreviewPath] = createSignal<string>();
+  const [selected, setSelected] = createSignal<GitFileSelection | undefined>(props.state.selected);
+  const [sourceControlOpen, setSourceControlOpen] = createSignal(props.state.sourceControlOpen);
+  const [previewPath, setPreviewPath] = createSignal<string | undefined>(props.state.previewPath);
+  const [stagedOpen, setStagedOpen] = createSignal(props.state.stagedOpen);
+  const [unstagedOpen, setUnstagedOpen] = createSignal(props.state.unstagedOpen);
   let gitFileLongPressTimer: number | undefined;
-  const [commitDialogOpen, setCommitDialogOpen] = createSignal(false);
+  const [commitDialogOpen, setCommitDialogOpen] = createSignal(props.state.commitDialogOpen);
+  const [commitMessage, setCommitMessage] = createSignal(props.state.commitMessage);
   const [commitBusy, setCommitBusy] = createSignal(false);
   const [commitError, setCommitError] = createSignal('');
   const [discardTarget, setDiscardTarget] = createSignal<GitFile>();
@@ -6540,7 +6605,10 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
   ]);
   const selectedStatus = createMemo(() => (status.data?.status.files ?? []).find((file) => file.path === selected()?.path));
 
-  onCleanup(() => clearGitFileLongPress());
+  onCleanup(() => {
+    clearGitFileLongPress();
+    if (fileListRef) saveFileListScroll(fileListRef);
+  });
 
   createEffect(() => {
     if (!reviewSplitRef) return;
@@ -6556,10 +6624,101 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
   });
 
   createEffect(() => {
+    props.state.sourceControlWidth = sourceControlPanel.size();
+  });
+
+  createEffect(() => {
+    if (!sourceControlOpen()) return;
+    stagedOpen();
+    unstagedOpen();
+    stagedFiles().length;
+    unstagedFiles().length;
+    queueMicrotask(restoreFileListScroll);
+  });
+
+  createEffect(() => {
     const files = selectableFiles();
     const current = selected();
-    if (current && !files.some((file) => file.path === current.path && file.staged === current.staged)) setSelected(undefined);
+    if (!current || !status.data) return;
+    if (!files.some((file) => file.path === current.path && file.staged === current.staged)) setReviewSelected(undefined);
   });
+
+  function saveFileListScroll(element: HTMLDivElement) {
+    props.state.fileListScrollTop = element.scrollTop;
+    props.state.fileListScrollLeft = element.scrollLeft;
+  }
+
+  function restoreFileListScroll() {
+    if (!fileListRef) return;
+    fileListRef.scrollTop = props.state.fileListScrollTop;
+    fileListRef.scrollLeft = props.state.fileListScrollLeft;
+  }
+
+  function setReviewSelected(selection?: GitFileSelection) {
+    if (reviewFileSelectionKey(selection) !== reviewFileSelectionKey(selected())) props.state.editorState = undefined;
+    setSelected(selection);
+    props.state.selected = selection;
+  }
+
+  function setReviewSourceControlOpen(open: boolean) {
+    setSourceControlOpen(open);
+    props.state.sourceControlOpen = open;
+  }
+
+  function setReviewPreviewPath(path?: string) {
+    setPreviewPath(path);
+    props.state.previewPath = path;
+  }
+
+  function setReviewCommitDialogOpen(open: boolean) {
+    setCommitDialogOpen(open);
+    props.state.commitDialogOpen = open;
+  }
+
+  function setReviewCommitMessage(message: string) {
+    setCommitMessage(message);
+    props.state.commitMessage = message;
+  }
+
+  function closeCommitDialog() {
+    setReviewCommitDialogOpen(false);
+    setReviewCommitMessage('');
+    setCommitError('');
+  }
+
+  function setReviewStagedOpen(open: boolean) {
+    setStagedOpen(open);
+    props.state.stagedOpen = open;
+  }
+
+  function setReviewUnstagedOpen(open: boolean) {
+    setUnstagedOpen(open);
+    props.state.unstagedOpen = open;
+  }
+
+  function diffEditorViewState(path: string, staged: boolean) {
+    const editorState = props.state.editorState;
+    const key = reviewEditorStateKey(path, staged, 'diff');
+    return editorState?.kind === 'diff' && editorState.key === key ? editorState.viewState : undefined;
+  }
+
+  function patchEditorViewState(path: string, staged: boolean) {
+    const editorState = props.state.editorState;
+    const key = reviewEditorStateKey(path, staged, 'patch');
+    return editorState?.kind === 'patch' && editorState.key === key ? editorState.viewState : undefined;
+  }
+
+  function saveDiffEditorViewState(path: string, staged: boolean, viewState: ReviewDiffEditorViewState) {
+    const current = selected();
+    if (!current || current.path !== path || current.staged !== staged) return;
+    props.state.editorState = { kind: 'diff', key: reviewEditorStateKey(path, staged, 'diff'), viewState };
+  }
+
+  function savePatchEditorViewState(path: string, staged: boolean, viewState: ReviewPatchEditorViewState) {
+    const current = selected();
+    if (!current || current.path !== path || current.staged !== staged) return;
+    props.state.editorState = { kind: 'patch', key: reviewEditorStateKey(path, staged, 'patch'), viewState };
+  }
 
   async function gitAction(action: 'stage' | 'unstage' | 'discard', file: string) {
     const actionKey = `${action}:${file}`;
@@ -6587,7 +6746,8 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
       const nextStatus = await api<{ status: GitStatus }>(`/api/projects/${props.project.id}/git/commit`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: commitMessage }) });
       queryClient.setQueryData(['git-status', props.project.id], nextStatus);
       queryClient.invalidateQueries({ queryKey: ['git-file-diff', props.project.id] });
-      setCommitDialogOpen(false);
+      setReviewCommitDialogOpen(false);
+      setReviewCommitMessage('');
     } catch (error) {
       setCommitError(errorMessage(error, 'Could not commit changes'));
     } finally {
@@ -6613,7 +6773,7 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
   }
 
   function selectFile(file: GitFile, staged: boolean) {
-    setSelected({ path: file.path, staged });
+    setReviewSelected({ path: file.path, staged });
   }
 
   function clearGitFileLongPress() {
@@ -6654,19 +6814,19 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
             </div>
             <div class="flex shrink-0 items-center gap-1.5">
               <button class="project-modal-close shrink-0" title="Refresh changes" onClick={refreshReview}><RefreshCw class="size-4" /></button>
-              <button class="project-modal-close shrink-0 review-source-toggle-mobile" title="Hide changes" aria-label="Hide changes" aria-controls="review-source-control-panel" aria-expanded={sourceControlOpen()} onClick={() => setSourceControlOpen(false)}><PanelLeftClose class="size-4" /></button>
+              <button class="project-modal-close shrink-0 review-source-toggle-mobile" title="Hide changes" aria-label="Hide changes" aria-controls="review-source-control-panel" aria-expanded={sourceControlOpen()} onClick={() => setReviewSourceControlOpen(false)}><PanelLeftClose class="size-4" /></button>
               <button class="project-modal-close shrink-0 review-close-mobile" title="Close reviewer" onClick={props.onClose}><X class="size-4" /></button>
             </div>
           </div>
           <div class="mt-4 flex gap-2">
-            <button class="button flex-1" type="button" disabled={!canCommit()} onClick={() => { setCommitError(''); setCommitDialogOpen(true); }}>{commitBusy() ? 'Committing...' : 'Commit'}</button>
+            <button class="button flex-1" type="button" disabled={!canCommit()} onClick={() => { setCommitError(''); setReviewCommitDialogOpen(true); }}>{commitBusy() ? 'Committing...' : 'Commit'}</button>
           </div>
           <Show when={actionError()}>
             <div class="mt-3 rounded-2xl bg-destructive/10 px-3 py-2 text-xs text-destructive ring-1 ring-destructive/20">{actionError()}</div>
           </Show>
         </div>
-        <div class="review-file-list min-h-0 overflow-auto p-3">
-          <PanelSection title={`Staged Changes ${stagedFiles().length}`}>
+        <div ref={fileListRef} class="review-file-list min-h-0 overflow-auto p-3" onScroll={(event) => saveFileListScroll(event.currentTarget)}>
+          <PanelSection title={`Staged Changes ${stagedFiles().length}`} open={stagedOpen()} onOpenChange={setReviewStagedOpen}>
             <div class="space-y-1">
               <For each={stagedFiles()} fallback={<div class="review-empty-section">No staged changes.</div>}>
                 {(file) => (
@@ -6694,7 +6854,7 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
               </For>
             </div>
           </PanelSection>
-          <PanelSection title={`Changes ${unstagedFiles().length}`}>
+          <PanelSection title={`Changes ${unstagedFiles().length}`} open={unstagedOpen()} onOpenChange={setReviewUnstagedOpen}>
             <div class="space-y-1">
               <For each={unstagedFiles()} fallback={<div class="review-empty-section">No working tree changes.</div>}>
                 {(file) => (
@@ -6745,13 +6905,13 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
         <div class="review-preview-header">
           <div class="flex min-w-0 items-center gap-2">
             <Show when={!sourceControlOpen()}>
-              <button class="project-modal-close shrink-0 review-source-toggle-mobile" title="Show changes" aria-label="Show changes" aria-controls="review-source-control-panel" aria-expanded={sourceControlOpen()} onClick={() => setSourceControlOpen(true)}><PanelLeftOpen class="size-4" /></button>
+              <button class="project-modal-close shrink-0 review-source-toggle-mobile" title="Show changes" aria-label="Show changes" aria-controls="review-source-control-panel" aria-expanded={sourceControlOpen()} onClick={() => setReviewSourceControlOpen(true)}><PanelLeftOpen class="size-4" /></button>
             </Show>
             <div class="min-w-0">
               <div class="flex items-center gap-1.5">
                 <Show when={selected()} fallback={<div class="truncate text-sm font-medium">{gitFileDisplayPath(selectedStatus())}</div>}>
-                  <button class="truncate text-sm font-medium text-left hover:underline" onClick={() => setPreviewPath(selected()!.path)}>{gitFileDisplayPath(selectedStatus())}</button>
-                  <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Open file" onClick={() => setPreviewPath(selected()!.path)}><ExternalLink class="size-3.5" /></button>
+                  <button class="truncate text-sm font-medium text-left hover:underline" onClick={() => setReviewPreviewPath(selected()!.path)}>{gitFileDisplayPath(selectedStatus())}</button>
+                  <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Open file" onClick={() => setReviewPreviewPath(selected()!.path)}><ExternalLink class="size-3.5" /></button>
                 </Show>
               </div>
               <div class="text-xs text-muted-foreground">{selected() ? (selected()?.staged ? 'Staged changes' : 'Working tree changes') : 'No preview open'}<Show when={selectedStatus()}> · {selectedStatus()?.status}</Show></div>
@@ -6765,11 +6925,11 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
               <Show when={fileDiff.data}>
                 {(diff) => (
                   <Show when={!diff().unavailable} fallback={<div class="review-preview-empty">{diff().message ?? 'Diff preview is not available for this file.'}</div>}>
-                    <Show when={diff().patch} fallback={<ReviewDiffEditor path={diff().path} original={diff().original} modified={diff().modified} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />}>
+                    <Show when={diff().patch} fallback={<ReviewDiffEditor path={diff().path} original={diff().original} modified={diff().modified} viewStateKey={reviewEditorStateKey(diff().path, diff().staged, 'diff')} viewState={diffEditorViewState(diff().path, diff().staged)} onViewStateChange={(viewState) => saveDiffEditorViewState(diff().path, diff().staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />}>
                       {(patch) => (
                         <div class="review-patch-preview">
                           <Show when={diff().message}><div class="review-patch-message">{diff().message}</div></Show>
-                          <ReviewPatchEditor path={diff().path} patch={patch()} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />
+                          <ReviewPatchEditor path={diff().path} patch={patch()} viewStateKey={reviewEditorStateKey(diff().path, diff().staged, 'patch')} viewState={patchEditorViewState(diff().path, diff().staged)} onViewStateChange={(viewState) => savePatchEditorViewState(diff().path, diff().staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />
                         </div>
                       )}
                     </Show>
@@ -6795,7 +6955,9 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
           stagedCount={stagedFiles().length}
           busy={commitBusy()}
           error={commitError()}
-          onCancel={() => { setCommitDialogOpen(false); setCommitError(''); }}
+          message={commitMessage()}
+          onMessage={setReviewCommitMessage}
+          onCancel={closeCommitDialog}
           onConfirm={commitChanges}
         />
       </Show>
@@ -6812,7 +6974,7 @@ function ReviewWorkspace(props: { project: Project; themeMode: ResolvedThemeMode
         )}
       </Show>
       <Show when={previewPath()}>
-        {(path) => <AssetPreviewModal project={props.project} path={path()} themeMode={props.themeMode} onClose={() => setPreviewPath(undefined)} />}
+        {(path) => <AssetPreviewModal project={props.project} path={path()} themeMode={props.themeMode} onClose={() => setReviewPreviewPath(undefined)} />}
       </Show>
     </section>
   );
@@ -6856,22 +7018,44 @@ function GitFileActionMenu(props: { menu: GitFileActionMenuState; onDismiss: () 
   );
 }
 
-function ReviewDiffEditor(props: { path: string; original: string; modified: string; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme }) {
+function ReviewDiffEditor(props: { path: string; original: string; modified: string; viewStateKey: string; viewState?: ReviewDiffEditorViewState; onViewStateChange?: (viewState: ReviewDiffEditorViewState) => void; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme }) {
   let containerRef: HTMLDivElement | undefined;
   let monacoApi: MonacoApi | undefined;
   let editor: import('monaco-editor').editor.IStandaloneDiffEditor | undefined;
   let originalModel: import('monaco-editor').editor.ITextModel | undefined;
   let modifiedModel: import('monaco-editor').editor.ITextModel | undefined;
   let currentPath = '';
+  let appliedViewStateKey = '';
   const [sideBySide, setSideBySide] = createSignal(true);
+
+  function saveViewState() {
+    const viewState = editor?.saveViewState();
+    if (viewState) props.onViewStateChange?.(viewState);
+  }
+
+  function resetViewState() {
+    editor?.getOriginalEditor().setPosition({ lineNumber: 1, column: 1 });
+    editor?.getModifiedEditor().setPosition({ lineNumber: 1, column: 1 });
+    editor?.getOriginalEditor().setScrollPosition({ scrollTop: 0, scrollLeft: 0 });
+    editor?.getModifiedEditor().setScrollPosition({ scrollTop: 0, scrollLeft: 0 });
+  }
+
+  function applyViewState() {
+    if (!editor || appliedViewStateKey === props.viewStateKey) return;
+    if (props.viewState) editor.restoreViewState(props.viewState);
+    else resetViewState();
+    appliedViewStateKey = props.viewStateKey;
+  }
 
   function createModels(monaco: MonacoApi) {
     originalModel?.dispose();
     modifiedModel?.dispose();
     currentPath = props.path;
+    appliedViewStateKey = '';
     originalModel = monaco.editor.createModel(props.original, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'review-original', path: `/${props.path}` }));
     modifiedModel = monaco.editor.createModel(props.modified, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'review-modified', path: `/${props.path}` }));
     editor?.setModel({ original: originalModel, modified: modifiedModel });
+    applyViewState();
   }
 
   onMount(() => {
@@ -6916,6 +7100,7 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
     onCleanup(() => {
       disposed = true;
       mediaQuery.removeEventListener('change', updateLayoutMode);
+      saveViewState();
       editor?.dispose();
       originalModel?.dispose();
       modifiedModel?.dispose();
@@ -6933,6 +7118,13 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
     }
     if (originalModel.getValue() !== original) originalModel.setValue(original);
     if (modifiedModel.getValue() !== modified) modifiedModel.setValue(modified);
+    applyViewState();
+  });
+
+  createEffect(() => {
+    props.viewStateKey;
+    props.viewState;
+    applyViewState();
   });
 
   createEffect(() => {
@@ -6953,12 +7145,30 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
   return <div ref={containerRef} class="review-diff-editor" aria-label={`Diff preview of ${props.path}`} />;
 }
 
-function ReviewPatchEditor(props: { path: string; patch: string; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme }) {
+function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: string; viewState?: ReviewPatchEditorViewState; onViewStateChange?: (viewState: ReviewPatchEditorViewState) => void; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme }) {
   let containerRef: HTMLDivElement | undefined;
   let monacoApi: MonacoApi | undefined;
   let editor: import('monaco-editor').editor.IStandaloneCodeEditor | undefined;
   let model: import('monaco-editor').editor.ITextModel | undefined;
   let latestPatch = props.patch;
+  let appliedViewStateKey = '';
+
+  function saveViewState() {
+    const viewState = editor?.saveViewState();
+    if (viewState) props.onViewStateChange?.(viewState);
+  }
+
+  function resetViewState() {
+    editor?.setPosition({ lineNumber: 1, column: 1 });
+    editor?.setScrollPosition({ scrollTop: 0, scrollLeft: 0 });
+  }
+
+  function applyViewState() {
+    if (!editor || appliedViewStateKey === props.viewStateKey) return;
+    if (props.viewState) editor.restoreViewState(props.viewState);
+    else resetViewState();
+    appliedViewStateKey = props.viewStateKey;
+  }
 
   onMount(() => {
     let disposed = false;
@@ -6990,9 +7200,11 @@ function ReviewPatchEditor(props: { path: string; patch: string; themeMode: Reso
         padding: { top: 14, bottom: 14 },
         scrollbar: { useShadows: false, horizontal: 'auto', vertical: 'auto' },
       });
+      applyViewState();
     });
     onCleanup(() => {
       disposed = true;
+      saveViewState();
       editor?.dispose();
       model?.dispose();
     });
@@ -7003,6 +7215,13 @@ function ReviewPatchEditor(props: { path: string; patch: string; themeMode: Reso
     if (patch === latestPatch) return;
     latestPatch = patch;
     if (model?.getValue() !== patch) model?.setValue(patch);
+    applyViewState();
+  });
+
+  createEffect(() => {
+    props.viewStateKey;
+    props.viewState;
+    applyViewState();
   });
 
   createEffect(() => {
@@ -7017,13 +7236,15 @@ function ReviewPatchEditor(props: { path: string; patch: string; themeMode: Reso
   return <div ref={containerRef} class="review-patch-editor" aria-label={`Patch preview of ${props.path}`} />;
 }
 
-function PanelSection(props: { title: string; children: JSX.Element }) {
+function PanelSection(props: { title: string; children: JSX.Element; open?: boolean; onOpenChange?: (open: boolean) => void }) {
   return (
     <Collapsible
       class="review-panel-section"
       triggerClass="review-panel-trigger"
       title={<span>{props.title}</span>}
       defaultOpen
+      open={props.open}
+      onOpenChange={props.onOpenChange}
     >
       {props.children}
     </Collapsible>
