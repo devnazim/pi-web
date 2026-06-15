@@ -202,6 +202,7 @@ type WorkspaceNotificationSummary = { total: number; unread: number; running: nu
 type WorkspaceLookupEntry = { workspace: ProjectWorkspace; project: Project; rootProject: Project };
 
 type WorkspaceNotificationServerEvent = { type?: string; projectId?: string; sessionId?: string; message?: string; data?: unknown };
+type FaviconStatus = 'idle' | 'unread' | 'running' | 'error';
 
 const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
 const THINKING_LEVEL_VALUE_OPTIONS: SelectOption[] = [
@@ -333,6 +334,13 @@ const WORKSPACE_SHORTCUT_KEYS = '123456789'.split('');
 const CHAT_SEARCH_INPUT_SELECTOR = '[data-chat-search-input="true"]';
 const SHORTCUT_BLOCKING_DIALOG_SELECTOR = '.project-modal-backdrop, .confirm-modal-backdrop, .file-search-backdrop, .asset-preview-backdrop';
 const KEYBINDINGS_STORAGE_KEY = 'pi-web-keybindings';
+const FAVICON_HREF = '/favicon.svg';
+const FAVICON_SIZE = 512;
+const FAVICON_BADGE_META: Record<Exclude<FaviconStatus, 'idle'>, { color: string; glyph: 'dot' | 'play' | 'alert' }> = {
+  unread: { color: '#f59e0b', glyph: 'dot' },
+  running: { color: '#22c55e', glyph: 'play' },
+  error: { color: '#ef4444', glyph: 'alert' },
+};
 
 // Ctrl+. is an app-specific chord prefix that avoids browser-reserved shortcuts
 // like Ctrl/Cmd+F, Ctrl/Cmd+P, and Ctrl/Cmd+,, plus Ctrl/Cmd+K readline/editor conflicts.
@@ -621,6 +629,7 @@ function Shell() {
     for (const workspaceId of Object.keys(workspaceLookup())) summaries[workspaceId] = workspaceNotificationSummary(workspaceNotificationStore()[workspaceId]);
     return summaries;
   });
+  const faviconStatus = createMemo(() => faviconStatusFromSummaries(Object.values(workspaceNotificationSummaries())));
   const projectNotificationSummaries = createMemo(() => {
     const summaries: Record<string, WorkspaceNotificationSummary> = {};
     const lookup = workspaceLookup();
@@ -1006,6 +1015,10 @@ function Shell() {
     document.documentElement.dataset.theme = resolvedMode;
     if (mode === 'system') localStorage.removeItem(THEME_MODE_KEY);
     else localStorage.setItem(THEME_MODE_KEY, mode);
+  });
+
+  createEffect(() => {
+    updateFaviconStatus(faviconStatus());
   });
 
   createEffect(() => {
@@ -7793,6 +7806,130 @@ function shortPath(path: string) {
 function singleLine(text: string) {
   const line = text.replace(/[\n\t]+/g, ' ').trim();
   return line.length > 80 ? `${line.slice(0, 77)}...` : line;
+}
+
+function faviconStatusFromSummaries(summaries: WorkspaceNotificationSummary[]): FaviconStatus {
+  if (summaries.some((summary) => summary.error)) return 'error';
+  if (summaries.some((summary) => summary.running)) return 'running';
+  if (summaries.some((summary) => summary.unread)) return 'unread';
+  return 'idle';
+}
+
+const faviconStatusCache = new Map<FaviconStatus, string>();
+let faviconBaseImagePromise: Promise<HTMLImageElement> | undefined;
+let faviconUpdateId = 0;
+let currentFaviconStatus: FaviconStatus | undefined;
+
+function updateFaviconStatus(status: FaviconStatus) {
+  if (currentFaviconStatus === status) return;
+  currentFaviconStatus = status;
+  const updateId = ++faviconUpdateId;
+
+  if (status === 'idle') {
+    setFaviconHref(FAVICON_HREF, 'image/svg+xml');
+    return;
+  }
+
+  const cachedHref = faviconStatusCache.get(status);
+  if (cachedHref) {
+    setFaviconHref(cachedHref, 'image/png');
+    return;
+  }
+
+  loadFaviconBaseImage()
+    .then((image) => {
+      if (updateId !== faviconUpdateId) return;
+      const href = drawFaviconStatus(image, status);
+      faviconStatusCache.set(status, href);
+      setFaviconHref(href, 'image/png');
+    })
+    .catch(() => {
+      if (updateId === faviconUpdateId) setFaviconHref(FAVICON_HREF, 'image/svg+xml');
+    });
+}
+
+function setFaviconHref(href: string, type: string) {
+  const link = document.querySelector<HTMLLinkElement>('link[rel~="icon"]') ?? document.head.appendChild(document.createElement('link'));
+  link.rel = 'icon';
+  link.type = type;
+  link.href = href;
+}
+
+function loadFaviconBaseImage() {
+  faviconBaseImagePromise ??= new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error('Could not load favicon'));
+    image.src = FAVICON_HREF;
+  });
+  return faviconBaseImagePromise;
+}
+
+function drawFaviconStatus(image: HTMLImageElement, status: Exclude<FaviconStatus, 'idle'>) {
+  const canvas = document.createElement('canvas');
+  canvas.width = FAVICON_SIZE;
+  canvas.height = FAVICON_SIZE;
+  const context = canvas.getContext('2d');
+  if (!context) throw new Error('Canvas unavailable');
+
+  context.drawImage(image, 0, 0, FAVICON_SIZE, FAVICON_SIZE);
+  drawFaviconBadge(context, status);
+  return canvas.toDataURL('image/png');
+}
+
+function drawFaviconBadge(context: CanvasRenderingContext2D, status: Exclude<FaviconStatus, 'idle'>) {
+  const { color, glyph } = FAVICON_BADGE_META[status];
+  const x = 384;
+  const y = 128;
+  const radius = 112;
+
+  context.save();
+  context.shadowColor = 'rgb(0 0 0 / 0.45)';
+  context.shadowBlur = 20;
+  context.shadowOffsetY = 8;
+  context.beginPath();
+  context.arc(x, y, radius, 0, Math.PI * 2);
+  context.fillStyle = color;
+  context.fill();
+  context.restore();
+
+  context.save();
+  context.beginPath();
+  context.arc(x, y, radius, 0, Math.PI * 2);
+  context.lineWidth = 28;
+  context.strokeStyle = '#fff7ed';
+  context.stroke();
+  context.restore();
+
+  context.save();
+  context.fillStyle = '#ffffff';
+  context.strokeStyle = '#ffffff';
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+
+  if (glyph === 'play') {
+    context.beginPath();
+    context.moveTo(x - 32, y - 50);
+    context.lineTo(x - 32, y + 50);
+    context.lineTo(x + 58, y);
+    context.closePath();
+    context.fill();
+  } else if (glyph === 'alert') {
+    context.lineWidth = 28;
+    context.beginPath();
+    context.moveTo(x, y - 56);
+    context.lineTo(x, y + 14);
+    context.stroke();
+    context.beginPath();
+    context.arc(x, y + 62, 15, 0, Math.PI * 2);
+    context.fill();
+  } else {
+    context.beginPath();
+    context.arc(x, y, 38, 0, Math.PI * 2);
+    context.fill();
+  }
+
+  context.restore();
 }
 
 function workspaceNotificationState(state?: WorkspaceNotificationState): WorkspaceNotificationState {
