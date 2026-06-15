@@ -7413,7 +7413,7 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
   return (
     <Show when={props.activity.running || error() || props.activity.notices.length}>
       <div class="live-agent">
-        <div class="live-agent-header"><LoaderCircle class={`size-3.5 ${props.activity.running ? 'animate-spin' : ''}`} />{props.activity.running ? 'working' : 'pi'}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
+        <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><LoaderCircle class="size-3.5 animate-spin" /></Show>{props.activity.running ? 'working' : 'pi'}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
         <Show when={props.activity.text.trim()}><div class="assistant-message assistant-message-live"><MarkdownContent text={props.activity.text} syntaxTheme={props.syntaxTheme} /></div></Show>
         <Show when={!props.hideThinking && props.activity.thinking.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{props.activity.thinking}</div></Collapsible></Show>
         <Show when={(props.toolOutputMode !== 'hidden' && props.activity.tools.length) || props.activity.notices.length}>
