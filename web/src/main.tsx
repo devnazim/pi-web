@@ -7126,10 +7126,10 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
           </Show>
         </Show>
       </main>
-      <Show when={actionMenu()}>
+      <Show when={actionMenu()} keyed>
         {(menu) => (
           <GitFileActionMenu
-            menu={menu()}
+            menu={menu}
             onDismiss={() => setActionMenu(undefined)}
             onAction={(action, file) => void gitAction(action, file)}
             onDiscard={setDiscardTarget}
@@ -7147,20 +7147,20 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
           onConfirm={commitChanges}
         />
       </Show>
-      <Show when={discardTarget()}>
+      <Show when={discardTarget()} keyed>
         {(file) => (
           <ConfirmDialog
             title="Discard changes?"
-            description={`${file().status.includes('?') ? 'This will permanently delete the untracked file' : 'This will permanently discard unstaged changes in'} "${file().path}". This cannot be undone.`}
+            description={`${file.status.includes('?') ? 'This will permanently delete the untracked file' : 'This will permanently discard unstaged changes in'} "${file.path}". This cannot be undone.`}
             confirmLabel="Discard"
             variant="danger"
             onCancel={() => setDiscardTarget(undefined)}
-            onConfirm={() => { const path = file().path; setDiscardTarget(undefined); void gitAction('discard', path); }}
+            onConfirm={() => { const path = file.path; setDiscardTarget(undefined); void gitAction('discard', path); }}
           />
         )}
       </Show>
-      <Show when={previewPath()}>
-        {(path) => <AssetPreviewModal project={props.project} path={path()} themeMode={props.themeMode} onClose={() => setReviewPreviewPath(undefined)} />}
+      <Show when={previewPath()} keyed>
+        {(path) => <AssetPreviewModal project={props.project} path={path} themeMode={props.themeMode} onClose={() => setReviewPreviewPath(undefined)} />}
       </Show>
     </section>
   );
