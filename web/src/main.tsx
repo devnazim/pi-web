@@ -7102,29 +7102,30 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
           </div>
           <button class="project-modal-close shrink-0 review-close-desktop" title="Close reviewer" onClick={props.onClose}><X class="size-4" /></button>
         </div>
-        <Show when={selected()} fallback={<div class="review-preview-empty">Select a file to preview its staged or unstaged changes.</div>}>
-          <Show
-            when={selectedDiff()}
-            keyed
-            fallback={
-              <div class={`review-preview-empty ${!selectedDiffState().loading && selectedDiffState().error ? 'text-destructive' : ''}`}>
-                {selectedDiffState().loading ? 'Loading diff...' : selectedDiffState().error ? errorMessage(selectedDiffState().error, 'Could not load diff') : 'No diff content available.'}
-              </div>
-            }
-          >
-            {(diff) => (
-              <Show when={!diff.unavailable} fallback={<div class="review-preview-empty">{diff.message ?? 'Diff preview is not available for this file.'}</div>}>
-                <Show when={diff.patch} keyed fallback={<ReviewDiffEditor path={diff.path} original={diff.original} modified={diff.modified} viewStateKey={reviewEditorStateKey(diff.path, diff.staged, 'diff')} viewState={diffEditorViewState(diff.path, diff.staged)} onViewStateChange={(viewState) => saveDiffEditorViewState(diff.path, diff.staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />}>
-                  {(patch) => (
-                    <div class="review-patch-preview">
-                      <Show when={diff.message}><div class="review-patch-message">{diff.message}</div></Show>
-                      <ReviewPatchEditor path={diff.path} patch={patch} viewStateKey={reviewEditorStateKey(diff.path, diff.staged, 'patch')} viewState={patchEditorViewState(diff.path, diff.staged)} onViewStateChange={(viewState) => savePatchEditorViewState(diff.path, diff.staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />
-                    </div>
-                  )}
-                </Show>
-              </Show>
-            )}
-          </Show>
+        <Show when={selected()} keyed fallback={<div class="review-preview-empty">Select a file to preview its staged or unstaged changes.</div>}>
+          {(selection) => (
+            <Show
+              when={selectedDiff()}
+              fallback={
+                <div class={`review-preview-empty ${!selectedDiffState().loading && selectedDiffState().error ? 'text-destructive' : ''}`}>
+                  {selectedDiffState().loading ? 'Loading diff...' : selectedDiffState().error ? errorMessage(selectedDiffState().error, 'Could not load diff') : 'No diff content available.'}
+                </div>
+              }
+            >
+              <ReviewFileDiffPreview
+                selection={selection}
+                diff={selectedDiff()!}
+                themeMode={props.themeMode}
+                syntaxTheme={settings.data?.effective.syntaxHighlightTheme}
+                syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight}
+                syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark}
+                diffEditorViewState={diffEditorViewState}
+                patchEditorViewState={patchEditorViewState}
+                onDiffEditorViewStateChange={saveDiffEditorViewState}
+                onPatchEditorViewStateChange={savePatchEditorViewState}
+              />
+            </Show>
+          )}
         </Show>
       </main>
       <Show when={actionMenu()} keyed>
@@ -7164,6 +7165,56 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
         {(path) => <AssetPreviewModal project={props.project} path={path} themeMode={props.themeMode} onClose={() => setReviewPreviewPath(undefined)} />}
       </Show>
     </section>
+  );
+}
+
+function ReviewFileDiffPreview(props: {
+  selection: GitFileSelection;
+  diff: GitFileDiff;
+  themeMode: ResolvedThemeMode;
+  syntaxTheme?: SyntaxHighlightTheme;
+  syntaxThemeLight?: SyntaxHighlightTheme;
+  syntaxThemeDark?: SyntaxHighlightTheme;
+  diffEditorViewState: (path: string, staged: boolean) => ReviewDiffEditorViewState | undefined;
+  patchEditorViewState: (path: string, staged: boolean) => ReviewPatchEditorViewState | undefined;
+  onDiffEditorViewStateChange: (path: string, staged: boolean, viewState: ReviewDiffEditorViewState) => void;
+  onPatchEditorViewStateChange: (path: string, staged: boolean, viewState: ReviewPatchEditorViewState) => void;
+}) {
+  return (
+    <Show when={!props.diff.unavailable} fallback={<div class="review-preview-empty">{props.diff.message ?? 'Diff preview is not available for this file.'}</div>}>
+      <Show
+        when={props.diff.patch}
+        fallback={
+          <ReviewDiffEditor
+            path={props.diff.path}
+            original={props.diff.original}
+            modified={props.diff.modified}
+            viewStateKey={reviewEditorStateKey(props.diff.path, props.diff.staged, 'diff')}
+            viewState={props.diffEditorViewState(props.diff.path, props.diff.staged)}
+            onViewStateChange={(viewState) => props.onDiffEditorViewStateChange(props.selection.path, props.selection.staged, viewState)}
+            themeMode={props.themeMode}
+            syntaxTheme={props.syntaxTheme}
+            syntaxThemeLight={props.syntaxThemeLight}
+            syntaxThemeDark={props.syntaxThemeDark}
+          />
+        }
+      >
+        <div class="review-patch-preview">
+          <Show when={props.diff.message}><div class="review-patch-message">{props.diff.message}</div></Show>
+          <ReviewPatchEditor
+            path={props.diff.path}
+            patch={props.diff.patch ?? ''}
+            viewStateKey={reviewEditorStateKey(props.diff.path, props.diff.staged, 'patch')}
+            viewState={props.patchEditorViewState(props.diff.path, props.diff.staged)}
+            onViewStateChange={(viewState) => props.onPatchEditorViewStateChange(props.selection.path, props.selection.staged, viewState)}
+            themeMode={props.themeMode}
+            syntaxTheme={props.syntaxTheme}
+            syntaxThemeLight={props.syntaxThemeLight}
+            syntaxThemeDark={props.syntaxThemeDark}
+          />
+        </div>
+      </Show>
+    </Show>
   );
 }
 
