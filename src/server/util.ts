@@ -78,3 +78,30 @@ export function randomToken(bytes = 32) {
 export function isLocalHost(host: string) {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1';
 }
+
+export function normalizeBasePath(value: unknown) {
+  if (value === undefined || value === null || value === '') return '/';
+  if (typeof value !== 'string') throw new Error('Base path must be a string, such as /pi-web.');
+
+  let next = value.trim();
+
+  try {
+    next = new URL(next, 'http://pi-web.local').pathname;
+  } catch {
+    // Keep the original value and normalize it below.
+  }
+
+  next = next.replace(/\/+$/, '');
+  if (!next || next === '.') return '/';
+  if (!next.startsWith('/')) next = `/${next}`;
+  if (/[?#]/.test(next)) throw new Error('Base path must not include a query string or hash.');
+  return next;
+}
+
+export function basePathWithTrailingSlash(basePath: string) {
+  return basePath === '/' ? '/' : `${basePath}/`;
+}
+
+export function urlWithBasePath(url: string, basePath: string) {
+  return basePath === '/' ? url : `${url}${basePath}`;
+}

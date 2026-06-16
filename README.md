@@ -27,6 +27,12 @@ npm run dev -- --host 0.0.0.0 --port 43110 --webPort 5173
 
 In dev mode, open the Vite URL (`5173` by default), not the API server port.
 
+To serve dev mode from a reverse-proxy subpath, pass `--base-path`:
+
+```bash
+npm run dev -- --base-path /pi-web-development
+```
+
 ## Logging
 
 `pi-web` defaults to quiet server logging: it prints the startup URLs plus warnings/errors, but not every HTTP/WebSocket request. Use `--log verbose` when you need request logs, `--log debug` for debug logs, or `--log silent` to disable Fastify logs entirely. The same setting is available as `PI_WEB_LOG`; `--quiet`, `--verbose`, `--debug`, and `--silent` are shorthands.
@@ -56,6 +62,35 @@ PI_WEB_PASSWORD='use-a-strong-password' pi-web --host 0.0.0.0 --port 43110 --wor
 ```
 
 `pi-web` can read/write workspace files and run Pi tools. If you expose it without `--password`/`PI_WEB_PASSWORD`, the server will warn but still start. Prefer a private network, Tailscale, or a trusted reverse proxy.
+
+### Reverse proxy / Tailscale subpaths
+
+By default, `pi-web` serves from `/`. Use `--base-path` or `PI_WEB_BASE_PATH` only when a reverse proxy maps a path prefix to this server:
+
+```bash
+pi-web --base-path /pi-web
+```
+
+For Tailscale Serve, map the external path to the same backend path:
+
+```bash
+tailscale serve --bg --set-path /pi-web http://127.0.0.1:43110/pi-web
+```
+
+Then open:
+
+```text
+https://your-device.your-tailnet.ts.net/pi-web
+```
+
+For dev mode behind Tailscale:
+
+```bash
+npm run dev -- --base-path /pi-web-development
+tailscale serve --bg --set-path /pi-web-development http://127.0.0.1:5173/pi-web-development
+```
+
+Vite dev mode allows `*.ts.net` hosts by default. For other reverse-proxy hostnames, set `PI_WEB_ALLOWED_HOSTS=example.com,dev.example.com`.
 
 ### Platform file-safety note
 

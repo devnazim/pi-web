@@ -82,6 +82,7 @@ import {
   type ComposerHistoryMode,
   type UploadAsset,
 } from './composerHistory';
+import { appUrl, appWebSocketUrl } from './appUrl';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -103,6 +104,7 @@ type GitFile = { path: string; oldPath?: string; status: string; staged: boolean
 type GitFileSelection = { path: string; staged: boolean };
 type GitFileActionMenuState = { file: GitFile; staged: boolean; x: number; y: number };
 type GitFileDiff = { path: string; staged: boolean; original: string; modified: string; unavailable?: boolean; message?: string; patch?: string };
+type ReviewFileDiffState = { key: string; loading: boolean; data?: GitFileDiff; error?: unknown };
 type GitStatus = { branch: string; files: GitFile[] };
 type ReviewEditorKind = 'diff' | 'patch';
 type ReviewDiffEditorViewState = import('monaco-editor').editor.IDiffEditorViewState;
@@ -1212,9 +1214,7 @@ function Shell() {
     const project = workspaceProject();
     const activeSessionId = sessionId();
     if (!project) return;
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${scheme}://${location.host}/ws/projects/${project.id}/agent${activeSessionId ? `?sessionId=${activeSessionId}` : ''}`;
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${activeSessionId ? `?sessionId=${activeSessionId}` : ''}`));
     socket.addEventListener('message', (event) => {
       try {
         const parsed = JSON.parse(event.data) as { type?: string; sessionId?: string; data?: unknown };
@@ -1240,8 +1240,7 @@ function Shell() {
   createEffect(() => {
     const project = workspaceProject();
     if (!project) return;
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-    const socket = new WebSocket(`${scheme}://${location.host}/ws/projects/${project.id}/files`);
+    const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${project.id}/files`));
     socket.addEventListener('message', (event) => {
       try {
         const parsed = JSON.parse(event.data) as { type?: string };
@@ -1256,9 +1255,8 @@ function Shell() {
   createEffect(() => {
     const ids = Object.keys(workspaceLookup()).sort();
     if (!ids.length) return;
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
     const sockets = ids.map((workspaceId) => {
-      const socket = new WebSocket(`${scheme}://${location.host}/ws/projects/${workspaceId}/notifications`);
+      const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${workspaceId}/notifications`));
       socket.addEventListener('message', (event) => {
         try {
           const parsed = JSON.parse(event.data) as WorkspaceNotificationServerEvent;
@@ -1844,7 +1842,7 @@ function Login(props: { onDone: () => void }) {
   async function submit(event: SubmitEvent) {
     event.preventDefault();
     setError('');
-    const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: password() }) });
+    const response = await fetch(appUrl('/api/auth/login'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: password() }) });
     if (response.ok) props.onDone();
     else setError('Invalid password');
   }
@@ -6729,17 +6727,8 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     queryFn: ({ signal }) => api<PiSettingsResponse>(`/api/projects/${props.project.id}/settings`, { signal }),
     staleTime: SETTINGS_CACHE_STALE_TIME_MS,
   }));
-  const fileDiff = createQuery(() => {
-    const file = selected();
-    return {
-      queryKey: ['git-file-diff', props.project.id, file?.path, file?.staged],
-      queryFn: ({ signal }) => api<GitFileDiff>(`/api/projects/${props.project.id}/git/file-diff?path=${encodeURIComponent(file!.path)}&staged=${String(file!.staged)}`, { signal }),
-      enabled: Boolean(file),
-      refetchInterval: 10_000,
-      refetchOnWindowFocus: true,
-      staleTime: 0,
-    };
-  });
+  const [diffRefreshToken, setDiffRefreshToken] = createSignal(0);
+  const [fileDiffState, setFileDiffState] = createSignal<ReviewFileDiffState>({ key: '', loading: false });
   const stagedFiles = createMemo(() => (status.data?.status.files ?? []).filter((file) => file.staged));
   const unstagedFiles = createMemo(() => (status.data?.status.files ?? []).filter((file) => file.unstaged));
   const canCommit = createMemo(() => stagedFiles().length > 0 && !commitBusy());
@@ -6748,11 +6737,20 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     ...unstagedFiles().map((file) => ({ path: file.path, staged: false })),
   ]);
   const selectedStatus = createMemo(() => (status.data?.status.files ?? []).find((file) => file.path === selected()?.path));
-  const selectedDiff = createMemo(() => {
+  const selectedDiffState = createMemo<ReviewFileDiffState>(() => {
     const current = selected();
-    const diff = fileDiff.data;
-    return current && diff?.path === current.path && diff.staged === current.staged ? diff : undefined;
+    const state = fileDiffState();
+    const key = reviewFileSelectionKey(current);
+    return current && state.key === key ? state : { key, loading: Boolean(current) };
   });
+  const selectedDiff = createMemo(() => selectedDiffState().data);
+
+  function refreshSelectedDiff(options?: { force?: boolean }) {
+    const current = selected();
+    const state = fileDiffState();
+    if (!current || (!options?.force && state.key === reviewFileSelectionKey(current) && state.loading)) return;
+    setDiffRefreshToken((value) => value + 1);
+  }
 
   onCleanup(() => {
     clearGitFileLongPress();
@@ -6791,6 +6789,41 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     if (!current || !status.data) return;
     if (files.some((file) => file.path === current.path && file.staged === current.staged)) return;
     setReviewSelected(files.find((file) => file.path === current.path));
+  });
+
+  createEffect(() => {
+    const current = selected();
+    diffRefreshToken();
+    if (!current) {
+      setFileDiffState({ key: '', loading: false });
+      return;
+    }
+
+    const key = reviewFileSelectionKey(current);
+    const controller = new AbortController();
+    setFileDiffState((state) => (state.key === key ? { key, loading: true, data: state.data } : { key, loading: true }));
+    api<GitFileDiff>(`/api/projects/${props.project.id}/git/file-diff?path=${encodeURIComponent(current.path)}&staged=${String(current.staged)}`, { signal: controller.signal })
+      .then((diff) => {
+        if (!controller.signal.aborted && reviewFileSelectionKey(selected()) === key) setFileDiffState({ key, loading: false, data: diff });
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted && reviewFileSelectionKey(selected()) === key) {
+          setFileDiffState((state) => (state.key === key ? { key, loading: false, data: state.data, error } : { key, loading: false, error }));
+        }
+      });
+
+    onCleanup(() => controller.abort());
+  });
+
+  createEffect(() => {
+    if (!selected()) return;
+    const refreshIfIdle = () => refreshSelectedDiff();
+    const interval = window.setInterval(refreshIfIdle, 10_000);
+    window.addEventListener('focus', refreshIfIdle);
+    onCleanup(() => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refreshIfIdle);
+    });
   });
 
   function saveFileListScroll(element: HTMLDivElement) {
@@ -6878,7 +6911,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     try {
       const nextStatus = await api<{ status: GitStatus }>(`/api/projects/${props.project.id}/git/${action}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: file }) });
       queryClient.setQueryData(['git-status', props.project.id], nextStatus);
-      queryClient.invalidateQueries({ queryKey: ['git-file-diff', props.project.id] });
+      refreshSelectedDiff({ force: true });
     } catch (error) {
       setActionError(errorMessage(error, `Git ${action} failed`));
     } finally {
@@ -6895,7 +6928,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     try {
       const nextStatus = await api<{ status: GitStatus }>(`/api/projects/${props.project.id}/git/commit`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: commitMessage }) });
       queryClient.setQueryData(['git-status', props.project.id], nextStatus);
-      queryClient.invalidateQueries({ queryKey: ['git-file-diff', props.project.id] });
+      refreshSelectedDiff({ force: true });
       setReviewCommitDialogOpen(false);
       setReviewCommitMessage('');
     } catch (error) {
@@ -6907,7 +6940,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
 
   function refreshReview() {
     queryClient.invalidateQueries({ queryKey: ['git-status', props.project.id] });
-    queryClient.invalidateQueries({ queryKey: ['git-file-diff', props.project.id] });
+    refreshSelectedDiff({ force: true });
   }
 
   function changeStats(file: GitFile, staged: boolean) {
@@ -7073,8 +7106,8 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
           <Show
             when={selectedDiff()}
             fallback={
-              <div class={`review-preview-empty ${!fileDiff.isFetching && fileDiff.error ? 'text-destructive' : ''}`}>
-                {fileDiff.isFetching || fileDiff.isLoading ? 'Loading diff...' : fileDiff.error ? errorMessage(fileDiff.error, 'Could not load diff') : 'No diff content available.'}
+              <div class={`review-preview-empty ${!selectedDiffState().loading && selectedDiffState().error ? 'text-destructive' : ''}`}>
+                {selectedDiffState().loading ? 'Loading diff...' : selectedDiffState().error ? errorMessage(selectedDiffState().error, 'Could not load diff') : 'No diff content available.'}
               </div>
             }
           >
@@ -9046,7 +9079,7 @@ function appendFileMentionParts(result: RichTextPart[], text: string) {
 }
 
 function assetUrl(projectId: string, filePath: string) {
-  return `/api/projects/${projectId}/asset?path=${encodeURIComponent(filePath)}`;
+  return appUrl(`/api/projects/${projectId}/asset?path=${encodeURIComponent(filePath)}`);
 }
 
 function isImagePath(filePath: string) {
@@ -10011,7 +10044,7 @@ function errorMessage(error: unknown, fallback: string) {
 }
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const response = await fetch(appUrl(url), init);
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? response.statusText);
   return response.json();
 }

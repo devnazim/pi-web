@@ -2,6 +2,7 @@ import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
 import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { registerAuth } from './auth.js';
@@ -13,6 +14,7 @@ import { registerSessionRoutes } from './sessions.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerTerminalRoutes } from './terminal.js';
 import type { ServerOptions } from './types.js';
+import { basePathWithTrailingSlash } from './util.js';
 
 export async function buildApp(options: ServerOptions) {
   const logMode = options.logMode ?? 'quiet';
@@ -20,6 +22,7 @@ export async function buildApp(options: ServerOptions) {
     logger: logMode === 'silent'
       ? false
       : { level: logMode === 'debug' ? 'debug' : logMode === 'verbose' ? 'info' : 'warn' },
+    rewriteUrl: options.basePath === '/' ? undefined : (request) => stripBasePathFromUrl(request.url ?? '/', options.basePath),
   });
   const registry = new ProjectRegistry(options.workspace);
   const bridge = new PiBridge();
@@ -28,7 +31,7 @@ export async function buildApp(options: ServerOptions) {
 
   app.get('/healthz', async () => ({ ok: true }));
 
-  await registerAuth(app, options.password);
+  await registerAuth(app, options.password, options.basePath);
   await registerProjectRoutes(app, registry);
   await registerSessionRoutes(app, registry, bridge);
   await registerSettingsRoutes(app, registry);
@@ -39,16 +42,22 @@ export async function buildApp(options: ServerOptions) {
 
   if (!options.dev) {
     const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
-    if (existsSync(webRoot)) {
+    const indexPath = path.join(webRoot, 'index.html');
+    if (existsSync(webRoot) && existsSync(indexPath)) {
+      const indexHtml = renderIndexHtml(await readFile(indexPath, 'utf8'), options.basePath);
       await app.register(fastifyStatic, {
         root: webRoot,
         wildcard: false,
+        index: false,
+        globIgnore: ['index.html'],
       });
+      app.get('/', async (_request, reply) => reply.type('text/html; charset=utf-8').send(indexHtml));
+      app.get('/index.html', async (_request, reply) => reply.type('text/html; charset=utf-8').send(indexHtml));
       app.setNotFoundHandler(async (request, reply) => {
         if (request.url.startsWith('/api/') || request.url.startsWith('/ws/')) {
           return reply.code(404).send({ error: 'Not found' });
         }
-        return reply.sendFile('index.html');
+        return reply.type('text/html; charset=utf-8').send(indexHtml);
       });
     } else {
       console.warn(`Warning: web assets not found at ${webRoot}; run npm run build before npm start, or use npm run dev.`);
@@ -56,4 +65,21 @@ export async function buildApp(options: ServerOptions) {
   }
 
   return app;
+}
+
+function stripBasePathFromUrl(url: string, basePath: string) {
+  if (url === basePath) return '/';
+  if (url.startsWith(`${basePath}/`)) return url.slice(basePath.length) || '/';
+  if (url.startsWith(`${basePath}?`)) return `/${url.slice(basePath.length)}`;
+  return url;
+}
+
+function renderIndexHtml(indexHtml: string, basePath: string) {
+  return indexHtml
+    .replace('<head>', `<head>\n    <base href="${escapeHtmlAttribute(basePathWithTrailingSlash(basePath))}" data-pi-web-base />`)
+    .replace("window.__PI_WEB_BASE_PATH__ = '/';", `window.__PI_WEB_BASE_PATH__ = ${JSON.stringify(basePath)};`);
+}
+
+function escapeHtmlAttribute(value: string) {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

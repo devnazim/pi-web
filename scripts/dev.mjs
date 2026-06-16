@@ -44,14 +44,39 @@ function urlsForHost(host, port) {
   return [...urls];
 }
 
+function normalizeBasePath(value) {
+  if (value === undefined || value === null || value === '') return '/';
+  if (typeof value !== 'string') throw new Error('Base path must be a string, such as /pi-web.');
+
+  let next = value.trim();
+
+  try {
+    next = new URL(next, 'http://pi-web.local').pathname;
+  } catch {
+    // Keep the original value and normalize it below.
+  }
+
+  next = next.replace(/\/+$/, '');
+  if (!next || next === '.') return '/';
+  return next.startsWith('/') ? next : `/${next}`;
+}
+
+function urlWithBasePath(url, basePath) {
+  return basePath === '/' ? url : `${url}${basePath}`;
+}
+
 const args = parseArgs(process.argv.slice(2));
 const expose = Boolean(args.expose);
 const host = String(args.host ?? (expose ? '0.0.0.0' : '127.0.0.1'));
 const serverPort = Number(args.port ?? process.env.PI_WEB_PORT ?? 43110);
 const webPort = Number(args.webPort ?? process.env.PI_WEB_DEV_PORT ?? 5173);
+const basePath = normalizeBasePath(args['base-path'] ?? args.basePath ?? process.env.PI_WEB_BASE_PATH);
+const allowedHosts = args['allowed-hosts'] ?? args.allowedHosts ?? args['allowed-host'] ?? args.allowedHost ?? process.env.PI_WEB_ALLOWED_HOSTS;
 const env = {
   ...process.env,
   PI_WEB_PORT: String(serverPort),
+  PI_WEB_BASE_PATH: basePath,
+  ...(typeof allowedHosts === 'string' && allowedHosts ? { PI_WEB_ALLOWED_HOSTS: allowedHosts } : {}),
 };
 
 const children = [
@@ -68,8 +93,9 @@ const children = [
 console.log('\npi-web dev mode');
 console.log(`  API: ${host}:${serverPort}`);
 console.log(`  Web: ${host}:${webPort}`);
+console.log(`  Base path: ${basePath}`);
 console.log('  Open:');
-for (const url of urlsForHost(host, webPort)) console.log(`    ${url}`);
+for (const url of urlsForHost(host, webPort)) console.log(`    ${urlWithBasePath(url, basePath)}`);
 console.log('');
 
 let stopping = false;

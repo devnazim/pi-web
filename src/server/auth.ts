@@ -10,7 +10,8 @@ export interface AuthState {
   tokens: Set<string>;
 }
 
-export async function registerAuth(app: FastifyInstance, password?: string) {
+export async function registerAuth(app: FastifyInstance, password?: string, basePath = '/') {
+  const cookiePath = basePath === '/' ? '/' : basePath;
   const state: AuthState = {
     enabled: Boolean(password),
     password,
@@ -51,7 +52,7 @@ export async function registerAuth(app: FastifyInstance, password?: string) {
       httpOnly: true,
       sameSite: 'lax',
       secure: false,
-      path: '/',
+      path: cookiePath,
     });
     return { ok: true };
   });
@@ -59,7 +60,7 @@ export async function registerAuth(app: FastifyInstance, password?: string) {
   app.post('/api/auth/logout', async (request, reply) => {
     const token = request.cookies[AUTH_COOKIE];
     if (token) state.tokens.delete(token);
-    reply.clearCookie(AUTH_COOKIE, { path: '/' });
+    reply.clearCookie(AUTH_COOKIE, { path: cookiePath });
     return { ok: true };
   });
 }

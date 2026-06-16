@@ -11,6 +11,7 @@ export interface ServerOptions {
   password?: string;
   workspace?: string;
   expose: boolean;
+  basePath: string;
 }
 
 export interface Project {

@@ -1,6 +1,7 @@
 import { SquareTerminal, X } from 'lucide-solid';
 import { createEffect, createMemo, createSignal, For, onCleanup } from 'solid-js';
 import type { Terminal as XTermTerminal } from '@xterm/xterm';
+import { appWebSocketUrl } from './appUrl';
 import './terminal-font.css';
 
 type TerminalProject = { id: string; path: string };
@@ -287,11 +288,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           .catch(() => undefined);
 
         resizeTerminal();
-        const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
         lastSentCols = xterm.cols;
         lastSentRows = xterm.rows;
         const params = new URLSearchParams({ cols: String(xterm.cols), rows: String(xterm.rows), terminalId: 'main' });
-        socket = new WebSocket(`${scheme}://${location.host}/ws/projects/${projectId}/terminal?${params}`);
+        socket = new WebSocket(appWebSocketUrl(`/ws/projects/${projectId}/terminal?${params}`));
         terminalSocket = socket;
         resumeHeartbeat = () => {
           if (document.visibilityState === 'hidden') return;
