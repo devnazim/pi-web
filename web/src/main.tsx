@@ -39,6 +39,7 @@ import {
   Home,
   LoaderCircle,
   MessageSquare,
+  Minus,
   Package,
   Palette,
   PanelLeftClose,
@@ -343,6 +344,9 @@ const WORKSPACE_NOTIFICATIONS_KEY = 'pi-web-workspace-notifications';
 const WORKSPACE_NOTIFICATIONS_BROWSER_KEY = 'pi-web-browser-notifications-enabled';
 const WORKSPACE_NOTIFICATIONS_SOUND_KEY = 'pi-web-notification-sound-enabled';
 const WORKSPACE_NOTIFICATIONS_SOUND_CHOICE_KEY = 'pi-web-notification-sound';
+const WORKSPACE_NOTIFICATIONS_SOUND_VOLUME_KEY = 'pi-web-notification-sound-volume';
+const DEFAULT_NOTIFICATION_SOUND_VOLUME = 1;
+const NOTIFICATION_SOUND_VOLUME_STEP = 0.05;
 const WORKSPACE_NOTIFICATIONS_LIMIT = 40;
 const WORKSPACE_NOTIFICATION_TOAST_TTL_MS = 8000;
 const SESSION_SIDEBAR_OPEN_KEY = 'pi-web-session-sidebar-open';
@@ -595,6 +599,7 @@ function Shell() {
   const [browserNotificationsEnabled, setBrowserNotificationsEnabled] = createSignal(readBrowserNotificationsEnabled());
   const [notificationSoundEnabled, setNotificationSoundEnabled] = createSignal(readNotificationSoundEnabled());
   const [notificationSoundId, setNotificationSoundId] = createSignal<NotificationSoundId>(readNotificationSoundId());
+  const [notificationSoundVolume, setNotificationSoundVolume] = createSignal(readNotificationSoundVolume());
   const [sessionSidebarOpen, setSessionSidebarOpen] = createSignal(localStorage.getItem(SESSION_SIDEBAR_OPEN_KEY) !== 'false');
   const [restoredOpenProjects, setRestoredOpenProjects] = createSignal(false);
   const [restoringOpenProjects, setRestoringOpenProjects] = createSignal(false);
@@ -796,7 +801,7 @@ function Shell() {
   }
 
   function playWorkspaceNotificationSound(level: WorkspaceNotificationLevel) {
-    if (notificationSoundEnabled()) playNotificationSound(level, notificationSoundId());
+    if (notificationSoundEnabled()) playNotificationSound(level, notificationSoundId(), notificationSoundVolume());
   }
 
   function toggleWorkspaceNotifications(workspaceId: string) {
@@ -814,6 +819,12 @@ function Shell() {
     localStorage.setItem(WORKSPACE_NOTIFICATIONS_SOUND_CHOICE_KEY, sound);
   }
 
+  function setNotificationSoundVolumePreference(volume: number) {
+    const next = clampNotificationSoundVolume(volume);
+    setNotificationSoundVolume(next);
+    localStorage.setItem(WORKSPACE_NOTIFICATIONS_SOUND_VOLUME_KEY, next.toFixed(2));
+  }
+
   function setBrowserTabNamePreference(name: string) {
     const next = name.replace(/[\r\n\t]+/g, ' ').slice(0, 80);
     const trimmed = next.trim();
@@ -829,7 +840,7 @@ function Shell() {
 
   async function previewNotificationSound() {
     await unlockWorkspaceNotificationSound();
-    playNotificationSound('info', notificationSoundId());
+    playNotificationSound('info', notificationSoundId(), notificationSoundVolume());
   }
 
   function isWorkspaceNotificationViewed(workspaceId: string, notificationSessionId: string | undefined) {
@@ -1694,11 +1705,13 @@ function Shell() {
             contrastUserMessages={contrastUserMessages()}
             notificationSoundEnabled={notificationSoundEnabled()}
             notificationSoundId={notificationSoundId()}
+            notificationSoundVolume={notificationSoundVolume()}
             onThemeMode={setThemeMode}
             onBrowserTabName={setBrowserTabNamePreference}
             onContrastUserMessages={setContrastUserMessagePreference}
             onNotificationSoundEnabled={setNotificationSound}
             onNotificationSound={setNotificationSoundChoice}
+            onNotificationSoundVolume={setNotificationSoundVolumePreference}
             onPreviewNotificationSound={previewNotificationSound}
             onClose={() => setSettingsOpen(false)}
           />
@@ -2195,11 +2208,13 @@ function SettingsModal(props: {
   contrastUserMessages: boolean;
   notificationSoundEnabled: boolean;
   notificationSoundId: NotificationSoundId;
+  notificationSoundVolume: number;
   onThemeMode: (mode: ThemeMode) => void;
   onBrowserTabName: (name: string) => void;
   onContrastUserMessages: (enabled: boolean) => void;
   onNotificationSoundEnabled: (enabled: boolean) => void;
   onNotificationSound: (sound: NotificationSoundId) => void;
+  onNotificationSoundVolume: (volume: number) => void;
   onPreviewNotificationSound: () => void | Promise<void>;
   onClose: () => void;
 }) {
@@ -2308,6 +2323,10 @@ function SettingsModal(props: {
                     <UiSelect class="min-w-0 flex-1" value={props.notificationSoundId} onChange={(value) => props.onNotificationSound(value as NotificationSoundId)} options={NOTIFICATION_SOUND_OPTIONS} ariaLabel="Notification sound" />
                     <button type="button" class="button-secondary h-10 px-3" onClick={() => void props.onPreviewNotificationSound()}><Volume2 class="size-4" /> Preview</button>
                   </div>
+                </div>
+                <div class="settings-field">
+                  <span>Notification volume</span>
+                  <NotificationVolumeControl value={props.notificationSoundVolume} onChange={props.onNotificationSoundVolume} />
                 </div>
               </SettingsSection>
               <p class="text-xs text-muted-foreground">Theme, browser tab, user message bubble, and notification changes apply immediately on this browser.</p>
@@ -3195,6 +3214,104 @@ function notificationIcon(notification: WorkspaceNotificationItem) {
   if (notification.level === 'success') return <Check class="size-4" />;
   if (notification.level === 'error') return <X class="size-4" />;
   return <BadgeInfo class="size-4" />;
+}
+
+function NotificationVolumeControl(props: { value: number; onChange: (volume: number) => void }) {
+  let sliderRef: HTMLDivElement | undefined;
+  let activePointerId: number | undefined;
+  const percent = createMemo(() => notificationSoundVolumePercent(props.value));
+  const volumeLabel = createMemo(() => percent() ? `${percent()}%` : 'Muted');
+  const adjustVolume = (delta: number) => props.onChange(clampNotificationSoundVolume(props.value + delta));
+
+  function setVolumeFromClientX(clientX: number) {
+    if (!sliderRef) return;
+    const rect = sliderRef.getBoundingClientRect();
+    if (!rect.width) return;
+    props.onChange(clampNotificationSoundVolume((clientX - rect.left) / rect.width));
+  }
+
+  function handlePointerDown(event: PointerEvent & { currentTarget: HTMLDivElement }) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.focus();
+    activePointerId = event.pointerId;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setVolumeFromClientX(event.clientX);
+  }
+
+  function handlePointerMove(event: PointerEvent) {
+    if (activePointerId !== event.pointerId) return;
+    event.preventDefault();
+    setVolumeFromClientX(event.clientX);
+  }
+
+  function handlePointerUp(event: PointerEvent & { currentTarget: HTMLDivElement }) {
+    if (activePointerId !== event.pointerId) return;
+    activePointerId = undefined;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+
+  function handleKeyDown(event: KeyboardEvent) {
+    const step = event.shiftKey ? NOTIFICATION_SOUND_VOLUME_STEP * 2 : NOTIFICATION_SOUND_VOLUME_STEP;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      adjustVolume(step);
+      return;
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') {
+      event.preventDefault();
+      adjustVolume(-step);
+      return;
+    }
+    if (event.key === 'PageUp') {
+      event.preventDefault();
+      adjustVolume(0.1);
+      return;
+    }
+    if (event.key === 'PageDown') {
+      event.preventDefault();
+      adjustVolume(-0.1);
+      return;
+    }
+    if (event.key === 'Home') {
+      event.preventDefault();
+      props.onChange(0);
+      return;
+    }
+    if (event.key === 'End') {
+      event.preventDefault();
+      props.onChange(1);
+    }
+  }
+
+  return (
+    <div class="notification-volume-control">
+      <button type="button" class="notification-volume-step" aria-label="Decrease notification volume" disabled={percent() <= 0} onClick={() => adjustVolume(-NOTIFICATION_SOUND_VOLUME_STEP)}><Minus class="size-3.5" /></button>
+      <div
+        ref={sliderRef}
+        class="notification-volume-slider"
+        role="slider"
+        tabIndex={0}
+        aria-label="Notification volume"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={percent()}
+        aria-valuetext={volumeLabel()}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onKeyDown={handleKeyDown}
+      >
+        <span class="notification-volume-track">
+          <span class="notification-volume-fill" style={{ width: `${percent()}%` }} />
+          <span class="notification-volume-thumb" style={{ left: `${percent()}%` }} />
+        </span>
+      </div>
+      <button type="button" class="notification-volume-step" aria-label="Increase notification volume" disabled={percent() >= 100} onClick={() => adjustVolume(NOTIFICATION_SOUND_VOLUME_STEP)}><Plus class="size-3.5" /></button>
+      <span class="notification-volume-value">{volumeLabel()}</span>
+    </div>
+  );
 }
 
 function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean }) {
@@ -8435,6 +8552,22 @@ function readNotificationSoundId(): NotificationSoundId {
   return isNotificationSoundId(stored) ? stored : 'glass';
 }
 
+function readNotificationSoundVolume() {
+  const stored = localStorage.getItem(WORKSPACE_NOTIFICATIONS_SOUND_VOLUME_KEY);
+  if (stored === null) return DEFAULT_NOTIFICATION_SOUND_VOLUME;
+  const value = Number(stored);
+  if (!Number.isFinite(value)) return DEFAULT_NOTIFICATION_SOUND_VOLUME;
+  return clampNotificationSoundVolume(value > 1 && value <= 100 ? value / 100 : value);
+}
+
+function clampNotificationSoundVolume(value: number) {
+  return Math.max(0, Math.min(1, Math.round(value * 100) / 100));
+}
+
+function notificationSoundVolumePercent(value: number) {
+  return Math.round(clampNotificationSoundVolume(value) * 100);
+}
+
 function isNotificationSoundId(value: unknown): value is NotificationSoundId {
   return value === 'chime' || value === 'ping' || value === 'pop' || value === 'bell' || value === 'ding' || value === 'boop' || value === 'pluck' || value === 'glass' || value === 'success' || value === 'warning' || value === 'alert' || value === 'silent';
 }
@@ -8448,11 +8581,11 @@ async function unlockWorkspaceNotificationSound() {
   if (context.state === 'suspended') await context.resume().catch(() => undefined);
 }
 
-function playNotificationSound(level: WorkspaceNotificationLevel, sound: NotificationSoundId) {
+function playNotificationSound(level: WorkspaceNotificationLevel, sound: NotificationSoundId, volume: number) {
   const context = workspaceNotificationAudioContext ?? createWorkspaceNotificationAudioContext();
   if (!context) return;
   workspaceNotificationAudioContext = context;
-  const play = () => playNotificationTone(context, level, sound);
+  const play = () => playNotificationTone(context, level, sound, volume);
   if (context.state === 'running') {
     play();
     return;
@@ -8472,9 +8605,11 @@ function createWorkspaceNotificationAudioContext() {
   }
 }
 
-function playNotificationTone(context: AudioContext, level: WorkspaceNotificationLevel, sound: NotificationSoundId) {
+function playNotificationTone(context: AudioContext, level: WorkspaceNotificationLevel, sound: NotificationSoundId, volume: number) {
   if (sound === 'silent') return;
-  const peak = level === 'error' ? 0.055 : 0.045;
+  const normalizedVolume = clampNotificationSoundVolume(volume);
+  if (!normalizedVolume) return;
+  const peak = (level === 'error' ? 0.17 : 0.13) * normalizedVolume;
   const config = (() => {
     if (sound === 'bell') return { type: 'sine' as OscillatorType, frequencies: level === 'error' ? [392, 294] : level === 'warning' ? [523, 392] : [784, 659], spacing: 0.14, duration: 0.32, peak: peak * 0.8 };
     if (sound === 'ding') return { type: 'triangle' as OscillatorType, frequencies: level === 'error' ? [330, 220] : level === 'warning' ? [587, 494] : [988], spacing: 0.09, duration: 0.22, peak: peak * 0.9 };
