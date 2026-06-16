@@ -1749,7 +1749,7 @@ body {
   }
 
   .review-preview-header {
-    @apply flex items-center justify-between gap-3 border-b border-border bg-card px-4 py-3;
+    @apply flex min-w-0 items-center justify-between gap-3 overflow-hidden border-b border-border bg-card px-4 py-3;
   }
 
   .review-preview-empty {
@@ -1757,7 +1757,7 @@ body {
   }
 
   .review-patch-preview {
-    @apply grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-card;
+    @apply grid h-full w-full min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card;
   }
 
   .review-patch-message {
@@ -1766,7 +1766,7 @@ body {
 
   .review-diff-editor,
   .review-patch-editor {
-    @apply h-full min-h-0 bg-card;
+    @apply h-full w-full max-w-full min-h-0 min-w-0 overflow-hidden bg-card;
   }
 
   .chat-row {

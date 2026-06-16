@@ -332,6 +332,7 @@ const REVIEW_SOURCE_CONTROL_DEFAULT_WIDTH = 340;
 const REVIEW_SOURCE_CONTROL_MIN_WIDTH = 260;
 const REVIEW_PREVIEW_MIN_WIDTH = 420;
 const REVIEW_SOURCE_CONTROL_RESIZE_KEY_STEP = 24;
+const REVIEW_EDITOR_SCROLL_BEYOND_LAST_COLUMN = 24;
 let reviewEditorModelSequence = 0;
 const RECENT_PROJECTS_KEY = 'pi-web-recent-projects';
 const RECENT_FILES_KEY_PREFIX = 'pi-web-recent-files:';
@@ -7084,7 +7085,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
       />
         </>
       </Show>
-      <main class="grid min-h-0 grid-rows-[auto_1fr] overflow-hidden">
+      <main class="grid min-h-0 min-w-0 grid-rows-[auto_1fr] overflow-hidden">
         <div class="review-preview-header">
           <div class="flex min-w-0 items-center gap-2">
             <Show when={!sourceControlOpen()}>
@@ -7334,6 +7335,7 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
         glyphMargin: false,
         lineNumbersMinChars: 4,
         wordWrap: 'off',
+        scrollBeyondLastColumn: REVIEW_EDITOR_SCROLL_BEYOND_LAST_COLUMN,
         padding: { top: 14, bottom: 14 },
         scrollbar: { useShadows: false, horizontal: 'auto', vertical: 'auto' },
       });
@@ -7454,6 +7456,7 @@ function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: s
         glyphMargin: false,
         lineNumbersMinChars: 4,
         wordWrap: 'off',
+        scrollBeyondLastColumn: REVIEW_EDITOR_SCROLL_BEYOND_LAST_COLUMN,
         padding: { top: 14, bottom: 14 },
         scrollbar: { useShadows: false, horizontal: 'auto', vertical: 'auto' },
       });
