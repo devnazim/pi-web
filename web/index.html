@@ -15,8 +15,11 @@
         try {
           const stored = localStorage.getItem('pi-web-theme-preference');
           if (stored === 'dark' || stored === 'light') theme = stored;
+
+          const storedTitle = localStorage.getItem('pi-web-browser-tab-name')?.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 80);
+          if (storedTitle) document.title = storedTitle;
         } catch {
-          // Keep the system preference if storage is unavailable.
+          // Keep defaults if storage is unavailable.
         }
 
         document.documentElement.dataset.theme = theme;

@@ -346,7 +346,9 @@ const WORKSPACE_NOTIFICATIONS_SOUND_CHOICE_KEY = 'pi-web-notification-sound';
 const WORKSPACE_NOTIFICATIONS_LIMIT = 40;
 const WORKSPACE_NOTIFICATION_TOAST_TTL_MS = 8000;
 const SESSION_SIDEBAR_OPEN_KEY = 'pi-web-session-sidebar-open';
+const DEFAULT_APP_TITLE = 'Pi Web';
 const THEME_MODE_KEY = 'pi-web-theme-preference';
+const BROWSER_TAB_NAME_KEY = 'pi-web-browser-tab-name';
 const CONTRAST_USER_MESSAGES_KEY = 'pi-web-contrast-user-messages';
 const SESSION_COMPOSER_CONTROLS_KEY = 'pi-web-session-composer-controls';
 const PROJECT_ORDER_KEY = 'pi-web-project-order';
@@ -597,6 +599,7 @@ function Shell() {
   const [restoredOpenProjects, setRestoredOpenProjects] = createSignal(false);
   const [restoringOpenProjects, setRestoringOpenProjects] = createSignal(false);
   const [themeMode, setThemeMode] = createSignal<ThemeMode>(readThemeMode());
+  const [browserTabName, setBrowserTabName] = createSignal(readBrowserTabName());
   const [contrastUserMessages, setContrastUserMessages] = createSignal(readContrastUserMessages());
   const [systemThemeMode, setSystemThemeMode] = createSignal<ResolvedThemeMode>(readSystemThemeMode());
   const [appError, setAppError] = createSignal<{ title: string; description: string }>();
@@ -809,6 +812,14 @@ function Shell() {
   function setNotificationSoundChoice(sound: NotificationSoundId) {
     setNotificationSoundId(sound);
     localStorage.setItem(WORKSPACE_NOTIFICATIONS_SOUND_CHOICE_KEY, sound);
+  }
+
+  function setBrowserTabNamePreference(name: string) {
+    const next = name.replace(/[\r\n\t]+/g, ' ').slice(0, 80);
+    const trimmed = next.trim();
+    setBrowserTabName(next);
+    if (trimmed) localStorage.setItem(BROWSER_TAB_NAME_KEY, trimmed);
+    else localStorage.removeItem(BROWSER_TAB_NAME_KEY);
   }
 
   function setContrastUserMessagePreference(enabled: boolean) {
@@ -1057,6 +1068,10 @@ function Shell() {
     document.documentElement.dataset.theme = resolvedMode;
     if (mode === 'system') localStorage.removeItem(THEME_MODE_KEY);
     else localStorage.setItem(THEME_MODE_KEY, mode);
+  });
+
+  createEffect(() => {
+    document.title = browserTabName().trim() || DEFAULT_APP_TITLE;
   });
 
   createEffect(() => {
@@ -1675,10 +1690,12 @@ function Shell() {
           <SettingsModal
             project={project()}
             themeMode={themeMode()}
+            browserTabName={browserTabName()}
             contrastUserMessages={contrastUserMessages()}
             notificationSoundEnabled={notificationSoundEnabled()}
             notificationSoundId={notificationSoundId()}
             onThemeMode={setThemeMode}
+            onBrowserTabName={setBrowserTabNamePreference}
             onContrastUserMessages={setContrastUserMessagePreference}
             onNotificationSoundEnabled={setNotificationSound}
             onNotificationSound={setNotificationSoundChoice}
@@ -2174,10 +2191,12 @@ function SettingsDivider(props: { label?: string }) {
 function SettingsModal(props: {
   project: Project;
   themeMode: ThemeMode;
+  browserTabName: string;
   contrastUserMessages: boolean;
   notificationSoundEnabled: boolean;
   notificationSoundId: NotificationSoundId;
   onThemeMode: (mode: ThemeMode) => void;
+  onBrowserTabName: (name: string) => void;
   onContrastUserMessages: (enabled: boolean) => void;
   onNotificationSoundEnabled: (enabled: boolean) => void;
   onNotificationSound: (sound: NotificationSoundId) => void;
@@ -2270,6 +2289,13 @@ function SettingsModal(props: {
                   <span>App theme</span>
                   <UiSelect class="w-full" value={props.themeMode} onChange={(value) => props.onThemeMode(value === 'dark' || value === 'light' ? value : 'system')} options={APP_THEME_OPTIONS} ariaLabel="App theme" />
                 </div>
+                <div class="settings-field">
+                  <span>Browser tab name</span>
+                  <div class="flex gap-2">
+                    <input class="input min-w-0 flex-1" value={props.browserTabName} placeholder={DEFAULT_APP_TITLE} maxLength={80} aria-label="Browser tab name" onInput={(event) => props.onBrowserTabName(event.currentTarget.value)} />
+                    <button type="button" class="button-secondary h-10 px-3" disabled={!props.browserTabName} onClick={() => props.onBrowserTabName('')}>Reset</button>
+                  </div>
+                </div>
                 <SettingsToggleRow label="Contrasting user messages" description="Use inverted primary bubbles: dark in light theme and light in dark theme." checked={props.contrastUserMessages} onChange={props.onContrastUserMessages} />
                 <div class="settings-field"><span>Syntax theme (light)</span><UiSelect class="w-full" value={form().syntaxHighlightThemeLight ?? ''} onChange={(value) => update('syntaxHighlightThemeLight', (value || undefined) as SyntaxHighlightTheme | undefined)} options={SYNTAX_HIGHLIGHT_LIGHT_THEME_OPTIONS} ariaLabel="Light syntax highlight theme" /></div>
                 <div class="settings-field"><span>Syntax theme (dark)</span><UiSelect class="w-full" value={form().syntaxHighlightThemeDark ?? ''} onChange={(value) => update('syntaxHighlightThemeDark', (value || undefined) as SyntaxHighlightTheme | undefined)} options={SYNTAX_HIGHLIGHT_DARK_THEME_OPTIONS} ariaLabel="Dark syntax highlight theme" /></div>
@@ -2284,7 +2310,7 @@ function SettingsModal(props: {
                   </div>
                 </div>
               </SettingsSection>
-              <p class="text-xs text-muted-foreground">Theme, user message bubble, and notification changes apply immediately on this browser.</p>
+              <p class="text-xs text-muted-foreground">Theme, browser tab, user message bubble, and notification changes apply immediately on this browser.</p>
             </div>
 
             <SettingsDivider label="Pi settings" />
@@ -9448,6 +9474,10 @@ function readThemeMode(): ThemeMode {
   const stored = localStorage.getItem(THEME_MODE_KEY);
   if (stored === 'system' || stored === 'light' || stored === 'dark') return stored;
   return 'system';
+}
+
+function readBrowserTabName() {
+  return (localStorage.getItem(BROWSER_TAB_NAME_KEY) ?? '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 80);
 }
 
 function readContrastUserMessages() {
