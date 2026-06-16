@@ -330,6 +330,7 @@ const REVIEW_SOURCE_CONTROL_DEFAULT_WIDTH = 340;
 const REVIEW_SOURCE_CONTROL_MIN_WIDTH = 260;
 const REVIEW_PREVIEW_MIN_WIDTH = 420;
 const REVIEW_SOURCE_CONTROL_RESIZE_KEY_STEP = 24;
+let reviewEditorModelSequence = 0;
 const RECENT_PROJECTS_KEY = 'pi-web-recent-projects';
 const RECENT_FILES_KEY_PREFIX = 'pi-web-recent-files:';
 const fileExplorerPaths = new Map<string, string>();
@@ -6747,6 +6748,11 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     ...unstagedFiles().map((file) => ({ path: file.path, staged: false })),
   ]);
   const selectedStatus = createMemo(() => (status.data?.status.files ?? []).find((file) => file.path === selected()?.path));
+  const selectedDiff = createMemo(() => {
+    const current = selected();
+    const diff = fileDiff.data;
+    return current && diff?.path === current.path && diff.staged === current.staged ? diff : undefined;
+  });
 
   onCleanup(() => {
     clearGitFileLongPress();
@@ -6783,7 +6789,8 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     const files = selectableFiles();
     const current = selected();
     if (!current || !status.data) return;
-    if (!files.some((file) => file.path === current.path && file.staged === current.staged)) setReviewSelected(undefined);
+    if (files.some((file) => file.path === current.path && file.staged === current.staged)) return;
+    setReviewSelected(files.find((file) => file.path === current.path));
   });
 
   function saveFileListScroll(element: HTMLDivElement) {
@@ -7063,23 +7070,26 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
           <button class="project-modal-close shrink-0 review-close-desktop" title="Close reviewer" onClick={props.onClose}><X class="size-4" /></button>
         </div>
         <Show when={selected()} fallback={<div class="review-preview-empty">Select a file to preview its staged or unstaged changes.</div>}>
-          <Show when={!fileDiff.isLoading} fallback={<div class="review-preview-empty">Loading diff...</div>}>
-            <Show when={!fileDiff.error} fallback={<div class="review-preview-empty text-destructive">{errorMessage(fileDiff.error, 'Could not load diff')}</div>}>
-              <Show when={fileDiff.data}>
-                {(diff) => (
-                  <Show when={!diff().unavailable} fallback={<div class="review-preview-empty">{diff().message ?? 'Diff preview is not available for this file.'}</div>}>
-                    <Show when={diff().patch} fallback={<ReviewDiffEditor path={diff().path} original={diff().original} modified={diff().modified} viewStateKey={reviewEditorStateKey(diff().path, diff().staged, 'diff')} viewState={diffEditorViewState(diff().path, diff().staged)} onViewStateChange={(viewState) => saveDiffEditorViewState(diff().path, diff().staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />}>
-                      {(patch) => (
-                        <div class="review-patch-preview">
-                          <Show when={diff().message}><div class="review-patch-message">{diff().message}</div></Show>
-                          <ReviewPatchEditor path={diff().path} patch={patch()} viewStateKey={reviewEditorStateKey(diff().path, diff().staged, 'patch')} viewState={patchEditorViewState(diff().path, diff().staged)} onViewStateChange={(viewState) => savePatchEditorViewState(diff().path, diff().staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />
-                        </div>
-                      )}
-                    </Show>
-                  </Show>
-                )}
+          <Show
+            when={selectedDiff()}
+            fallback={
+              <div class={`review-preview-empty ${!fileDiff.isFetching && fileDiff.error ? 'text-destructive' : ''}`}>
+                {fileDiff.isFetching || fileDiff.isLoading ? 'Loading diff...' : fileDiff.error ? errorMessage(fileDiff.error, 'Could not load diff') : 'No diff content available.'}
+              </div>
+            }
+          >
+            {(diff) => (
+              <Show when={!diff().unavailable} fallback={<div class="review-preview-empty">{diff().message ?? 'Diff preview is not available for this file.'}</div>}>
+                <Show when={diff().patch} fallback={<ReviewDiffEditor path={diff().path} original={diff().original} modified={diff().modified} viewStateKey={reviewEditorStateKey(diff().path, diff().staged, 'diff')} viewState={diffEditorViewState(diff().path, diff().staged)} onViewStateChange={(viewState) => saveDiffEditorViewState(diff().path, diff().staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />}>
+                  {(patch) => (
+                    <div class="review-patch-preview">
+                      <Show when={diff().message}><div class="review-patch-message">{diff().message}</div></Show>
+                      <ReviewPatchEditor path={diff().path} patch={patch()} viewStateKey={reviewEditorStateKey(diff().path, diff().staged, 'patch')} viewState={patchEditorViewState(diff().path, diff().staged)} onViewStateChange={(viewState) => savePatchEditorViewState(diff().path, diff().staged, viewState)} themeMode={props.themeMode} syntaxTheme={settings.data?.effective.syntaxHighlightTheme} syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight} syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark} />
+                    </div>
+                  )}
+                </Show>
               </Show>
-            </Show>
+            )}
           </Show>
         </Show>
       </main>
@@ -7191,13 +7201,18 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
   }
 
   function createModels(monaco: MonacoApi) {
-    originalModel?.dispose();
-    modifiedModel?.dispose();
+    const previousOriginalModel = originalModel;
+    const previousModifiedModel = modifiedModel;
+    const modelId = String((reviewEditorModelSequence += 1));
+    const nextOriginalModel = monaco.editor.createModel(props.original, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'review-original', path: `/${props.path}`, query: modelId }));
+    const nextModifiedModel = monaco.editor.createModel(props.modified, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'review-modified', path: `/${props.path}`, query: modelId }));
     currentPath = props.path;
     appliedViewStateKey = '';
-    originalModel = monaco.editor.createModel(props.original, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'review-original', path: `/${props.path}` }));
-    modifiedModel = monaco.editor.createModel(props.modified, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'review-modified', path: `/${props.path}` }));
+    originalModel = nextOriginalModel;
+    modifiedModel = nextModifiedModel;
     editor?.setModel({ original: originalModel, modified: modifiedModel });
+    previousOriginalModel?.dispose();
+    previousModifiedModel?.dispose();
     applyViewState();
   }
 
@@ -7293,6 +7308,7 @@ function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: s
   let monacoApi: MonacoApi | undefined;
   let editor: import('monaco-editor').editor.IStandaloneCodeEditor | undefined;
   let model: import('monaco-editor').editor.ITextModel | undefined;
+  let currentPath = '';
   let latestPatch = props.patch;
   let appliedViewStateKey = '';
 
@@ -7313,6 +7329,19 @@ function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: s
     appliedViewStateKey = props.viewStateKey;
   }
 
+  function createPatchModel(monaco: MonacoApi) {
+    const previousModel = model;
+    const modelId = String((reviewEditorModelSequence += 1));
+    const nextModel = monaco.editor.createModel(props.patch, 'diff', monaco.Uri.from({ scheme: 'review-patch', path: `/${props.path}.diff`, query: modelId }));
+    currentPath = props.path;
+    latestPatch = props.patch;
+    appliedViewStateKey = '';
+    model = nextModel;
+    editor?.setModel(model);
+    previousModel?.dispose();
+    applyViewState();
+  }
+
   onMount(() => {
     let disposed = false;
     installMonacoWorker();
@@ -7320,7 +7349,7 @@ function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: s
       if (disposed || !containerRef) return;
       monacoApi = monaco;
       defineMonacoPreviewThemes(monaco);
-      model = monaco.editor.createModel(props.patch, 'diff', monaco.Uri.from({ scheme: 'review-patch', path: `/${props.path}.diff` }));
+      createPatchModel(monaco);
       editor = monaco.editor.create(containerRef, {
         model,
         readOnly: true,
@@ -7354,10 +7383,17 @@ function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: s
   });
 
   createEffect(() => {
+    const path = props.path;
     const patch = props.patch;
-    if (patch === latestPatch) return;
-    latestPatch = patch;
-    if (model?.getValue() !== patch) model?.setValue(patch);
+    if (!monacoApi) return;
+    if (!model || currentPath !== path) {
+      createPatchModel(monacoApi);
+      return;
+    }
+    if (patch !== latestPatch) {
+      latestPatch = patch;
+      if (model.getValue() !== patch) model.setValue(patch);
+    }
     applyViewState();
   });
 
