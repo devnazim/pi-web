@@ -59,6 +59,7 @@ const MAX_TERMINAL_METADATA_LENGTH = 2048;
 const TERMINAL_HEARTBEAT_MS = 30_000;
 const TERMINAL_HEARTBEAT_TIMEOUT_MS = TERMINAL_HEARTBEAT_MS * 3;
 const TERMINAL_RESIZE_SEND_DELAY_MS = 80;
+const TERMINAL_RESIZE_SETTLE_DELAY_MS = 180;
 const TERMINAL_RECONNECT_BASE_DELAY_MS = 750;
 const TERMINAL_RECONNECT_MAX_DELAY_MS = 8_000;
 const TERMINAL_RECONNECT_STABLE_MS = 10_000;
@@ -190,6 +191,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let resizeObserver: ResizeObserver | undefined;
     let resizeTimer: number | undefined;
     let resizeFrame: number | undefined;
+    let resizeSettledTimer: number | undefined;
     let resizeMessageTimer: number | undefined;
     let reconnectTimer: number | undefined;
     let reconnectAttemptResetTimer: number | undefined;
@@ -199,7 +201,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let pendingInput = '';
     let pendingMetadata: { cwd?: string; title?: string } = {};
     let terminalExited = false;
-    let resizeTerminal: ((immediate?: boolean) => void) | undefined;
+    let resizeTerminal: ((immediate?: boolean, forceRefresh?: boolean) => void) | undefined;
     let scheduleResizeTerminal: (() => void) | undefined;
 
     setStatus('connecting');
@@ -271,6 +273,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
 
         let lastSentCols = 0;
         let lastSentRows = 0;
+        let lastResizeSentAt = 0;
         const sendTerminalResize = (cols: number, rows: number, immediate = false) => {
           if (resizeMessageTimer !== undefined) {
             window.clearTimeout(resizeMessageTimer);
@@ -283,36 +286,47 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             if (sendTerminalClientMessage(socket, { type: 'resize', cols, rows })) {
               lastSentCols = cols;
               lastSentRows = rows;
+              lastResizeSentAt = Date.now();
             }
           };
 
-          if (immediate) sendResize();
-          else resizeMessageTimer = window.setTimeout(sendResize, TERMINAL_RESIZE_SEND_DELAY_MS);
+          const delay = Math.max(0, TERMINAL_RESIZE_SEND_DELAY_MS - (Date.now() - lastResizeSentAt));
+          if (immediate || delay === 0) sendResize();
+          else resizeMessageTimer = window.setTimeout(sendResize, delay);
         };
-        resizeTerminal = (immediate = false) => {
+        resizeTerminal = (immediate = false, forceRefresh = false) => {
           if (!xterm || !terminalElement || !terminalElement.isConnected) return;
           const bounds = terminalElement.getBoundingClientRect();
           if (bounds.width <= 0 || bounds.height <= 0) return;
           try {
             fitAddon.fit();
+            if (forceRefresh && xterm.rows > 0) {
+              xterm.clearTextureAtlas();
+              xterm.refresh(0, xterm.rows - 1);
+            }
             sendTerminalResize(xterm.cols, xterm.rows, immediate);
           } catch {
             // Fit can throw while fonts/layout are still settling.
           }
         };
         scheduleResizeTerminal = () => {
-          if (resizeFrame !== undefined) return;
-          resizeFrame = window.requestAnimationFrame(() => {
-            resizeFrame = undefined;
-            resizeTerminal?.();
-          });
+          if (resizeFrame === undefined) {
+            resizeFrame = window.requestAnimationFrame(() => {
+              resizeFrame = undefined;
+              resizeTerminal?.();
+            });
+          }
+          if (resizeSettledTimer !== undefined) window.clearTimeout(resizeSettledTimer);
+          resizeSettledTimer = window.setTimeout(() => {
+            resizeSettledTimer = undefined;
+            resizeTerminal?.(true, true);
+          }, TERMINAL_RESIZE_SETTLE_DELAY_MS);
         };
 
         void document.fonts.load(`${TERMINAL_FONT_SIZE}px "${TERMINAL_MEASURE_FONT_FAMILY}"`)
           .then(() => {
             if (terminal !== xterm || !resizeTerminal || !xterm) return;
-            resizeTerminal();
-            xterm.refresh(0, xterm.rows - 1);
+            resizeTerminal(true, true);
           })
           .catch(() => undefined);
 
@@ -346,7 +360,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (terminalSocket !== socket || !resizeTerminal || !xterm) return;
           setStatus('connected');
           pendingHeartbeatAt = 0;
-          resizeTerminal(true);
+          resizeTerminal(true, true);
           if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
           if (pendingInput) {
             sendTerminalClientMessage(socket, { type: 'input', data: pendingInput });
@@ -437,6 +451,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         resizeObserver = new ResizeObserver(() => scheduleResizeTerminal?.());
         resizeObserver.observe(terminalElement);
         window.addEventListener('resize', scheduleResizeTerminal);
+        window.visualViewport?.addEventListener('resize', scheduleResizeTerminal);
         queueMicrotask(() => scheduleResizeTerminal?.());
         resizeTimer = window.setTimeout(() => scheduleResizeTerminal?.(), 100);
       })
@@ -450,6 +465,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
       disposed = true;
       if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
       if (resizeFrame !== undefined) window.cancelAnimationFrame(resizeFrame);
+      if (resizeSettledTimer !== undefined) window.clearTimeout(resizeSettledTimer);
       if (resizeMessageTimer !== undefined) window.clearTimeout(resizeMessageTimer);
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
@@ -458,7 +474,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         document.removeEventListener('visibilitychange', resumeHeartbeat);
         window.removeEventListener('focus', resumeHeartbeat);
       }
-      if (scheduleResizeTerminal) window.removeEventListener('resize', scheduleResizeTerminal);
+      if (scheduleResizeTerminal) {
+        window.removeEventListener('resize', scheduleResizeTerminal);
+        window.visualViewport?.removeEventListener('resize', scheduleResizeTerminal);
+      }
       resizeObserver?.disconnect();
       inputDisposable?.dispose();
       titleDisposable?.dispose();
