@@ -367,7 +367,7 @@ const WORKSPACE_SHORTCUT_KEYS = '123456789'.split('');
 const CHAT_SEARCH_INPUT_SELECTOR = '[data-chat-search-input="true"]';
 const SHORTCUT_BLOCKING_DIALOG_SELECTOR = '.project-modal-backdrop, .confirm-modal-backdrop, .file-search-backdrop, .asset-preview-backdrop';
 const KEYBINDINGS_STORAGE_KEY = 'pi-web-keybindings';
-const FAVICON_HREF = '/favicon.svg';
+const FAVICON_HREF = appUrl('/favicon.svg');
 const FAVICON_SIZE = 512;
 const FAVICON_BADGE_META: Record<Exclude<FaviconStatus, 'idle'>, { color: string; glyph: 'dot' | 'play' | 'alert' }> = {
   unread: { color: '#f59e0b', glyph: 'dot' },

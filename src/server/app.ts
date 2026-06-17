@@ -75,8 +75,11 @@ function stripBasePathFromUrl(url: string, basePath: string) {
 }
 
 function renderIndexHtml(indexHtml: string, basePath: string) {
+  const baseHref = basePathWithTrailingSlash(basePath);
+
   return indexHtml
-    .replace('<head>', `<head>\n    <base href="${escapeHtmlAttribute(basePathWithTrailingSlash(basePath))}" data-pi-web-base />`)
+    .replace('<head>', `<head>\n    <base href="${escapeHtmlAttribute(baseHref)}" data-pi-web-base />`)
+    .replace(/href="(?:\.\/|\/|%BASE_URL%)favicon\.svg"/, `href="${escapeHtmlAttribute(`${baseHref}favicon.svg`)}"`)
     .replace("window.__PI_WEB_BASE_PATH__ = '/';", `window.__PI_WEB_BASE_PATH__ = ${JSON.stringify(basePath)};`);
 }
 
