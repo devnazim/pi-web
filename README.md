@@ -27,6 +27,10 @@ npm run dev -- --host 0.0.0.0 --port 43110 --webPort 5173
 
 In dev mode, open the Vite URL (`5173` by default), not the API server port.
 
+## Keyboard shortcuts
+
+Pi Web includes configurable keyboard shortcuts under **Settings → Shortcuts**. Defaults use `Ctrl+.` as a chord prefix: press `Ctrl+.` then `1`-`9` to switch projects/workspaces, `[` / `]` to move to the previous/next project or workspace, and `T` to toggle light/dark theme. Theme mode shortcuts are also available by default: `Ctrl+.` then `S` for system, `L` for light, and `D` for dark.
+
 To serve dev mode from a reverse-proxy subpath, pass `--base-path`:
 
 ```bash

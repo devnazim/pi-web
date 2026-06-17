@@ -389,8 +389,13 @@ const DEFAULT_SHORTCUT_BINDINGS: Record<string, string> = {
   searchFiles: `${APP_SHORTCUT_CHORD_PREFIX} p`,
   newSession: `${APP_SHORTCUT_CHORD_PREFIX} n`,
   newWorkspace: `${APP_SHORTCUT_CHORD_PREFIX} o`,
+  previousWorkspace: `${APP_SHORTCUT_CHORD_PREFIX} [`,
+  nextWorkspace: `${APP_SHORTCUT_CHORD_PREFIX} ]`,
   openSettings: `${APP_SHORTCUT_CHORD_PREFIX} ,`,
   toggleTheme: `${APP_SHORTCUT_CHORD_PREFIX} t`,
+  themeSystem: `${APP_SHORTCUT_CHORD_PREFIX} s`,
+  themeLight: `${APP_SHORTCUT_CHORD_PREFIX} l`,
+  themeDark: `${APP_SHORTCUT_CHORD_PREFIX} d`,
 };
 
 const SHORTCUT_DEFINITIONS: { id: string; name: string; category: string }[] = [
@@ -403,8 +408,13 @@ const SHORTCUT_DEFINITIONS: { id: string; name: string; category: string }[] = [
   { id: 'searchFiles', name: 'Search files', category: 'Search' },
   { id: 'newSession', name: 'Create new session', category: 'Session' },
   { id: 'newWorkspace', name: 'Open project', category: 'Workspace' },
+  { id: 'previousWorkspace', name: 'Switch to previous workspace/project', category: 'Workspace' },
+  { id: 'nextWorkspace', name: 'Switch to next workspace/project', category: 'Workspace' },
   { id: 'openSettings', name: 'Open settings', category: 'General' },
   { id: 'toggleTheme', name: 'Toggle dark / light theme', category: 'General' },
+  { id: 'themeSystem', name: 'Use system theme', category: 'General' },
+  { id: 'themeLight', name: 'Use light theme', category: 'General' },
+  { id: 'themeDark', name: 'Use dark theme', category: 'General' },
 ];
 const SHORTCUT_ACTION_IDS = SHORTCUT_DEFINITIONS.map((shortcut) => shortcut.id);
 const TERMINAL_SHORTCUT_CHORD_PREFIXES = new Set([APP_SHORTCUT_CHORD_PREFIX]);
@@ -1060,8 +1070,22 @@ function Shell() {
         setOpenProjectModal(true);
         return true;
       }
+      if (id === 'previousWorkspace') return selectRelativeShortcutWorkspace(-1);
+      if (id === 'nextWorkspace') return selectRelativeShortcutWorkspace(1);
       if (id === 'toggleTheme') {
         toggleThemeMode();
+        return true;
+      }
+      if (id === 'themeSystem') {
+        setThemeMode('system');
+        return true;
+      }
+      if (id === 'themeLight') {
+        setThemeMode('light');
+        return true;
+      }
+      if (id === 'themeDark') {
+        setThemeMode('dark');
         return true;
       }
       return false;
@@ -1093,7 +1117,7 @@ function Shell() {
 
       if (chordPrefix) {
         if (isModifierShortcutKey(key)) return;
-        if (chordPrefix === APP_SHORTCUT_CHORD_PREFIX && !typingTarget && !blockingDialogOpen && !inTerminal && !inMonaco) {
+        if (chordPrefix === APP_SHORTCUT_CHORD_PREFIX && !blockingDialogOpen && !inMonaco) {
           const workspaceKey = workspaceShortcutEventKey(event);
           const workspaceIndex = workspaceKey ? WORKSPACE_SHORTCUT_KEYS.indexOf(workspaceKey) : -1;
           if (workspaceIndex !== -1 && selectShortcutWorkspace(workspaceIndex)) {
@@ -1801,6 +1825,23 @@ function Shell() {
     const project = orderedProjects()[index];
     if (!project) return false;
     selectProject(project.id);
+    return true;
+  }
+
+  function selectRelativeShortcutWorkspace(delta: 1 | -1) {
+    if (workspaceModeActive()) {
+      const listed = projectWorkspaces();
+      if (!listed.length) return false;
+      const currentIndex = listed.findIndex((workspace) => workspace.id === activeWorkspace()?.id);
+      const targetIndex = currentIndex >= 0 ? currentIndex + delta : delta > 0 ? 0 : listed.length - 1;
+      selectWorkspace(listed[(targetIndex + listed.length) % listed.length].id);
+      return true;
+    }
+    const listed = orderedProjects();
+    if (!listed.length) return false;
+    const currentIndex = listed.findIndex((project) => project.id === activeProject()?.id);
+    const targetIndex = currentIndex >= 0 ? currentIndex + delta : delta > 0 ? 0 : listed.length - 1;
+    selectProject(listed[(targetIndex + listed.length) % listed.length].id);
     return true;
   }
 
@@ -2558,10 +2599,10 @@ function ShortcutsSettingsPanel() {
     const q = query().trim().toLowerCase();
     return !q || [label, ...terms].some((term) => term.toLowerCase().includes(q));
   };
-  const showSwitchWorkspaceShortcut = () => shortcutMatches('Switch workspace', 'Ctrl+.', '1..9', 'workspace');
+  const showSwitchWorkspaceShortcut = () => shortcutMatches('Switch workspace/project by number', 'Ctrl+.', '1..9', 'workspace', 'project');
   const workspaceNavigationShortcuts = () => {
     const shortcuts: { id: string; name: string; category: string }[] = [];
-    if (showSwitchWorkspaceShortcut()) shortcuts.push({ id: 'switchWorkspace', name: 'Switch workspace', category: 'Workspace' });
+    if (showSwitchWorkspaceShortcut()) shortcuts.push({ id: 'switchWorkspace', name: 'Switch workspace/project by number', category: 'Workspace' });
     return shortcuts;
   };
   const filtered = createMemo(() => {
