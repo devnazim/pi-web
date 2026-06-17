@@ -358,6 +358,7 @@ const DEFAULT_APP_TITLE = 'Pi Web';
 const THEME_MODE_KEY = 'pi-web-theme-preference';
 const BROWSER_TAB_NAME_KEY = 'pi-web-browser-tab-name';
 const CONTRAST_USER_MESSAGES_KEY = 'pi-web-contrast-user-messages';
+const LAST_WORKSPACE_SESSIONS_KEY = 'pi-web-last-workspace-sessions-v2';
 const SESSION_COMPOSER_CONTROLS_KEY = 'pi-web-session-composer-controls';
 const PROJECT_ORDER_KEY = 'pi-web-project-order';
 const SESSION_PAGE_SIZE = 30;
@@ -580,9 +581,11 @@ function setProjectTileDragData(dataTransfer: DataTransfer, dragEl: HTMLElement)
 
 
 function Shell() {
+  const initialActiveSessionId = readActiveSessionId();
   const [projectId, setProjectId] = createSignal<string>();
   const [workspaceProjectId, setWorkspaceProjectId] = createSignal<string>();
-  const [sessionId, setSessionId] = createSignal<string | undefined>(readActiveSessionId());
+  const [sessionId, setSessionId] = createSignal<string | undefined>(initialActiveSessionId);
+  const [sessionWorkspaceId, setSessionWorkspaceId] = createSignal<string>();
   const [events, setEvents] = createSignal<string[]>([]);
   const [toolPanel, setToolPanel] = createSignal<ToolPanel>();
   const [reviewInitialSessionSidebarOpen, setReviewInitialSessionSidebarOpen] = createSignal<boolean>();
@@ -596,6 +599,7 @@ function Shell() {
   const [editingProject, setEditingProject] = createSignal<Project>();
   const [projectMenu, setProjectMenu] = createSignal<ProjectMenuState>();
   const [workspacesEnabledByPath, setWorkspacesEnabledByPath] = createSignal(readWorkspacesEnabledByPath());
+  const [lastWorkspaceSessions, setLastWorkspaceSessions] = createSignal(readLastWorkspaceSessions());
   const [knownWorkspacesByRootId, setKnownWorkspacesByRootId] = createSignal<Record<string, ProjectWorkspace[]>>({});
   const [workspaceNotificationStore, setWorkspaceNotificationStore] = createSignal<Record<string, WorkspaceNotificationState>>(readWorkspaceNotificationStore());
   const [notificationToasts, setNotificationToasts] = createSignal<WorkspaceNotificationItem[]>([]);
@@ -624,6 +628,10 @@ function Shell() {
   const initialActiveProjectPath = readActiveProjectPath();
   const initialActiveWorkspacePath = readActiveWorkspacePath();
   const [pendingActiveWorkspacePath, setPendingActiveWorkspacePath] = createSignal(initialActiveWorkspacePath);
+  let initialSessionRestorePending = Boolean(initialActiveSessionId);
+  let workspaceSessionRestoredForId: string | undefined;
+  let workspaceSessionRestoreRequest = 0;
+  let workspaceSessionRestoreTarget: { workspaceId: string; sessionId: string; request: number } | undefined;
   let shellSplitRef: HTMLDivElement | undefined;
   const sessionSidebar = createResizableDimension({
     defaultSize: SESSION_SIDEBAR_DEFAULT_WIDTH,
@@ -713,9 +721,15 @@ function Shell() {
     if (!project || !workspace) return project;
     return { id: workspace.id, name: workspace.local ? project.name : workspace.name, path: workspace.path, color: project.color, image: project.image };
   });
+  const activeSessionId = createMemo(() => {
+    const id = sessionId();
+    const owner = sessionWorkspaceId();
+    const workspaceId = workspaceProject()?.id;
+    return id && owner && workspaceId && owner === workspaceId ? id : undefined;
+  });
   const currentSessionRunning = createMemo(() => {
     const project = workspaceProject();
-    const id = sessionId();
+    const id = activeSessionId();
     return Boolean(project && id && workspaceNotificationState(workspaceNotificationStore()[project.id]).runningSessionIds.includes(id));
   });
   const resolvedThemeMode = createMemo<ResolvedThemeMode>(() => {
@@ -743,6 +757,11 @@ function Shell() {
       pendingEventsFrame = undefined;
     }
     setEvents(payloads);
+  }
+
+  function setActiveSession(id: string | undefined, workspaceId = workspaceProject()?.id) {
+    setSessionWorkspaceId(id ? workspaceId : undefined);
+    setSessionId(id);
   }
 
   function updateAgentStatusCache(projectId: string, eventSessionId: string, data: unknown) {
@@ -842,6 +861,71 @@ function Shell() {
     localStorage.setItem(CONTRAST_USER_MESSAGES_KEY, String(enabled));
   }
 
+  function rememberWorkspaceSession(workspaceId: string, id: string) {
+    setLastWorkspaceSessions((current) => {
+      if (current[workspaceId] === id) return current;
+      const next = { ...current, [workspaceId]: id };
+      writeLastWorkspaceSessions(next);
+      return next;
+    });
+  }
+
+  function forgetWorkspaceLastSession(workspaceId: string) {
+    setLastWorkspaceSessions((current) => {
+      if (!(workspaceId in current)) return current;
+      const next = { ...current };
+      delete next[workspaceId];
+      writeLastWorkspaceSessions(next);
+      return next;
+    });
+  }
+
+  function forgetLastWorkspaceSessionId(id: string) {
+    setLastWorkspaceSessions((current) => {
+      let changed = false;
+      const next = { ...current };
+      for (const [workspaceId, sessionId] of Object.entries(next)) {
+        if (sessionId !== id) continue;
+        delete next[workspaceId];
+        changed = true;
+      }
+      if (!changed) return current;
+      writeLastWorkspaceSessions(next);
+      return next;
+    });
+  }
+
+  function cachedSessionKnown(workspaceId: string, id: string) {
+    if (queryClient.getQueryData<SessionDetail>(['session', workspaceId, id])) return true;
+    const sessionPages = queryClient.getQueryData<{ pages?: SessionListResponse[] }>(['sessions', workspaceId]);
+    return Boolean(sessionPages?.pages?.some((page) => page.sessions.some((session) => session.id === id)));
+  }
+
+  async function restoreRememberedWorkspaceSession(workspaceId: string, id: string, request: number) {
+    workspaceSessionRestoreTarget = { workspaceId, sessionId: id, request };
+    try {
+      if (!cachedSessionKnown(workspaceId, id)) {
+        await queryClient.fetchQuery({
+          queryKey: ['session', workspaceId, id],
+          queryFn: ({ signal }) => api<SessionDetail>(`/api/projects/${workspaceId}/session?sessionId=${encodeURIComponent(id)}`, { signal }),
+          staleTime: SESSION_DETAIL_CACHE_STALE_TIME_MS,
+        });
+      }
+      if (workspaceSessionRestoreRequest !== request || workspaceProjectId() !== workspaceId) return;
+      setActiveSession(id, workspaceId);
+    } catch (error) {
+      if (workspaceSessionRestoreRequest !== request || workspaceProjectId() !== workspaceId) return;
+      if (apiErrorStatus(error) === 404) {
+        forgetWorkspaceLastSession(workspaceId);
+        if (toolPanel() === 'tree') setToolPanel(undefined);
+      } else {
+        setActiveSession(id, workspaceId);
+      }
+    } finally {
+      if (workspaceSessionRestoreTarget?.request === request) workspaceSessionRestoreTarget = undefined;
+    }
+  }
+
   async function previewNotificationSound() {
     await unlockWorkspaceNotificationSound();
     playNotificationSound('info', notificationSoundId(), notificationSoundVolume());
@@ -850,7 +934,7 @@ function Shell() {
   function isWorkspaceNotificationViewed(workspaceId: string, notificationSessionId: string | undefined) {
     if (workspaceProject()?.id !== workspaceId) return false;
     if (document.visibilityState !== 'visible' || !document.hasFocus()) return false;
-    return notificationSessionId ? sessionId() === notificationSessionId : true;
+    return notificationSessionId ? activeSessionId() === notificationSessionId : true;
   }
 
   function maybeShowBrowserNotification(notification: WorkspaceNotificationItem, workspace: WorkspaceLookupEntry, viewed: boolean) {
@@ -902,10 +986,16 @@ function Shell() {
   function openWorkspaceNotification(notification: WorkspaceNotificationItem) {
     const workspace = workspaceLookup()[notification.workspaceId];
     if (workspace) {
+      setActiveSession(undefined, workspace.workspace.id);
       setProjectId(workspace.rootProject.id);
-      setWorkspaceProjectId(workspace.workspace.id);
+      resetWorkspaceSelection(workspace.workspace.id);
       writeActiveProjectPath(workspace.rootProject.path);
-      if (notification.sessionId) setSessionId(notification.sessionId);
+      if (notification.sessionId) {
+        workspaceSessionRestoreRequest += 1;
+        setActiveSession(notification.sessionId, workspace.workspace.id);
+        rememberWorkspaceSession(workspace.workspace.id, notification.sessionId);
+        if (!eventsBelongToSession(events(), notification.sessionId)) resetAgentEvents([]);
+      }
     }
     markWorkspaceNotificationsRead(notification.workspaceId);
     setNotificationPanelWorkspaceId(notification.workspaceId);
@@ -1112,7 +1202,14 @@ function Shell() {
   });
 
   createEffect(() => {
-    writeActiveSessionId(sessionId());
+    writeActiveSessionId(activeSessionId());
+  });
+
+  createEffect(() => {
+    if (pendingActiveWorkspacePath()) return;
+    const workspaceId = workspaceProject()?.id;
+    const id = activeSessionId();
+    if (workspaceId && id && sessionWorkspaceId() === workspaceId) rememberWorkspaceSession(workspaceId, id);
   });
 
   createEffect(() => {
@@ -1141,7 +1238,8 @@ function Shell() {
     const project = activeProject();
     if (!project) return;
     if (!workspaceModeActive()) {
-      if (workspaceProjectId() !== project.id) setWorkspaceProjectId(project.id);
+      if (pendingActiveWorkspacePath() && !workspacesError()) return;
+      if (workspaceProjectId() !== project.id) resetWorkspaceSelection(project.id);
       return;
     }
     const listed = projectWorkspaces();
@@ -1151,12 +1249,12 @@ function Shell() {
       const targetWorkspace = listed.find((workspace) => workspace.path === workspacePath);
       setPendingActiveWorkspacePath(undefined);
       if (targetWorkspace) {
-        if (workspaceProjectId() !== targetWorkspace.id) setWorkspaceProjectId(targetWorkspace.id);
+        if (workspaceProjectId() !== targetWorkspace.id) resetWorkspaceSelection(targetWorkspace.id);
         return;
       }
     }
     if (listed.some((workspace) => workspace.id === workspaceProjectId())) return;
-    setWorkspaceProjectId(listed.find((workspace) => workspace.local)?.id ?? project.id);
+    resetWorkspaceSelection(listed.find((workspace) => workspace.local)?.id ?? project.id);
   });
 
   createEffect(() => {
@@ -1164,6 +1262,33 @@ function Shell() {
     const workspace = activeWorkspace();
     if (!project || !workspace || pendingActiveWorkspacePath()) return;
     writeActiveWorkspacePath(project.path, workspace.path);
+  });
+
+  createEffect(() => {
+    const workspace = activeWorkspace();
+    if (!workspace || pendingActiveWorkspacePath()) return;
+    if (workspaceModeActive() && workspaceProjectId() !== workspace.id) return;
+    const workspaceId = workspace.id;
+    if (workspaceSessionRestoredForId === workspaceId) return;
+    workspaceSessionRestoredForId = workspaceId;
+    if (initialSessionRestorePending && sessionId() === initialActiveSessionId) {
+      initialSessionRestorePending = false;
+      const restoreRequest = workspaceSessionRestoreRequest + 1;
+      workspaceSessionRestoreRequest = restoreRequest;
+      setActiveSession(undefined, workspaceId);
+      resetAgentEvents([]);
+      if (initialActiveSessionId) void restoreRememberedWorkspaceSession(workspaceId, initialActiveSessionId, restoreRequest);
+      return;
+    }
+    initialSessionRestorePending = false;
+    const rememberedSessionId = lastWorkspaceSessions()[workspaceId];
+    if (activeSessionId() === rememberedSessionId) return;
+    const restoreRequest = workspaceSessionRestoreRequest + 1;
+    workspaceSessionRestoreRequest = restoreRequest;
+    setActiveSession(undefined, workspaceId);
+    resetAgentEvents([]);
+    if (rememberedSessionId) void restoreRememberedWorkspaceSession(workspaceId, rememberedSessionId, restoreRequest);
+    else if (toolPanel() === 'tree') setToolPanel(undefined);
   });
 
   createEffect(() => {
@@ -1213,16 +1338,16 @@ function Shell() {
 
   createEffect(() => {
     const project = workspaceProject();
-    const activeSessionId = sessionId();
+    const currentActiveSessionId = activeSessionId();
     if (!project) return;
-    const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${activeSessionId ? `?sessionId=${activeSessionId}` : ''}`));
+    const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentActiveSessionId ? `?sessionId=${currentActiveSessionId}` : ''}`));
     socket.addEventListener('message', (event) => {
       try {
         const parsed = JSON.parse(event.data) as { type?: string; sessionId?: string; data?: unknown };
         const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
         if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([event.data]);
         else if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
-        const eventSessionId = parsed.sessionId ?? activeSessionId;
+        const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
         if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
         if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
           queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
@@ -1274,15 +1399,15 @@ function Shell() {
 
   createEffect(() => {
     const workspaceId = workspaceProject()?.id;
-    const activeSessionId = sessionId();
-    if (workspaceId && isWorkspaceNotificationViewed(workspaceId, activeSessionId)) markWorkspaceSessionNotificationsRead(workspaceId, activeSessionId);
+    const currentActiveSessionId = activeSessionId();
+    if (workspaceId && isWorkspaceNotificationViewed(workspaceId, currentActiveSessionId)) markWorkspaceSessionNotificationsRead(workspaceId, currentActiveSessionId);
   });
 
   createEffect(() => {
     const markActiveRead = () => {
       const workspaceId = workspaceProject()?.id;
-      const activeSessionId = sessionId();
-      if (workspaceId && isWorkspaceNotificationViewed(workspaceId, activeSessionId)) markWorkspaceSessionNotificationsRead(workspaceId, activeSessionId);
+      const currentActiveSessionId = activeSessionId();
+      if (workspaceId && isWorkspaceNotificationViewed(workspaceId, currentActiveSessionId)) markWorkspaceSessionNotificationsRead(workspaceId, currentActiveSessionId);
     };
     document.addEventListener('visibilitychange', markActiveRead);
     window.addEventListener('focus', markActiveRead);
@@ -1307,11 +1432,10 @@ function Shell() {
         if (closedProject) forgetOpenProject(closedProject.path);
       }
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
+      setActiveSession(undefined);
       setProjectId(project.id);
-      setWorkspaceProjectId(project.id);
+      resetWorkspaceSelection(project.id);
       writeActiveProjectPath(project.path);
-      setSessionId(undefined);
-      resetAgentEvents([]);
       setWorkspaceToolPanel(undefined);
       setOpenProjectModal(false);
     } catch (error) {
@@ -1357,11 +1481,10 @@ function Shell() {
       forgetOpenProject(project.path);
     }
     await queryClient.invalidateQueries({ queryKey: ['projects'] });
+    setActiveSession(undefined);
     setProjectId(nextProject.id);
-    setWorkspaceProjectId(nextProject.id);
+    resetWorkspaceSelection(nextProject.id);
     writeActiveProjectPath(nextProject.path);
-    setSessionId(undefined);
-    resetAgentEvents([]);
     setWorkspaceToolPanel(undefined);
     setEditingProject(undefined);
   }
@@ -1372,23 +1495,25 @@ function Shell() {
     await queryClient.invalidateQueries({ queryKey: ['projects'] });
     if (project.id === projectId()) {
       const nextProject = projects.data?.projects.find((item) => item.id !== project.id);
+      setActiveSession(undefined);
       setProjectId(nextProject?.id);
-      setWorkspaceProjectId(nextProject?.id);
       writeActiveProjectPath(nextProject?.path);
-      setSessionId(undefined);
-      resetAgentEvents([]);
+      if (nextProject) resetWorkspaceSelection(nextProject.id);
+      else {
+        setWorkspaceProjectId(undefined);
+        resetAgentEvents([]);
+      }
       setWorkspaceToolPanel(undefined);
     }
   }
 
   function selectProject(id: string) {
     if (id === projectId()) return;
+    setActiveSession(undefined);
     setProjectId(id);
-    setWorkspaceProjectId(id);
     const project = projects.data?.projects.find((item) => item.id === id);
     if (project) writeActiveProjectPath(project.path);
-    setSessionId(undefined);
-    resetAgentEvents([]);
+    resetWorkspaceSelection(id);
     setWorkspaceToolPanel(undefined);
   }
 
@@ -1406,25 +1531,42 @@ function Shell() {
 
   function selectSession(id: string, workspaceId = workspaceProject()?.id, expectedSessionId?: string | null) {
     const currentWorkspaceId = workspaceProject()?.id;
-    const currentSessionId = sessionId();
-    if (workspaceId && currentWorkspaceId !== workspaceId) return;
+    const currentSessionId = activeSessionId();
     if (expectedSessionId !== undefined && currentSessionId !== (expectedSessionId ?? undefined)) return;
-    if (currentSessionId === id) return;
+    workspaceSessionRestoreRequest += 1;
+    const switchedWorkspace = Boolean(workspaceId && currentWorkspaceId !== workspaceId);
+    if (workspaceId && currentWorkspaceId !== workspaceId) {
+      setActiveSession(undefined, workspaceId);
+      setWorkspaceProjectId(workspaceId);
+      workspaceSessionRestoredForId = workspaceId;
+    }
+    if (workspaceId) rememberWorkspaceSession(workspaceId, id);
+    if (currentSessionId === id && !switchedWorkspace) return;
     const keepEvents = eventsBelongToSession(events(), id);
-    setSessionId(id);
+    setActiveSession(id, workspaceId);
     if (!keepEvents) resetAgentEvents([]);
   }
 
   function handleSessionDeleted(id: string) {
-    if (sessionId() !== id) return;
-    setSessionId(undefined);
+    const deletedActiveSession = activeSessionId() === id;
+    const deletedPendingRestore = workspaceSessionRestoreTarget?.sessionId === id && workspaceSessionRestoreTarget.request === workspaceSessionRestoreRequest;
+    if (deletedActiveSession || deletedPendingRestore) {
+      workspaceSessionRestoreRequest += 1;
+      if (deletedPendingRestore) workspaceSessionRestoreTarget = undefined;
+    }
+    forgetLastWorkspaceSessionId(id);
+    if (!deletedActiveSession) {
+      if (deletedPendingRestore && toolPanel() === 'tree') setToolPanel(undefined);
+      return;
+    }
+    setActiveSession(undefined);
     resetAgentEvents([]);
     if (toolPanel() === 'tree') setToolPanel(undefined);
   }
 
   function currentSessionName() {
     const project = workspaceProject();
-    const id = sessionId();
+    const id = activeSessionId();
     if (!project || !id) return '';
     const detail = queryClient.getQueryData<SessionDetail>(['session', project.id, id]);
     if (detail) return detail.name ?? '';
@@ -1433,7 +1575,7 @@ function Shell() {
   }
 
   async function deleteCurrentSession() {
-    const id = sessionId();
+    const id = activeSessionId();
     const project = workspaceProject();
     if (!id || !project) return;
     if (currentSessionRunning()) {
@@ -1457,7 +1599,7 @@ function Shell() {
   }
 
   async function renameCurrentSession() {
-    const id = sessionId();
+    const id = activeSessionId();
     const project = workspaceProject();
     if (!id || !project) return;
     setSessionActionBusy(true);
@@ -1482,7 +1624,7 @@ function Shell() {
     if (project) url.searchParams.set(PROJECT_QUERY_KEY, encodeProjectPath(project.path));
     if (workspace && project && workspace.path !== project.path) url.searchParams.set(WORKSPACE_QUERY_KEY, encodeProjectPath(workspace.path));
     else url.searchParams.delete(WORKSPACE_QUERY_KEY);
-    const id = sessionId();
+    const id = activeSessionId();
     if (id) url.searchParams.set(SESSION_QUERY_KEY, id);
     else url.searchParams.delete(SESSION_QUERY_KEY);
     return `${url.origin}${url.pathname}${url.search}${url.hash}`;
@@ -1502,17 +1644,39 @@ function Shell() {
   }
 
   function startNewSession(workspaceId?: string) {
-    if (workspaceId) setWorkspaceProjectId(workspaceId);
-    setSessionId(undefined);
+    const targetWorkspaceId = workspaceId ?? workspaceProject()?.id;
+    workspaceSessionRestoreRequest += 1;
+    if (targetWorkspaceId) forgetWorkspaceLastSession(targetWorkspaceId);
+    setActiveSession(undefined, targetWorkspaceId);
+    if (workspaceId) {
+      setWorkspaceProjectId(workspaceId);
+      workspaceSessionRestoredForId = workspaceId;
+    }
     resetAgentEvents([]);
     setToolPanel((panel) => panel === 'tree' ? undefined : panel);
   }
 
   function resetWorkspaceSelection(id: string) {
-    setWorkspaceProjectId(id);
-    setSessionId(undefined);
+    if (initialSessionRestorePending && sessionId() === initialActiveSessionId) {
+      const restoreRequest = workspaceSessionRestoreRequest + 1;
+      workspaceSessionRestoreRequest = restoreRequest;
+      setActiveSession(undefined, id);
+      resetAgentEvents([]);
+      setWorkspaceProjectId(id);
+      workspaceSessionRestoredForId = id;
+      initialSessionRestorePending = false;
+      if (initialActiveSessionId) void restoreRememberedWorkspaceSession(id, initialActiveSessionId, restoreRequest);
+      return;
+    }
+    const rememberedSessionId = lastWorkspaceSessions()[id];
+    const restoreRequest = workspaceSessionRestoreRequest + 1;
+    workspaceSessionRestoreRequest = restoreRequest;
+    setActiveSession(undefined, id);
     resetAgentEvents([]);
-    setToolPanel((panel) => panel === 'tree' ? undefined : panel);
+    setWorkspaceProjectId(id);
+    workspaceSessionRestoredForId = id;
+    if (rememberedSessionId) void restoreRememberedWorkspaceSession(id, rememberedSessionId, restoreRequest);
+    else setToolPanel((panel) => panel === 'tree' ? undefined : panel);
   }
 
   function selectWorkspace(id: string) {
@@ -1569,6 +1733,7 @@ function Shell() {
     queryClient.removeQueries({ queryKey: ['settings-editor', workspace.id] });
     queryClient.removeQueries({ queryKey: ['git-status', workspace.id] });
     queryClient.removeQueries({ queryKey: ['git-file-diff', workspace.id] });
+    forgetWorkspaceLastSession(workspace.id);
     await queryClient.invalidateQueries({ queryKey: ['workspaces', project.id] });
     if (workspaceProjectId() === workspace.id) resetWorkspaceSelection(project.id);
   }
@@ -1612,7 +1777,7 @@ function Shell() {
 
   function toggleShortcutToolPanel(panel: ToolPanel) {
     if (!workspaceProject()) return false;
-    if (panel === 'tree' && !sessionId()) return false;
+    if (panel === 'tree' && !activeSessionId()) return false;
     setWorkspaceToolPanel(toolPanel() === panel ? undefined : panel);
     return true;
   }
@@ -1667,7 +1832,7 @@ function Shell() {
             workspaces={projectWorkspaces()}
             workspacesLoading={workspaces.isLoading}
             selectedWorkspaceId={activeWorkspace()?.id}
-            selectedSessionId={sessionId()}
+            selectedSessionId={activeSessionId()}
             workspaceNotifications={workspaceNotificationSummaries()}
             onWorkspace={selectWorkspace}
             onSession={selectSession}
@@ -1689,8 +1854,8 @@ function Shell() {
           />
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
-          <Topbar project={workspaceProject()} sessionId={sessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={sessionId()} events={events()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} events={events()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -1798,7 +1963,7 @@ function Shell() {
           workspacesLoading={workspaces.isLoading}
           workspacesError={workspacesError()}
           selectedWorkspaceId={activeWorkspace()?.id}
-          selectedSessionId={sessionId()}
+          selectedSessionId={activeSessionId()}
           selectedSessionTitle={currentSessionName()}
           workspaceNotifications={workspaceNotificationSummaries()}
           sessionRunning={currentSessionRunning()}
@@ -1828,7 +1993,7 @@ function Shell() {
       <Show when={mobileToolPopover()}>
         <MobileToolPopover
           toolPanel={toolPanel()}
-          sessionId={sessionId()}
+          sessionId={activeSessionId()}
           setToolPanel={setWorkspaceToolPanel}
           onClose={() => setMobileToolPopover(false)}
         />
@@ -2604,7 +2769,7 @@ function Sidebar(props: {
   selectedSessionId?: string;
   workspaceNotifications: Record<string, WorkspaceNotificationSummary>;
   onWorkspace: (id: string) => void;
-  onSession: (id: string) => void;
+  onSession: (id: string, workspaceId?: string) => void;
   onNewSession: (workspaceId?: string) => void;
   onDeleteSession: (id: string) => void;
   onProjectMenu: (menu: ProjectMenuState) => void;
@@ -2792,7 +2957,7 @@ function Sidebar(props: {
                   onOpenNotifications={() => props.onOpenNotifications(workspace.id)}
                   onClearNotifications={() => props.onClearNotifications(workspace.id)}
                   onDeleteSession={(session) => { setDeleteError(''); setSessionToDelete({ workspaceId: workspace.id, session }); }}
-                  onSession={(session) => { props.onWorkspace(workspace.id); props.onSession(session.id); }}
+                  onSession={(session) => props.onSession(session.id, workspace.id)}
                 />
               )}
             </For>
@@ -3670,7 +3835,7 @@ function MobileMenu(props: {
   sessionRunning: boolean;
   onProject: (id: string) => void;
   onWorkspace: (id: string) => void;
-  onSession: (id: string) => void;
+  onSession: (id: string, workspaceId?: string) => void;
   onNewSession: (workspaceId?: string) => void;
   onDeleteSession: (id: string) => void;
   onToggleWorkspaces: () => void;
@@ -3910,7 +4075,7 @@ function MobileMenu(props: {
                           onOpenNotifications={() => props.onOpenNotifications(workspace.id)}
                           onClearNotifications={() => props.onClearNotifications(workspace.id)}
                           onDeleteSession={(session) => { setDeleteError(''); setSessionToDelete({ workspaceId: workspace.id, session }); }}
-                          onSession={(session) => { props.onWorkspace(workspace.id); props.onSession(session.id); props.onClose(); }}
+                          onSession={(session) => { props.onSession(session.id, workspace.id); props.onClose(); }}
                         />
                       )}
                     </For>
@@ -9945,6 +10110,24 @@ function writeWorkspacesEnabledByPath(value: Record<string, boolean>) {
   localStorage.setItem(WORKSPACES_ENABLED_KEY, JSON.stringify(value));
 }
 
+function readLastWorkspaceSessions(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(LAST_WORKSPACE_SESSIONS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string'));
+  } catch {
+    return {};
+  }
+}
+
+function writeLastWorkspaceSessions(value: Record<string, string>) {
+  const entries = Object.entries(value).filter((entry): entry is [string, string] => Boolean(entry[0]) && Boolean(entry[1]));
+  if (entries.length) localStorage.setItem(LAST_WORKSPACE_SESSIONS_KEY, JSON.stringify(Object.fromEntries(entries)));
+  else localStorage.removeItem(LAST_WORKSPACE_SESSIONS_KEY);
+}
+
 function readOpenProjects() {
   const activePath = readActiveProjectPath();
   const paths = readProjectPaths(OPEN_PROJECTS_KEY);
@@ -10098,9 +10281,18 @@ function errorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
+function apiErrorStatus(error: unknown) {
+  return error && typeof error === 'object' && typeof (error as { status?: unknown }).status === 'number' ? (error as { status: number }).status : undefined;
+}
+
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(appUrl(url), init);
-  if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? response.statusText);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { error?: unknown };
+    const error = new Error(typeof body.error === 'string' ? body.error : response.statusText) as Error & { status: number };
+    error.status = response.status;
+    throw error;
+  }
   return response.json();
 }
 
