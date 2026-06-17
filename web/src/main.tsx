@@ -209,7 +209,8 @@ type PiSettingsResponse = { global: PiSettings; project: PiSettings; effective: 
 type ChatContentPart = { type: 'text' | 'thinking' | 'tool' | 'image' | 'error'; text: string };
 type ToolCallInfo = { id?: string; name: string; args: Record<string, unknown> };
 type AgentToolActivity = { id: string; name: string; status: 'running' | 'done' | 'error'; summary?: string };
-type AgentActivity = { running: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[] };
+type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
+type AgentActivity = { running: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean };
 type SessionComposerControls = { model?: string; thinking?: ThinkingLevel | '' };
@@ -8200,10 +8201,16 @@ function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; synt
 
 function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
   const error = createMemo(() => props.activity.error === 'Operation aborted' ? undefined : props.activity.error);
+  const statusText = createMemo(() => {
+    const retry = props.activity.retry;
+    if (!retry) return props.activity.running ? 'working' : 'pi';
+    const attempt = retry.attempt && retry.maxAttempts ? ` (${retry.attempt}/${retry.maxAttempts})` : retry.attempt ? ` (${retry.attempt})` : '';
+    return `retrying${attempt}`;
+  });
   return (
     <Show when={props.activity.running || error() || props.activity.notices.length}>
       <div class="live-agent">
-        <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><LoaderCircle class="size-3.5 animate-spin" /></Show>{props.activity.running ? 'working' : 'pi'}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
+        <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
         <Show when={props.activity.text.trim()}><div class="assistant-message assistant-message-live"><MarkdownContent text={props.activity.text} syntaxTheme={props.syntaxTheme} /></div></Show>
         <Show when={!props.hideThinking && props.activity.thinking.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{props.activity.thinking}</div></Collapsible></Show>
         <Show when={(props.toolOutputMode !== 'hidden' && props.activity.tools.length) || props.activity.notices.length}>
@@ -8287,7 +8294,7 @@ function agentEventSummary(event: { type?: string; message?: string; data?: unkn
   const type = typeof data.type === 'string' ? data.type : 'event';
   const toolName = typeof data.toolName === 'string' ? data.toolName : 'tool';
   if (type === 'agent_start') return { label: 'agent', text: 'started' };
-  if (type === 'agent_end') return { label: 'agent', text: 'finished' };
+  if (type === 'agent_end') return { label: 'agent', text: data.willRetry ? 'retry pending' : 'finished' };
   if (type === 'tool_execution_start') return { label: 'tool', text: `started ${toolName}` };
   if (type === 'tool_execution_end') return { label: data.isError ? 'tool error' : 'tool', text: `finished ${toolName}` };
   if (type === 'auto_retry_start') return { label: 'retry', text: `attempt ${data.attempt ?? ''} after ${data.errorMessage ?? 'provider error'}` };
@@ -8336,6 +8343,7 @@ function bashActivity(events: string[]): BashActivity {
 function agentActivity(events: string[]): AgentActivity {
   let running = false;
   let error: string | undefined;
+  let retry: AgentRetryActivity | undefined;
   let text = '';
   let thinking = '';
   const tools = new Map<string, AgentToolActivity>();
@@ -8347,6 +8355,7 @@ function agentActivity(events: string[]): AgentActivity {
     if (parsed.type === 'agent:start') {
       running = true;
       error = undefined;
+      retry = undefined;
       text = '';
       thinking = '';
       tools.clear();
@@ -8355,11 +8364,17 @@ function agentActivity(events: string[]): AgentActivity {
     }
     if (parsed.type === 'agent:finish') {
       running = false;
+      retry = undefined;
       continue;
     }
     if (parsed.type === 'agent:error' || parsed.type === 'error') {
-      running = false;
       const message = parsed.message ?? 'Agent failed';
+      if (/already processing/i.test(message) && running) {
+        notices.push(message);
+        continue;
+      }
+      running = false;
+      retry = undefined;
       error = message === 'Request was aborted' ? 'Operation aborted' : message;
       continue;
     }
@@ -8373,6 +8388,7 @@ function agentActivity(events: string[]): AgentActivity {
     if (type === 'agent_start') {
       running = true;
       error = undefined;
+      retry = undefined;
       text = '';
       thinking = '';
       tools.clear();
@@ -8380,7 +8396,9 @@ function agentActivity(events: string[]): AgentActivity {
       continue;
     }
     if (type === 'agent_end') {
-      running = false;
+      running = data.willRetry === true;
+      if (running) error = undefined;
+      else retry = undefined;
       continue;
     }
     if (['message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'compaction_start'].includes(type)) running = true;
@@ -8405,13 +8423,28 @@ function agentActivity(events: string[]): AgentActivity {
       continue;
     }
     if (type === 'notice') notices.push(String(data.message ?? 'notice'));
-    if (type === 'auto_retry_start') notices.push(`retrying after ${data.errorMessage ?? 'provider error'}`);
-    if (type === 'auto_retry_end') notices.push(data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`);
+    if (type === 'auto_retry_start') {
+      const attempt = typeof data.attempt === 'number' && Number.isFinite(data.attempt) ? data.attempt : undefined;
+      const maxAttempts = typeof data.maxAttempts === 'number' && Number.isFinite(data.maxAttempts) ? data.maxAttempts : undefined;
+      const delayMs = typeof data.delayMs === 'number' && Number.isFinite(data.delayMs) ? data.delayMs : undefined;
+      const errorMessage = String(data.errorMessage ?? 'provider error');
+      const attemptText = attempt && maxAttempts ? ` (${attempt}/${maxAttempts})` : attempt ? ` (${attempt})` : '';
+      const delayText = delayMs ? ` in ${Math.ceil(delayMs / 1000)}s` : '';
+      retry = { attempt, maxAttempts, delayMs, errorMessage };
+      notices.push(`retrying${attemptText}${delayText} after ${errorMessage}`);
+      continue;
+    }
+    if (type === 'auto_retry_end') {
+      retry = undefined;
+      notices.push(data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`);
+      if (data.success !== true) running = false;
+      continue;
+    }
     if (type === 'compaction_start') notices.push('compacting context');
     if (type === 'compaction_end') notices.push(data.aborted ? 'compaction aborted' : 'compaction finished');
   }
 
-  return { running, error, text, thinking, tools: [...tools.values()], notices };
+  return { running, error, text, thinking, tools: [...tools.values()], notices, retry };
 }
 
 function toolActivitySummary(data: Record<string, unknown>) {

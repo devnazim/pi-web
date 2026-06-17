@@ -78,8 +78,11 @@ type AgentStatus = {
 };
 
 type CachedSession = { promise: Promise<unknown>; expiresAt: number; timer?: NodeJS.Timeout };
+type RuntimeSessionLock = { release: () => void; wasActive: boolean };
+type PromptRunOptions = { startEvent?: boolean; preflightResult?: (success: boolean, error?: unknown) => void };
 
 const WEB_BUILTIN_COMMAND_NAMES = new Set(['compact']);
+const AGENT_ALREADY_PROCESSING_MESSAGE = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 const SESSION_CACHE_TTL_MS = 30 * 60_000;
 const SESSION_CACHE_BUSY_RETRY_MS = 60_000;
 
@@ -218,14 +221,26 @@ export class PiBridge {
     return sessionDetailFromManager(filePath ?? sessionFile ?? await resolveSessionFile(sessionId, projectPath), manager);
   }
 
-  async prompt(projectPath: string, body: PromptBody, key: string | string[], options: { startEvent?: boolean } = {}) {
+  async prompt(projectPath: string, body: PromptBody, key: string | string[], options: PromptRunOptions = {}) {
     let markSessionIdle: () => void = () => undefined;
     let subscription: (() => void) | undefined;
+    let preflightReported = false;
+    const reportPreflight = (success: boolean, error?: unknown) => {
+      if (preflightReported) return;
+      preflightReported = true;
+      options.preflightResult?.(success, error);
+    };
     try {
-      markSessionIdle = await this.markSessionActive(projectPath, body.sessionId);
+      const sessionLock = await this.markSessionActiveWithState(projectPath, body.sessionId);
+      markSessionIdle = sessionLock.release;
       const session = await this.getSession(projectPath, body.sessionId);
       await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       const extensionCommand = this.isExtensionCommandPrompt(session, body.prompt);
+      if (!extensionCommand && (sessionLock.wasActive || this.cachedSessionInUse(session))) {
+        const error = new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
+        reportPreflight(false, error);
+        throw error;
+      }
       const lifecycle = { started: false, finished: false };
       subscription = this.subscribeSessionEvents(session, key, body.sessionId, { mirrorLifecycle: extensionCommand, lifecycle });
       const useSyntheticStart = (options.startEvent ?? true) && !extensionCommand;
@@ -248,10 +263,18 @@ export class PiBridge {
         ? `${body.prompt}\n\nAttached files in the workspace:\n${body.attachments.map((file) => `- ${file}`).join('\n')}`
         : body.prompt;
 
+      if (extensionCommand) reportPreflight(true);
       if (typeof session?.prompt === 'function') {
-        await session.prompt(prompt, { source: 'rpc' });
+        await session.prompt(prompt, {
+          source: 'rpc',
+          preflightResult: (success: boolean) => {
+            if (success) reportPreflight(true);
+          },
+        });
+        reportPreflight(true);
       } else if (typeof session?.followUp === 'function') {
         await session.followUp(prompt);
+        reportPreflight(true);
       } else {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
       }
@@ -266,7 +289,11 @@ export class PiBridge {
       }
     } catch (error) {
       subscription?.();
-      this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Agent failed' });
+      if (!preflightReported) reportPreflight(false, error);
+      const message = error instanceof Error ? error.message : 'Agent failed';
+      this.broadcast(key, isAgentAlreadyProcessingMessage(message)
+        ? { type: 'agent:notice', sessionId: body.sessionId, message, data: { level: 'warning' } }
+        : { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
       markSessionIdle();
@@ -435,7 +462,7 @@ export class PiBridge {
         this.broadcast(key, { type: 'agent:start', sessionId });
       }
       this.broadcast(key, { type: 'agent:event', sessionId, data: event });
-      if (options.mirrorLifecycle && type === 'agent_end') {
+      if (options.mirrorLifecycle && type === 'agent_end' && !agentEventWillRetry(event)) {
         if (options.lifecycle) options.lifecycle.finished = true;
         this.broadcast(key, { type: 'agent:finish', sessionId });
       }
@@ -803,6 +830,10 @@ export class PiBridge {
   }
 
   private async lockRuntimeSession(projectPath: string, sessionId: string, filePath?: string) {
+    return (await this.lockRuntimeSessionWithState(projectPath, sessionId, filePath))?.release;
+  }
+
+  private async lockRuntimeSessionWithState(projectPath: string, sessionId: string, filePath?: string): Promise<RuntimeSessionLock | undefined> {
     let resolvedFilePath = filePath;
     if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
     if (!resolvedFilePath) {
@@ -816,9 +847,10 @@ export class PiBridge {
     if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
 
     const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, resolvedFilePath);
+    const wasActive = [...keys].some((key) => this.activeRuntimeSessions.has(key));
     for (const key of keys) this.activeRuntimeSessions.set(key, (this.activeRuntimeSessions.get(key) ?? 0) + 1);
     let active = true;
-    return () => {
+    const release = () => {
       if (!active) return;
       active = false;
       for (const key of keys) {
@@ -827,13 +859,18 @@ export class PiBridge {
         else this.activeRuntimeSessions.set(key, count - 1);
       }
     };
+    return { release, wasActive };
+  }
+
+  private async markSessionActiveWithState(projectPath: string, sessionId?: string): Promise<RuntimeSessionLock> {
+    if (!sessionId) return { release: () => undefined, wasActive: false };
+    const lock = await this.lockRuntimeSessionWithState(projectPath, sessionId);
+    if (!lock) throw new Error('Session is being deleted.');
+    return lock;
   }
 
   private async markSessionActive(projectPath: string, sessionId?: string) {
-    if (!sessionId) return () => undefined;
-    const release = await this.lockRuntimeSession(projectPath, sessionId);
-    if (!release) throw new Error('Session is being deleted.');
-    return release;
+    return (await this.markSessionActiveWithState(projectPath, sessionId)).release;
   }
 
   private getCachedSession(cache: Map<string, CachedSession>, key: string) {
@@ -1084,12 +1121,27 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
         const { treeTargetId: _treeTargetId, treeSummary: _treeSummary, branchFromId: _branchFromId, ...rest } = request.body;
         promptBody = rest;
       }
-      bridge.prompt(project.path, promptBody, streamTarget, { startEvent: !request.body.treeTargetId })
-        .finally(() => clearProjectFileCaches(project.id))
-        .catch(() => undefined);
+      let preflightSettled = false;
+      let resolvePreflight: () => void = () => undefined;
+      let rejectPreflight: (error: Error) => void = () => undefined;
+      const preflight = new Promise<void>((resolve, reject) => {
+        resolvePreflight = resolve;
+        rejectPreflight = reject;
+      });
+      const settlePreflight = (success: boolean, error?: unknown) => {
+        if (preflightSettled) return;
+        preflightSettled = true;
+        if (success) resolvePreflight();
+        else rejectPreflight(error instanceof Error ? error : new Error('Prompt failed'));
+      };
+      const promptTask = bridge.prompt(project.path, promptBody, streamTarget, { startEvent: !request.body.treeTargetId, preflightResult: settlePreflight })
+        .finally(() => clearProjectFileCaches(project.id));
+      promptTask.catch((error) => settlePreflight(false, error));
+      await preflight;
       return { ok: true };
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Prompt failed' });
+      const message = error instanceof Error ? error.message : 'Prompt failed';
+      return reply.code(isAgentAlreadyProcessingMessage(message) ? 409 : 400).send({ error: message });
     }
   });
 
@@ -1161,8 +1213,16 @@ function agentEventType(event: unknown) {
   return event && typeof event === 'object' && typeof (event as { type?: unknown }).type === 'string' ? (event as { type: string }).type : undefined;
 }
 
+function agentEventWillRetry(event: unknown) {
+  return event && typeof event === 'object' && (event as { willRetry?: unknown }).willRetry === true;
+}
+
 function isCommandActivityStartEvent(type: string | undefined) {
   return type === 'agent_start' || type === 'compaction_start' || type === 'auto_retry_start' || type === 'message_update' || type === 'tool_execution_start';
+}
+
+function isAgentAlreadyProcessingMessage(message: string) {
+  return /agent is already processing/i.test(message);
 }
 
 function projectIdFromStreamKey(key: string) {
