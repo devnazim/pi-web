@@ -58,6 +58,11 @@ const MAX_TERMINAL_QUEUED_INPUT_LENGTH = 64 * 1024;
 const MAX_TERMINAL_METADATA_LENGTH = 2048;
 const TERMINAL_HEARTBEAT_MS = 30_000;
 const TERMINAL_HEARTBEAT_TIMEOUT_MS = TERMINAL_HEARTBEAT_MS * 3;
+const TERMINAL_RESIZE_SEND_DELAY_MS = 80;
+const TERMINAL_RECONNECT_BASE_DELAY_MS = 750;
+const TERMINAL_RECONNECT_MAX_DELAY_MS = 8_000;
+const TERMINAL_RECONNECT_STABLE_MS = 10_000;
+const TERMINAL_AUTO_RECONNECT_MAX_ATTEMPTS = 8;
 const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
   '`': '~',
   '1': '!',
@@ -89,6 +94,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
   let terminalSocket: WebSocket | undefined;
   let sendInputRef: ((data: string) => void) | undefined;
   let mobileShortcutPointer: { id: number; x: number; y: number; moved: boolean } | undefined;
+  let autoReconnectAttempts = 0;
   const [status, setStatus] = createSignal<TerminalStatus>('connecting');
   const [shellName, setShellName] = createSignal('terminal');
   const [cwd, setCwd] = createSignal(props.project.path);
@@ -132,6 +138,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     else if (modifier === 'alt') setAltSticky((value) => !value);
     else setShiftSticky((value) => !value);
     focusTerminal();
+  };
+  const reconnectTerminal = () => {
+    autoReconnectAttempts = 0;
+    setReconnectKey((key) => key + 1);
   };
   const startMobileShortcutPointer = (event: PointerEvent) => {
     event.preventDefault();
@@ -180,12 +190,16 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let resizeObserver: ResizeObserver | undefined;
     let resizeTimer: number | undefined;
     let resizeFrame: number | undefined;
+    let resizeMessageTimer: number | undefined;
+    let reconnectTimer: number | undefined;
+    let reconnectAttemptResetTimer: number | undefined;
     let heartbeatTimer: number | undefined;
     let pendingHeartbeatAt = 0;
     let resumeHeartbeat: (() => void) | undefined;
     let pendingInput = '';
     let pendingMetadata: { cwd?: string; title?: string } = {};
-    let resizeTerminal: (() => void) | undefined;
+    let terminalExited = false;
+    let resizeTerminal: ((immediate?: boolean) => void) | undefined;
     let scheduleResizeTerminal: (() => void) | undefined;
 
     setStatus('connecting');
@@ -257,16 +271,31 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
 
         let lastSentCols = 0;
         let lastSentRows = 0;
-        resizeTerminal = () => {
-          if (!xterm) return;
-          try {
-            fitAddon.fit();
-            const cols = xterm.cols;
-            const rows = xterm.rows;
-            if ((cols !== lastSentCols || rows !== lastSentRows) && sendTerminalClientMessage(socket, { type: 'resize', cols, rows })) {
+        const sendTerminalResize = (cols: number, rows: number, immediate = false) => {
+          if (resizeMessageTimer !== undefined) {
+            window.clearTimeout(resizeMessageTimer);
+            resizeMessageTimer = undefined;
+          }
+          if (!socket || socket.readyState !== WebSocket.OPEN || (cols === lastSentCols && rows === lastSentRows)) return;
+
+          const sendResize = () => {
+            resizeMessageTimer = undefined;
+            if (sendTerminalClientMessage(socket, { type: 'resize', cols, rows })) {
               lastSentCols = cols;
               lastSentRows = rows;
             }
+          };
+
+          if (immediate) sendResize();
+          else resizeMessageTimer = window.setTimeout(sendResize, TERMINAL_RESIZE_SEND_DELAY_MS);
+        };
+        resizeTerminal = (immediate = false) => {
+          if (!xterm || !terminalElement || !terminalElement.isConnected) return;
+          const bounds = terminalElement.getBoundingClientRect();
+          if (bounds.width <= 0 || bounds.height <= 0) return;
+          try {
+            fitAddon.fit();
+            sendTerminalResize(xterm.cols, xterm.rows, immediate);
           } catch {
             // Fit can throw while fonts/layout are still settling.
           }
@@ -317,7 +346,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (terminalSocket !== socket || !resizeTerminal || !xterm) return;
           setStatus('connected');
           pendingHeartbeatAt = 0;
-          resizeTerminal();
+          resizeTerminal(true);
           if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
           if (pendingInput) {
             sendTerminalClientMessage(socket, { type: 'input', data: pendingInput });
@@ -348,6 +377,11 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           pendingHeartbeatAt = 0;
 
           if (message.type === 'ready') {
+            if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
+            reconnectAttemptResetTimer = window.setTimeout(() => {
+              reconnectAttemptResetTimer = undefined;
+              if (!disposed && terminalSocket === socket) autoReconnectAttempts = 0;
+            }, TERMINAL_RECONNECT_STABLE_MS);
             setShellName(normalizeTerminalMetadata(message.title ?? '') || message.shellName || message.shell || 'terminal');
             setCwd(normalizeTerminalMetadata(message.cwd ?? '') || projectPath);
           } else if (message.type === 'metadata') {
@@ -364,6 +398,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           } else if (message.type === 'clear') {
             xterm.clear();
           } else if (message.type === 'exit') {
+            terminalExited = true;
             props.onFilesystemActivity?.();
             setStatus('disconnected');
             xterm.writeln(`\r\n\x1b[2mTerminal exited${typeof message.exitCode === 'number' ? ` with code ${message.exitCode}` : ''}.\x1b[0m`);
@@ -375,7 +410,24 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             window.clearInterval(heartbeatTimer);
             heartbeatTimer = undefined;
           }
+          if (resizeMessageTimer !== undefined) {
+            window.clearTimeout(resizeMessageTimer);
+            resizeMessageTimer = undefined;
+          }
+          if (reconnectAttemptResetTimer !== undefined) {
+            window.clearTimeout(reconnectAttemptResetTimer);
+            reconnectAttemptResetTimer = undefined;
+          }
           setStatus(status() === 'error' ? 'error' : 'disconnected');
+          if (disposed || terminalExited || autoReconnectAttempts >= TERMINAL_AUTO_RECONNECT_MAX_ATTEMPTS) return;
+
+          const delay = Math.min(TERMINAL_RECONNECT_MAX_DELAY_MS, TERMINAL_RECONNECT_BASE_DELAY_MS * (2 ** autoReconnectAttempts));
+          autoReconnectAttempts += 1;
+          reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = undefined;
+            if (disposed || terminalExited || terminalSocket !== socket) return;
+            setReconnectKey((key) => key + 1);
+          }, delay);
         });
         socket.addEventListener('error', () => {
           if (terminalSocket !== socket) return;
@@ -398,6 +450,9 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
       disposed = true;
       if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
       if (resizeFrame !== undefined) window.cancelAnimationFrame(resizeFrame);
+      if (resizeMessageTimer !== undefined) window.clearTimeout(resizeMessageTimer);
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
       if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer);
       if (resumeHeartbeat) {
         document.removeEventListener('visibilitychange', resumeHeartbeat);
@@ -436,7 +491,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
                 sendTerminalClientMessage(terminalSocket, { type: 'clear' });
               }}
             >Clear</button>
-            <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={() => setReconnectKey((key) => key + 1)}>Reconnect</button>
+            <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={reconnectTerminal}>Reconnect</button>
             <button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClose}><X class="size-4" /></button>
           </div>
         </div>
@@ -451,7 +506,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           <div class="terminal-toolbar-row">
             <span class={`terminal-status ${statusClass()}`}>{statusText()}</span>
             <button class="ghost h-7 px-2 text-xs" type="button" onClick={() => { terminal?.clear(); sendTerminalClientMessage(terminalSocket, { type: 'clear' }); }}>Clear</button>
-            <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={() => setReconnectKey((key) => key + 1)}>Reconnect</button>
+            <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={reconnectTerminal}>Reconnect</button>
           </div>
           <div class="terminal-toolbar-row terminal-mobile-keys">
             <button class={`ghost terminal-mobile-key ${ctrlSticky() ? 'terminal-key-active' : ''}`} type="button" tabIndex={-1} title="Ctrl modifier" aria-label="Ctrl modifier" onPointerDown={startMobileShortcutPointer} onPointerMove={moveMobileShortcutPointer} onPointerCancel={cancelMobileShortcutPointer} onPointerUp={(event) => finishMobileShortcutPointer(event, () => toggleMobileModifier('ctrl'))}>ctrl</button>
