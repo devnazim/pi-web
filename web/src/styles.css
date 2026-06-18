@@ -1193,6 +1193,70 @@ body {
     @apply rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground;
   }
 
+  .extension-ui-dock-wrap {
+    @apply min-w-0 pb-3;
+  }
+
+  .extension-ui-dock {
+    @apply mx-auto flex w-full max-w-5xl flex-col gap-3 rounded-2xl border border-yellow-500/30 bg-card p-4 text-sm shadow-floating ring-1 ring-yellow-500/10;
+  }
+
+  .extension-ui-header {
+    @apply flex min-w-0 items-start gap-3;
+  }
+
+  .extension-ui-icon {
+    @apply mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full bg-yellow-500/10 text-yellow-700 dark:text-yellow-300;
+  }
+
+  .extension-ui-kicker {
+    @apply text-xs font-semibold uppercase tracking-wide text-yellow-700 dark:text-yellow-300;
+  }
+
+  .extension-ui-title {
+    @apply mt-0.5 break-words text-base font-medium text-foreground;
+  }
+
+  .extension-ui-message {
+    @apply whitespace-pre-wrap break-words rounded-xl bg-muted/50 px-3 py-2 text-muted-foreground;
+  }
+
+  .extension-ui-hint {
+    @apply text-xs text-muted-foreground;
+  }
+
+  .extension-ui-options {
+    @apply flex max-h-60 flex-col gap-1 overflow-auto rounded-xl border border-border bg-input/20 p-1;
+  }
+
+  .extension-ui-option {
+    @apply flex w-full items-start gap-2 rounded-lg px-3 py-2 text-sm outline-none transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:pointer-events-none disabled:opacity-50;
+  }
+
+  .extension-ui-option-active {
+    @apply bg-accent text-accent-foreground;
+  }
+
+  .extension-ui-option-mark {
+    @apply mt-0.5 grid h-5 w-5 shrink-0 place-items-center text-primary;
+  }
+
+  .extension-ui-input {
+    @apply rounded-xl;
+  }
+
+  .extension-ui-editor {
+    @apply min-h-36 w-full resize-y rounded-xl border border-input bg-input/30 px-3 py-2 text-sm leading-6 outline-none transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .extension-ui-error {
+    @apply rounded-xl bg-destructive/10 px-3 py-2 text-sm text-destructive;
+  }
+
+  .extension-ui-actions {
+    @apply flex flex-wrap justify-end gap-2;
+  }
+
   .composer-form {
     @apply min-w-0;
   }

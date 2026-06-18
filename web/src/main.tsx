@@ -150,6 +150,9 @@ type AgentStatusInfo = {
   context?: { tokens: number | null; contextWindow: number; percent: number | null; autoCompact: boolean };
   statuses: Array<{ key: string; text: string }>;
 };
+type ExtensionUiRequestMethod = 'select' | 'confirm' | 'input' | 'editor';
+type ExtensionUiRequest = { id: string; sessionId?: string; method: ExtensionUiRequestMethod; title: string; message?: string; options?: string[]; placeholder?: string; prefill?: string; timeout?: number; createdAt: number };
+type ExtensionUiReply = { value?: string; confirmed?: boolean; cancelled?: boolean; sessionId?: string };
 type AgentStatusPart = { text: string; title?: string; tone?: 'warning' | 'danger' };
 type ModelListItem = { value: string; label: string; provider: string; id: string; reasoning: boolean; thinkingLevels?: ThinkingLevel[] };
 type RichTextPart = { text: string; kind?: 'code' | 'file' | 'strong' };
@@ -598,6 +601,8 @@ function Shell() {
   const [sessionId, setSessionId] = createSignal<string | undefined>(initialActiveSessionId);
   const [sessionWorkspaceId, setSessionWorkspaceId] = createSignal<string>();
   const [events, setEvents] = createSignal<string[]>([]);
+  const [extensionUiRequests, setExtensionUiRequests] = createSignal<Record<string, ExtensionUiRequest>>({});
+  const settledExtensionUiRequestIds = new Set<string>();
   const [toolPanel, setToolPanel] = createSignal<ToolPanel>();
   const [reviewInitialSessionSidebarOpen, setReviewInitialSessionSidebarOpen] = createSignal<boolean>();
   const [chatSearchInput, setChatSearchInput] = createSignal('');
@@ -768,6 +773,57 @@ function Shell() {
       pendingEventsFrame = undefined;
     }
     setEvents(payloads);
+  }
+
+  function upsertExtensionUiRequest(request: ExtensionUiRequest) {
+    if (settledExtensionUiRequestIds.has(request.id)) return;
+    setExtensionUiRequests((current) => ({ ...current, [request.id]: request }));
+  }
+
+  function mergeExtensionUiRequests(requests: ExtensionUiRequest[]) {
+    setExtensionUiRequests((current) => {
+      const next = { ...current };
+      for (const request of requests) {
+        if (!settledExtensionUiRequestIds.has(request.id)) next[request.id] = request;
+      }
+      return next;
+    });
+  }
+
+  function removeExtensionUiRequest(id: string) {
+    settledExtensionUiRequestIds.add(id);
+    setExtensionUiRequests((current) => {
+      if (!(id in current)) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+  }
+
+  function removeSessionExtensionUiRequests(sessionId: string | undefined) {
+    setExtensionUiRequests((current) => {
+      let changed = false;
+      const next: Record<string, ExtensionUiRequest> = {};
+      for (const [id, request] of Object.entries(current)) {
+        if (request.sessionId === sessionId) {
+          settledExtensionUiRequestIds.add(id);
+          changed = true;
+        } else next[id] = request;
+      }
+      return changed ? next : current;
+    });
+  }
+
+  const workspaceExtensionUiRequests = createMemo(() => Object.values(extensionUiRequests())
+    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)));
+
+  async function replyExtensionUiRequest(projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) {
+    await api<{ request: ExtensionUiRequest }>(`/api/projects/${projectId}/agent/ui-requests/${encodeURIComponent(request.id)}/reply`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...reply, sessionId: request.sessionId }),
+    });
+    removeExtensionUiRequest(request.id);
   }
 
   function setActiveSession(id: string | undefined, workspaceId = workspaceProject()?.id) {
@@ -1363,6 +1419,23 @@ function Shell() {
 
   createEffect(() => {
     const project = workspaceProject();
+    setExtensionUiRequests({});
+    if (!project) return;
+    const controller = new AbortController();
+    void api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests`, { signal: controller.signal })
+      .then(({ requests }) => {
+        if (workspaceProject()?.id !== project.id) return;
+        mergeExtensionUiRequests(requests);
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        console.warn('Could not load extension UI requests', error);
+      });
+    onCleanup(() => controller.abort());
+  });
+
+  createEffect(() => {
+    const project = workspaceProject();
     const currentActiveSessionId = activeSessionId();
     if (!project) return;
     const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentActiveSessionId ? `?sessionId=${currentActiveSessionId}` : ''}`));
@@ -1373,8 +1446,17 @@ function Shell() {
         if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([event.data]);
         else if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
         const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
+        if (parsed.type === 'agent:ui-request') {
+          const request = readExtensionUiRequest(parsed.data, eventSessionId);
+          if (request) upsertExtensionUiRequest(request);
+        }
+        if (parsed.type === 'agent:ui-response') {
+          const id = readExtensionUiResponseId(parsed.data);
+          if (id) removeExtensionUiRequest(id);
+        }
         if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
         if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
+          removeSessionExtensionUiRequests(eventSessionId);
           queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
           queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
           queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
@@ -1897,7 +1979,7 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} events={events()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} events={events()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -4180,7 +4262,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -4319,14 +4401,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
                     class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
                     style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
                   >
-                    <Chat project={project()} sessionId={props.sessionId} events={props.events} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onTreeSelection={setTreeSelection} />
+                    <Chat project={project()} sessionId={props.sessionId} events={props.events} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                     <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
                 <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} events={props.events} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onTreeSelection={setTreeSelection} />
+                  <Chat project={project()} sessionId={props.sessionId} events={props.events} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
                   <div
                     class="terminal-resize-handle"
                     role="separator"
@@ -4358,7 +4440,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
   );
 }
 
-function Chat(props: { project: Project; sessionId?: string; events: string[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; events: string[]; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
@@ -4394,6 +4476,8 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
+  const [extensionUiResponding, setExtensionUiResponding] = createSignal<string>();
+  const [extensionUiError, setExtensionUiError] = createSignal('');
   const [sessionControlsHydratedKey, setSessionControlsHydratedKey] = createSignal<string>();
   const autocompleteSessionId = createMemo(() => props.sessionId ?? commandSessionId());
   const session = createQuery(() => ({
@@ -4488,7 +4572,11 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
   const commandCompletionOptions = createMemo(() => commandCompletions.data?.completions ?? []);
   const liveActivity = createMemo(() => agentActivity(props.events));
   const liveShellActivity = createMemo(() => bashActivity(props.events));
-  const busy = createMemo(() => liveActivity().running || Boolean(runningCommand()));
+  const visibleExtensionUiRequests = createMemo(() => {
+    const sessionId = props.sessionId ?? commandSessionId();
+    return props.extensionUiRequests.filter((request) => sessionId ? request.sessionId === sessionId : !request.sessionId);
+  });
+  const busy = createMemo(() => liveActivity().running || Boolean(runningCommand()) || visibleExtensionUiRequests().length > 0);
   const showEmptySessionPrompt = createMemo(() => Boolean(props.sessionId && !session.isLoading && !session.error && visibleTranscriptEntries().length === 0 && !busy() && !pendingUserMessageVisible()));
   const centerTranscript = createMemo(() => (!props.sessionId && !pendingUserMessageVisible()) || showEmptySessionPrompt());
   const agentStatus = createQuery(() => {
@@ -4498,6 +4586,12 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
       queryFn: ({ signal }) => api<{ status: AgentStatusInfo }>(`/api/projects/${props.project.id}/agent/status${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`, { signal }),
       refetchInterval: busy() ? 1500 : 5000,
     };
+  });
+
+  createEffect(() => {
+    const requestId = visibleExtensionUiRequests()[0]?.id;
+    setExtensionUiError('');
+    setExtensionUiResponding((id) => id && id === requestId ? id : undefined);
   });
 
   createEffect(() => {
@@ -5074,6 +5168,19 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
     }
   }
 
+  async function replyToExtensionUiRequest(request: ExtensionUiRequest, reply: ExtensionUiReply) {
+    if (extensionUiResponding()) return;
+    setExtensionUiResponding(request.id);
+    setExtensionUiError('');
+    try {
+      await props.onExtensionUiReply(props.project.id, request, reply);
+    } catch (error) {
+      setExtensionUiError(errorMessage(error, 'Could not send response'));
+    } finally {
+      setExtensionUiResponding((id) => id === request.id ? undefined : id);
+    }
+  }
+
   async function compactSession(projectId: string, sessionId: string, instructions: string | undefined, mirrorActiveStream: boolean) {
     await api(`/api/projects/${projectId}/agent/compact`, {
       method: 'POST',
@@ -5390,6 +5497,19 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; t
           </div>
         </div>
       </div>
+      <Show when={visibleExtensionUiRequests()[0]}>
+        {(request) => (
+          <div class="extension-ui-dock-wrap shrink-0 px-4 xl:px-6">
+            <ExtensionUiRequestDock
+              request={request()}
+              busy={extensionUiResponding() === request().id}
+              disabled={Boolean(extensionUiResponding())}
+              error={extensionUiError()}
+              onReply={(reply) => void replyToExtensionUiRequest(request(), reply)}
+            />
+          </div>
+        )}
+      </Show>
       <form onSubmit={send} class="composer-form shrink-0 px-4 pb-4 xl:px-6">
         <div class="composer-shell relative mx-auto w-full max-w-5xl rounded-2xl border border-border bg-card shadow-floating">
           <Show when={fileMention()}>
@@ -5543,6 +5663,88 @@ function AgentStatusBar(props: { status?: AgentStatusInfo; loading?: boolean; er
         {(part) => <span class={`agent-status-item ${part.tone ? `agent-status-${part.tone}` : ''}`} title={part.title}>{part.text}</span>}
       </For>
     </div>
+  );
+}
+
+function ExtensionUiRequestDock(props: { request: ExtensionUiRequest; busy?: boolean; disabled?: boolean; error?: string; onReply: (reply: ExtensionUiReply) => void }) {
+  const [value, setValue] = createSignal('');
+  const [selected, setSelected] = createSignal('');
+
+  createEffect(() => {
+    const request = props.request;
+    setValue(request.method === 'editor' ? request.prefill ?? '' : '');
+    setSelected('');
+  });
+
+  const methodLabel = createMemo(() => {
+    if (props.request.method === 'confirm') return 'Confirmation needed';
+    if (props.request.method === 'select') return 'Selection needed';
+    if (props.request.method === 'editor') return 'Text needed';
+    return 'Input needed';
+  });
+
+  const submit = (event?: SubmitEvent) => {
+    event?.preventDefault();
+    if (props.disabled || props.busy) return;
+    const request = props.request;
+    if (request.method === 'confirm') props.onReply({ confirmed: true });
+    else if (request.method === 'select') {
+      if (selected()) props.onReply({ value: selected() });
+    } else props.onReply({ value: value() });
+  };
+
+  return (
+    <form class="extension-ui-dock" onSubmit={submit}>
+      <div class="extension-ui-header">
+        <span class="extension-ui-icon"><BadgeInfo class="size-4" /></span>
+        <div class="min-w-0 flex-1">
+          <div class="extension-ui-kicker">{methodLabel()}</div>
+          <div class="extension-ui-title">{props.request.title}</div>
+        </div>
+      </div>
+      <Show when={props.request.message}><div class="extension-ui-message">{props.request.message}</div></Show>
+      <Show when={props.request.timeout}><div class="extension-ui-hint">This request may expire automatically.</div></Show>
+      <Show when={props.request.method === 'select'}>
+        <div class="extension-ui-options" role="radiogroup" aria-label={props.request.title}>
+          <For each={props.request.options ?? []}>
+            {(option) => (
+              <button
+                type="button"
+                class={`extension-ui-option ${selected() === option ? 'extension-ui-option-active' : ''}`}
+                role="radio"
+                aria-checked={selected() === option}
+                disabled={props.disabled}
+                onClick={() => setSelected(option)}
+              >
+                <span class="extension-ui-option-mark">{selected() === option ? <Check class="size-4" /> : ''}</span>
+                <span class="min-w-0 flex-1 break-words text-left">{option}</span>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+      <Show when={props.request.method === 'input'}>
+        <input class="input extension-ui-input" value={value()} placeholder={props.request.placeholder ?? ''} disabled={props.disabled} autofocus onInput={(event) => setValue(event.currentTarget.value)} />
+      </Show>
+      <Show when={props.request.method === 'editor'}>
+        <textarea class="extension-ui-editor" value={value()} disabled={props.disabled} autofocus onInput={(event) => setValue(event.currentTarget.value)} />
+      </Show>
+      <Show when={props.error}><div class="extension-ui-error">{props.error}</div></Show>
+      <div class="extension-ui-actions">
+        <Show
+          when={props.request.method === 'confirm'}
+          fallback={(
+            <>
+              <button type="button" class="button-secondary" disabled={props.disabled} onClick={() => props.onReply({ cancelled: true })}>Cancel</button>
+              <button class="button" disabled={props.disabled || (props.request.method === 'select' && !selected())}>{props.busy ? 'Sending...' : props.request.method === 'select' ? 'Select' : 'Submit'}</button>
+            </>
+          )}
+        >
+          <button type="button" class="button-secondary" disabled={props.disabled} onClick={() => props.onReply({ confirmed: false })}>No</button>
+          <button class="button" disabled={props.disabled}>{props.busy ? 'Sending...' : 'Yes'}</button>
+        </Show>
+      </div>
+    </form>
   );
 }
 
@@ -8349,6 +8551,35 @@ function agentEventDataType(data: unknown) {
   return data && typeof data === 'object' && typeof (data as { type?: unknown }).type === 'string' ? (data as { type: string }).type : undefined;
 }
 
+function readExtensionUiRequest(data: unknown, fallbackSessionId?: string): ExtensionUiRequest | undefined {
+  if (!data || typeof data !== 'object') return undefined;
+  const record = data as Record<string, unknown>;
+  if (typeof record.id !== 'string' || typeof record.title !== 'string' || !isExtensionUiRequestMethod(record.method)) return undefined;
+  const options = Array.isArray(record.options) ? record.options.filter((option): option is string => typeof option === 'string') : undefined;
+  return {
+    id: record.id,
+    sessionId: typeof record.sessionId === 'string' ? record.sessionId : fallbackSessionId,
+    method: record.method,
+    title: record.title,
+    message: typeof record.message === 'string' ? record.message : undefined,
+    options,
+    placeholder: typeof record.placeholder === 'string' ? record.placeholder : undefined,
+    prefill: typeof record.prefill === 'string' ? record.prefill : undefined,
+    timeout: typeof record.timeout === 'number' && Number.isFinite(record.timeout) ? record.timeout : undefined,
+    createdAt: typeof record.createdAt === 'number' && Number.isFinite(record.createdAt) ? record.createdAt : Date.now(),
+  };
+}
+
+function readExtensionUiResponseId(data: unknown) {
+  if (!data || typeof data !== 'object') return undefined;
+  const id = (data as { id?: unknown }).id;
+  return typeof id === 'string' ? id : undefined;
+}
+
+function isExtensionUiRequestMethod(value: unknown): value is ExtensionUiRequestMethod {
+  return value === 'select' || value === 'confirm' || value === 'input' || value === 'editor';
+}
+
 function bashActivity(events: string[]): BashActivity {
   let running = false;
   let error: string | undefined;
@@ -8869,6 +9100,11 @@ function workspaceNotificationFromEvent(event: WorkspaceNotificationServerEvent,
   if (event.type === 'agent:finish') return { ...base, title: 'Pi finished', message: 'Agent response completed.', level: 'success', kind: 'agent' };
   if (event.type === 'agent:error' || event.type === 'error') return { ...base, title: 'Pi failed', message: singleLine(event.message ?? 'Agent failed'), level: 'error', kind: 'agent' };
   if (event.type === 'agent:notice') return { ...base, title: 'Pi notice', message: singleLine(event.message ?? 'Notice'), level: notificationLevelFromUnknown((event.data as { level?: unknown } | undefined)?.level), kind: 'notice' };
+  if (event.type === 'agent:ui-request') {
+    const request = readExtensionUiRequest(event.data, event.sessionId);
+    const title = request?.method === 'confirm' ? 'Confirmation needed' : request?.method === 'select' ? 'Selection needed' : 'Input needed';
+    return { ...base, title, message: singleLine(request?.title ?? 'Extension UI request'), level: 'warning', kind: 'notice' };
+  }
   if (event.type === 'bash:finish') return { ...base, title: 'Command completed', message: singleLine(event.message ?? 'Shell command finished'), level: 'success', kind: 'command' };
   if (event.type === 'bash:error') return { ...base, title: 'Command failed', message: singleLine(event.message ?? 'Shell command failed'), level: 'error', kind: 'command' };
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return undefined;

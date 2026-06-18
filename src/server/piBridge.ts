@@ -1,5 +1,6 @@
 import { AuthStorage, ModelRegistry } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { clearProjectFileCaches } from './files.js';
 import { getGitBranch } from './git.js';
@@ -67,6 +68,34 @@ type CommandInfo = {
 
 type CommandCompletion = { value: string; label?: string; description?: string };
 
+type ExtensionUiRequestMethod = 'select' | 'confirm' | 'input' | 'editor';
+type ExtensionUiRequest = {
+  id: string;
+  sessionId?: string;
+  method: ExtensionUiRequestMethod;
+  title: string;
+  message?: string;
+  options?: string[];
+  placeholder?: string;
+  prefill?: string;
+  timeout?: number;
+  createdAt: number;
+};
+type ExtensionUiResponse = { value?: string; confirmed?: boolean; cancelled?: boolean };
+type PendingExtensionUiRequest<T = unknown> = {
+  projectPath: string;
+  streamKey: string | string[];
+  request: ExtensionUiRequest;
+  resolve: (value: T) => void;
+  parseResponse: (response: ExtensionUiResponse) => T;
+  defaultValue: T;
+  cleanup: () => boolean;
+};
+
+interface ExtensionUiReplyBody extends ExtensionUiResponse {
+  sessionId?: string;
+}
+
 type ModelInfo = { value: string; label: string; provider: string; id: string; reasoning: boolean; thinkingLevels: ThinkingLevel[] };
 
 type AgentStatus = {
@@ -94,6 +123,7 @@ export class PiBridge {
   private readonly boundSessions = new WeakSet<object>();
   private readonly sessionStreamKeys = new WeakMap<object, string | string[]>();
   private readonly extensionStatuses = new WeakMap<object, Map<string, string>>();
+  private readonly pendingExtensionUiRequests = new Map<string, PendingExtensionUiRequest<any>>();
   private readonly activeRuntimeSessions = new Map<string, number>();
   private readonly deletingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessionFiles = new Set<string>();
@@ -296,6 +326,7 @@ export class PiBridge {
         : { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
+      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
       markSessionIdle();
     }
   }
@@ -327,6 +358,7 @@ export class PiBridge {
       this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Tree navigation failed' });
       throw error;
     } finally {
+      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
       markSessionIdle();
     }
   }
@@ -402,6 +434,7 @@ export class PiBridge {
       this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Compaction failed' });
       throw error;
     } finally {
+      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
       markSessionIdle();
     }
   }
@@ -439,11 +472,13 @@ export class PiBridge {
       this.broadcast(key, { type: 'bash:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Shell command failed' });
       throw error;
     } finally {
+      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
       markSessionIdle();
     }
   }
 
   async abort(projectPath: string, sessionId?: string) {
+    this.cancelExtensionUiRequests(projectPath, sessionId);
     const session = await this.getSession(projectPath, sessionId);
     if (typeof session?.clearQueue === 'function') session.clearQueue();
     if (typeof session?.abortBash === 'function' && session.isBashRunning) session.abortBash();
@@ -451,6 +486,21 @@ export class PiBridge {
     if (typeof session?.abortCompaction === 'function' && session.isCompacting) session.abortCompaction();
     if (typeof session?.abortRetry === 'function' && session.isRetrying) session.abortRetry();
     if (typeof session?.abort === 'function') await session.abort();
+  }
+
+  extensionUiRequests(projectPath: string, sessionId?: string) {
+    return [...this.pendingExtensionUiRequests.values()]
+      .filter((item) => item.projectPath === projectPath && (!sessionId || item.request.sessionId === sessionId))
+      .map((item) => item.request)
+      .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+  }
+
+  respondExtensionUiRequest(projectPath: string, requestId: string, response: ExtensionUiReplyBody) {
+    const pending = this.pendingExtensionUiRequests.get(requestId);
+    if (!pending || pending.projectPath !== projectPath) throw new Error('UI request not found');
+    if (response.sessionId !== pending.request.sessionId) throw new Error('UI request not found');
+    this.settleExtensionUiRequest(pending, this.normalizeExtensionUiResponse(pending.request, response));
+    return pending.request;
   }
 
   private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean } } = {}) {
@@ -505,7 +555,7 @@ export class PiBridge {
     if (this.boundSessions.has(session) || typeof session.bindExtensions !== 'function') return;
     this.boundSessions.add(session);
     await session.bindExtensions({
-      uiContext: this.webUiContext(session, sessionId),
+      uiContext: this.webUiContext(session, projectPath, sessionId),
       abortHandler: () => {
         if (typeof session?.clearQueue === 'function') session.clearQueue();
         if (typeof session?.abortBranchSummary === 'function') session.abortBranchSummary();
@@ -537,7 +587,80 @@ export class PiBridge {
     });
   }
 
-  private webUiContext(session: object, sessionId?: string) {
+  private createExtensionUiRequest<T>(session: object, projectPath: string, sessionId: string | undefined, request: Omit<ExtensionUiRequest, 'id' | 'sessionId' | 'createdAt'>, opts: { signal?: AbortSignal; timeout?: number } | undefined, defaultValue: T, parseResponse: (response: ExtensionUiResponse) => T) {
+    if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+
+    const id = randomUUID();
+    const streamKey = this.sessionStreamKeys.get(session) ?? [];
+    const timeout = this.finiteNumber(opts?.timeout);
+    const pendingRequest: ExtensionUiRequest = {
+      id,
+      sessionId,
+      ...request,
+      timeout: timeout && timeout > 0 ? timeout : undefined,
+      createdAt: Date.now(),
+    };
+
+    let timer: NodeJS.Timeout | undefined;
+    let settled = false;
+    let pending: PendingExtensionUiRequest<T>;
+    const cleanup = () => {
+      if (settled) return false;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      opts?.signal?.removeEventListener('abort', abort);
+      this.pendingExtensionUiRequests.delete(id);
+      return true;
+    };
+    const abort = () => this.settleExtensionUiRequest(pending, { cancelled: true }, defaultValue);
+
+    return new Promise<T>((resolve) => {
+      pending = { projectPath, streamKey, request: pendingRequest, resolve, parseResponse, defaultValue, cleanup };
+      this.pendingExtensionUiRequests.set(id, pending);
+      opts?.signal?.addEventListener('abort', abort, { once: true });
+      if (pendingRequest.timeout) {
+        timer = setTimeout(() => this.settleExtensionUiRequest(pending, { cancelled: true }, defaultValue), pendingRequest.timeout);
+        timer.unref();
+      }
+      this.broadcast(streamKey, { type: 'agent:ui-request', sessionId, data: pendingRequest });
+    });
+  }
+
+  private settleExtensionUiRequest<T>(pending: PendingExtensionUiRequest<T>, response: ExtensionUiResponse, value?: T) {
+    if (!pending.cleanup()) return;
+    pending.resolve(arguments.length >= 3 ? value as T : pending.parseResponse(response));
+    this.broadcast(pending.streamKey, { type: 'agent:ui-response', sessionId: pending.request.sessionId, data: { id: pending.request.id, response } });
+  }
+
+  private cancelExtensionUiRequests(projectPath: string, sessionId?: string, options: { allWhenSessionMissing?: boolean } = {}) {
+    const allWhenSessionMissing = options.allWhenSessionMissing ?? true;
+    for (const pending of [...this.pendingExtensionUiRequests.values()]) {
+      if (pending.projectPath !== projectPath) continue;
+      if (sessionId) {
+        if (pending.request.sessionId !== sessionId) continue;
+      } else if (!allWhenSessionMissing && pending.request.sessionId !== undefined) {
+        continue;
+      }
+      this.settleExtensionUiRequest(pending, { cancelled: true }, pending.defaultValue);
+    }
+  }
+
+  private normalizeExtensionUiResponse(request: ExtensionUiRequest, response: ExtensionUiResponse): ExtensionUiResponse {
+    if (response.cancelled) return { cancelled: true };
+    if (request.method === 'confirm') {
+      if (typeof response.confirmed !== 'boolean') throw new Error('Missing confirmation response');
+      return { confirmed: response.confirmed };
+    }
+    if (request.method === 'select') {
+      if (typeof response.value !== 'string') throw new Error('Missing selected option');
+      if (!request.options?.includes(response.value)) throw new Error('Selected option is not available');
+      return { value: response.value };
+    }
+    if (typeof response.value !== 'string') throw new Error('Missing input response');
+    return { value: response.value };
+  }
+
+  private webUiContext(session: object, projectPath: string, sessionId?: string) {
     const notify = (message: string, level?: string) => {
       this.broadcast(this.sessionStreamKeys.get(session) ?? [], { type: 'agent:notice', sessionId, message, data: { level } });
     };
@@ -557,9 +680,33 @@ export class PiBridge {
       getBashModeBorderColor: () => passthrough,
     };
     return {
-      select: async (title: string) => { notify(`${title}: selection UI is not available in web yet`, 'warning'); return undefined; },
-      confirm: async (title: string, message: string) => { notify(`${title}: ${message}`, 'warning'); return false; },
-      input: async (title: string) => { notify(`${title}: input UI is not available in web yet`, 'warning'); return undefined; },
+      select: (title: string, options: string[], opts?: { signal?: AbortSignal; timeout?: number }) => this.createExtensionUiRequest(
+        session,
+        projectPath,
+        sessionId,
+        { method: 'select', title, options: options.map((option) => String(option)) },
+        opts,
+        undefined,
+        (response) => response.cancelled ? undefined : response.value,
+      ),
+      confirm: (title: string, message: string, opts?: { signal?: AbortSignal; timeout?: number }) => this.createExtensionUiRequest(
+        session,
+        projectPath,
+        sessionId,
+        { method: 'confirm', title, message },
+        opts,
+        false,
+        (response) => response.cancelled ? false : response.confirmed === true,
+      ),
+      input: (title: string, placeholder?: string, opts?: { signal?: AbortSignal; timeout?: number }) => this.createExtensionUiRequest(
+        session,
+        projectPath,
+        sessionId,
+        { method: 'input', title, placeholder },
+        opts,
+        undefined,
+        (response) => response.cancelled ? undefined : response.value,
+      ),
       notify,
       onTerminalInput: () => () => undefined,
       setStatus: (key: string, text?: string) => this.setExtensionStatus(session, key, text, sessionId),
@@ -575,7 +722,15 @@ export class PiBridge {
       pasteToEditor: () => undefined,
       setEditorText: () => undefined,
       getEditorText: () => '',
-      editor: async () => undefined,
+      editor: (title: string, prefill?: string, opts?: { signal?: AbortSignal; timeout?: number }) => this.createExtensionUiRequest(
+        session,
+        projectPath,
+        sessionId,
+        { method: 'editor', title, prefill },
+        opts,
+        undefined,
+        (response) => response.cancelled ? undefined : response.value,
+      ),
       addAutocompleteProvider: () => undefined,
       setEditorComponent: () => undefined,
       getEditorComponent: () => undefined,
@@ -1094,6 +1249,24 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
     }
   });
 
+  app.get<{ Params: { projectId: string }; Querystring: { sessionId?: string } }>('/api/projects/:projectId/agent/ui-requests', async (request, reply) => {
+    try {
+      const project = registry.get(request.params.projectId);
+      return { requests: bridge.extensionUiRequests(project.path, request.query.sessionId) };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not load UI requests' });
+    }
+  });
+
+  app.post<{ Params: { projectId: string; requestId: string }; Body: ExtensionUiReplyBody }>('/api/projects/:projectId/agent/ui-requests/:requestId/reply', async (request, reply) => {
+    try {
+      const project = registry.get(request.params.projectId);
+      return { request: bridge.respondExtensionUiRequest(project.path, request.params.requestId, request.body ?? {}) };
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not reply to UI request' });
+    }
+  });
+
   app.get<{ Params: { projectId: string }; Querystring: CommandCompletionQuery }>('/api/projects/:projectId/agent/command-completions', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
@@ -1231,12 +1404,12 @@ function projectIdFromStreamKey(key: string) {
 }
 
 function isWorkspaceNotificationEvent(event: AgentEvent) {
-  if (['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'bash:start', 'bash:finish', 'bash:error', 'error'].includes(event.type)) return true;
+  if (['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'agent:ui-request', 'bash:start', 'bash:finish', 'bash:error', 'error'].includes(event.type)) return true;
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return false;
   const type = (event.data as { type?: unknown }).type;
   if (typeof type !== 'string') return false;
-  return ['notice', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(type)
-    || /approval|permission|confirm|input|notify|review/i.test(type);
+  return ['notice', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end', 'extension_ui_request'].includes(type)
+    || /approval|permission|confirm|input|select|notify|review/i.test(type);
 }
 
 const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
