@@ -3302,7 +3302,7 @@ function ConfirmDialog(props: { title: string; description: string; confirmLabel
     <div class="confirm-modal-backdrop" onMouseDown={() => !props.busy && props.onCancel()}>
       <div class="confirm-modal" onMouseDown={(event) => event.stopPropagation()}>
         <h2 class="text-base font-medium leading-none">{props.title}</h2>
-        <p class="mt-2 text-sm leading-6 text-muted-foreground">{props.description}</p>
+        <p class="mt-2 min-w-0 break-all text-sm leading-6 text-muted-foreground">{props.description}</p>
         <Show when={props.error}>
           <div class="mt-4 rounded-2xl bg-destructive/10 px-3 py-2 text-sm text-destructive ring-1 ring-destructive/20">{props.error}</div>
         </Show>
@@ -5841,7 +5841,7 @@ function AssetPreviewModal(props: { project: Project; path: string; themeMode: R
         <div class="asset-preview-header">
           <div class="min-w-0 flex-1">
             <div class="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Preview</div>
-            <div class="truncate text-sm font-medium">{props.path}</div>
+            <div class="min-w-0 break-all text-sm font-medium">{props.path}</div>
             <Show when={saveError()} fallback={<Show when={file.data?.truncated} fallback={<Show when={dirty()}><div class="text-xs text-muted-foreground">Unsaved changes</div></Show>}><div class="text-xs text-muted-foreground">Large file preview is read-only because it was truncated.</div></Show>}>
               <div class="text-xs text-destructive">{saveError()}</div>
             </Show>
@@ -7401,9 +7401,9 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
           <aside id="review-source-control-panel" class="review-source-panel grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card">
         <div class="border-b border-border p-4">
           <div class="flex items-start justify-between gap-3">
-            <div class="min-w-0">
+            <div class="min-w-0 flex-1">
               <div class="text-sm font-semibold">Source control</div>
-              <div class="truncate text-xs text-muted-foreground">{status.data?.status.branch ?? props.project.name}</div>
+              <div class="min-w-0 break-all text-xs text-muted-foreground">{status.data?.status.branch ?? props.project.name}</div>
             </div>
             <div class="flex shrink-0 items-center gap-1.5">
               <button class="project-modal-close shrink-0" title="Refresh changes" onClick={refreshReview}><RefreshCw class="size-4" /></button>
@@ -7436,7 +7436,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
                     onPointerLeave={clearGitFileLongPress}
                   >
                     <span class="git-file-status">{file.status}</span>
-                    <span class="min-w-0 flex-1 truncate text-left" title={gitFileDisplayPath(file, true)}>{gitFileDisplayPath(file, true)}</span>
+                    <span class="min-w-0 flex-1 break-all text-left" title={gitFileDisplayPath(file, true)}>{gitFileDisplayPath(file, true)}</span>
                     <span class="text-success">{changeStats(file, true).additions ? `+${changeStats(file, true).additions}` : ''}</span>
                     <span class="text-destructive">{changeStats(file, true).deletions ? `-${changeStats(file, true).deletions}` : ''}</span>
                     <div class="git-file-actions">
@@ -7464,7 +7464,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
                     onPointerLeave={clearGitFileLongPress}
                   >
                     <span class="git-file-status">{file.status}</span>
-                    <span class="min-w-0 flex-1 truncate text-left" title={gitFileDisplayPath(file, false)}>{gitFileDisplayPath(file, false)}</span>
+                    <span class="min-w-0 flex-1 break-all text-left" title={gitFileDisplayPath(file, false)}>{gitFileDisplayPath(file, false)}</span>
                     <span class="text-success">{changeStats(file, false).additions ? `+${changeStats(file, false).additions}` : ''}</span>
                     <span class="text-destructive">{changeStats(file, false).deletions ? `-${changeStats(file, false).deletions}` : ''}</span>
                     <div class="git-file-actions">
@@ -7496,14 +7496,14 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
       </Show>
       <main class="grid min-h-0 min-w-0 grid-rows-[auto_1fr] overflow-hidden">
         <div class="review-preview-header">
-          <div class="flex min-w-0 items-center gap-2">
+          <div class="flex min-w-0 flex-1 items-center gap-2">
             <Show when={!sourceControlOpen()}>
               <button class="project-modal-close shrink-0 review-source-toggle-mobile" title="Show changes" aria-label="Show changes" aria-controls="review-source-control-panel" aria-expanded={sourceControlOpen()} onClick={() => setReviewSourceControlOpen(true)}><PanelLeftOpen class="size-4" /></button>
             </Show>
-            <div class="min-w-0">
-              <div class="flex items-center gap-1.5">
-                <Show when={selected()} fallback={<div class="truncate text-sm font-medium">{gitFileDisplayPath(selectedStatus())}</div>}>
-                  <button class="truncate text-sm font-medium text-left hover:underline" onClick={() => setReviewPreviewPath(selected()!.path)}>{gitFileDisplayPath(selectedStatus())}</button>
+            <div class="min-w-0 flex-1">
+              <div class="flex min-w-0 items-start gap-1.5">
+                <Show when={selected()} fallback={<div class="min-w-0 break-all text-sm font-medium">{gitFileDisplayPath(selectedStatus())}</div>}>
+                  <button class="min-w-0 break-all text-left text-sm font-medium hover:underline" onClick={() => setReviewPreviewPath(selected()!.path)}>{gitFileDisplayPath(selectedStatus())}</button>
                   <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Open file" onClick={() => setReviewPreviewPath(selected()!.path)}><ExternalLink class="size-3.5" /></button>
                 </Show>
               </div>

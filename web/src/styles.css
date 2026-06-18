@@ -471,7 +471,8 @@ body {
   }
 
   .confirm-modal {
-    @apply w-full max-w-md rounded-4xl p-6;
+    @apply w-full min-w-0 max-w-md rounded-4xl p-6;
+    overflow-wrap: anywhere;
   }
 
   .file-search-modal {
@@ -517,7 +518,7 @@ body {
   }
 
   .dialog-footer {
-    @apply mt-5 flex items-center gap-2 border-t border-border pt-4;
+    @apply mt-5 flex flex-wrap items-center gap-2 border-t border-border pt-4;
   }
 
   .settings-tab {
@@ -1411,7 +1412,7 @@ body {
   }
 
   .asset-preview-footer {
-    @apply static mt-0 flex min-w-0 items-center justify-end gap-2 border-t border-border px-4 py-3;
+    @apply static mt-0 flex min-w-0 flex-wrap items-center justify-end gap-2 border-t border-border px-4 py-3;
   }
 
   .asset-preview-media {
