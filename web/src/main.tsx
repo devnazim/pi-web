@@ -5931,6 +5931,7 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
 
   onMount(() => {
     let disposed = false;
+    const disposeFindHoverGuard = containerRef ? installMonacoFindHoverGuard(containerRef) : undefined;
     installMonacoWorker();
     void import('monaco-editor').then((monaco) => {
       if (disposed || !containerRef) return;
@@ -5965,6 +5966,7 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
     });
     onCleanup(() => {
       disposed = true;
+      disposeFindHoverGuard?.();
       editor?.dispose();
       model?.dispose();
     });
@@ -5996,6 +5998,31 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
 let monacoWorkerInstalled = false;
 let monacoClipboardFallbackInstalled = false;
 let monacoClipboardFallbackText = '';
+const monacoFindHoverGuardContainers = new Set<HTMLElement>();
+const MONACO_FIND_HOVER_SUPPRESSED_CLASS = 'monaco-find-widget-hover-suppressed';
+
+function updateMonacoFindHoverSuppression() {
+  const suppress = [...monacoFindHoverGuardContainers].some((container) => container.isConnected && Boolean(container.querySelector('.find-widget.visible')));
+  document.documentElement.classList.toggle(MONACO_FIND_HOVER_SUPPRESSED_CLASS, suppress);
+}
+
+function installMonacoFindHoverGuard(container: HTMLElement) {
+  monacoFindHoverGuardContainers.add(container);
+  const stopFindControlHover = (event: Event) => {
+    const target = event.target;
+    if (target instanceof Element && target.closest('.find-widget .button, .find-widget .monaco-custom-toggle')) event.stopPropagation();
+  };
+  const observer = new MutationObserver(updateMonacoFindHoverSuppression);
+  observer.observe(container, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+  container.addEventListener('mouseover', stopFindControlHover, true);
+  updateMonacoFindHoverSuppression();
+  return () => {
+    observer.disconnect();
+    container.removeEventListener('mouseover', stopFindControlHover, true);
+    monacoFindHoverGuardContainers.delete(container);
+    updateMonacoFindHoverSuppression();
+  };
+}
 
 function installMonacoClipboardFallback() {
   if (monacoClipboardFallbackInstalled) return;
@@ -7713,6 +7740,7 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
 
   onMount(() => {
     let disposed = false;
+    const disposeFindHoverGuard = containerRef ? installMonacoFindHoverGuard(containerRef) : undefined;
     const mediaQuery = window.matchMedia('(min-width: 901px)');
     const updateLayoutMode = () => setSideBySide(mediaQuery.matches);
     updateLayoutMode();
@@ -7753,6 +7781,7 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
 
     onCleanup(() => {
       disposed = true;
+      disposeFindHoverGuard?.();
       mediaQuery.removeEventListener('change', updateLayoutMode);
       saveViewState();
       editor?.dispose();
@@ -7840,6 +7869,7 @@ function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: s
 
   onMount(() => {
     let disposed = false;
+    const disposeFindHoverGuard = containerRef ? installMonacoFindHoverGuard(containerRef) : undefined;
     installMonacoWorker();
     void import('monaco-editor').then((monaco) => {
       if (disposed || !containerRef) return;
@@ -7873,6 +7903,7 @@ function ReviewPatchEditor(props: { path: string; patch: string; viewStateKey: s
     });
     onCleanup(() => {
       disposed = true;
+      disposeFindHoverGuard?.();
       saveViewState();
       editor?.dispose();
       model?.dispose();

@@ -1834,6 +1834,48 @@ body {
     @apply h-full w-full max-w-full min-h-0 min-w-0 overflow-hidden bg-card;
   }
 
+  /* Monaco find uses generic .button/.input classes; keep app component styles from leaking into it. */
+  .monaco-editor .find-widget .button {
+    border: 0;
+    background: transparent;
+    box-shadow: none;
+    color: inherit;
+    translate: 0 0;
+    transform: none;
+    transition: none;
+  }
+
+  .monaco-editor .find-widget .button:active {
+    --tw-translate-x: 0;
+    --tw-translate-y: 0;
+    translate: 0 0;
+    transform: none;
+  }
+
+  .monaco-editor .find-widget .monaco-inputbox .input {
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    transition: none;
+  }
+
+  .monaco-editor .find-widget .monaco-inputbox .input:focus-visible {
+    border-color: transparent;
+    box-shadow: none;
+    outline: none;
+  }
+
+  .monaco-editor .find-widget .codicon-find-selection,
+  .monaco-editor .find-widget .monaco-custom-toggle {
+    transition: none;
+  }
+
+  /* Monaco find tooltips can render under the cursor and steal hover, causing rapid show/hide flicker. */
+  html.monaco-find-widget-hover-suppressed .workbench-hover-container {
+    display: none !important;
+    pointer-events: none;
+  }
+
   .chat-row {
     @apply mb-4 flex items-start gap-3 text-sm leading-6;
   }
