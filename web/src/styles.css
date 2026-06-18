@@ -455,7 +455,8 @@ body {
     @apply grid place-items-center p-6;
   }
 
-  .file-search-backdrop {
+  .file-search-backdrop,
+  .open-project-modal-backdrop {
     @apply flex items-start justify-center p-4 pt-[10vh];
   }
 
@@ -699,8 +700,21 @@ body {
     @apply flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground;
   }
 
+  .project-folder-row-active {
+    @apply bg-accent text-accent-foreground;
+  }
+
   .project-folder-icon {
     @apply h-4 w-4 shrink-0 text-muted-foreground;
+  }
+
+  .project-folder-row:hover .project-folder-icon,
+  .project-folder-row-active .project-folder-icon {
+    @apply text-accent-foreground;
+  }
+
+  .project-folder-empty {
+    @apply py-8 text-center text-sm text-muted-foreground;
   }
 
   .project-menu {

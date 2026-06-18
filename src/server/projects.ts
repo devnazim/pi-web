@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -397,7 +398,10 @@ function normalizeProjectImage(projectPath: string, value: unknown) {
   return path.relative(projectPath, resolved).split(path.sep).join('/');
 }
 
-type FolderSuggestion = { path: string; displayPath: string; name: string };
+type FolderSuggestion = { path: string; displayPath: string; name: string; search: string };
+
+const SKIP_DIRECTORY_NAMES = new Set(['node_modules']);
+const MIN_RECURSIVE_FOLDER_QUERY_LENGTH = 2;
 
 async function findFolders(rawQuery: string) {
   const query = rawQuery.trim();
@@ -406,20 +410,25 @@ async function findFolders(rawQuery: string) {
   const addFolder = async (folderPath: string) => {
     try {
       const resolved = assertDirectory(folderPath);
-      candidates.set(resolved, { path: resolved, displayPath: displayPath(resolved, home), name: path.basename(resolved) || resolved });
+      const displayed = displayPath(resolved, home);
+      const name = path.basename(resolved) || resolved;
+      candidates.set(resolved, { path: resolved, displayPath: displayed, name, search: folderSuggestionSearch(resolved, displayed, name) });
+      return true;
     } catch {
       // Ignore missing/inaccessible folders while building suggestions.
+      return false;
     }
   };
 
-  const addChildren = async (folderPath: string, filter = '') => {
+  const addChildren = async (folderPath: string, filter = '', skipNames?: Set<string>) => {
     try {
       const resolved = assertDirectory(folderPath);
       const entries = await readdir(resolved, { withFileTypes: true });
       const normalizedFilter = filter.toLowerCase();
       for (const entry of entries) {
         if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-        if (normalizedFilter && !entry.name.toLowerCase().includes(normalizedFilter)) continue;
+        if (skipNames?.has(entry.name)) continue;
+        if (normalizedFilter && !folderSuggestionMatches(entry.name, normalizedFilter)) continue;
         await addFolder(path.join(resolved, entry.name));
       }
     } catch {
@@ -427,12 +436,38 @@ async function findFolders(rawQuery: string) {
     }
   };
 
+  const addRecursiveMatches = async (folderPath: string, filter: string, maxDepth: number, limit: number, seen: Set<string>) => {
+    const queue: { path: string; depth: number }[] = [{ path: folderPath, depth: 0 }];
+    const maxExplored = 5000;
+    while (queue.length > 0 && candidates.size < limit && seen.size < maxExplored) {
+      const { path: currentPath, depth } = queue.shift()!;
+      if (seen.has(currentPath)) continue;
+      seen.add(currentPath);
+      let entries: Dirent[];
+      try {
+        entries = await readdir(currentPath, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+        if (SKIP_DIRECTORY_NAMES.has(entry.name)) continue;
+        const childDepth = depth + 1;
+        const childPath = path.join(currentPath, entry.name);
+        if (childDepth <= maxDepth && folderSuggestionMatches(entry.name, filter)) await addFolder(childPath);
+        if (childDepth < maxDepth) queue.push({ path: childPath, depth: childDepth });
+      }
+    }
+  };
+
   if (looksLikePath(query)) {
     const expanded = expandHome(query, home);
-    const base = query.endsWith('/') || query.endsWith(path.sep) ? expanded : path.dirname(expanded);
-    const filter = query.endsWith('/') || query.endsWith(path.sep) ? '' : path.basename(expanded);
-    await addFolder(expanded);
+    const queryHasTrailingSeparator = hasTrailingPathSeparator(query);
+    const base = queryHasTrailingSeparator ? expanded : path.dirname(expanded);
+    const filter = queryHasTrailingSeparator ? '' : path.basename(expanded);
+    const expandedExists = await addFolder(expanded);
     await addChildren(base, filter);
+    if (expandedExists && !queryHasTrailingSeparator) await addChildren(expanded);
   } else {
     const roots = [
       home,
@@ -449,27 +484,81 @@ async function findFolders(rawQuery: string) {
     ];
     for (const root of roots) {
       await addFolder(root);
-      await addChildren(root, query);
+      await addChildren(root, query, SKIP_DIRECTORY_NAMES);
+    }
+    const recursiveQuery = normalizeFolderSuggestionSearch(query).replace(/\s/g, '');
+    if (recursiveQuery.length >= MIN_RECURSIVE_FOLDER_QUERY_LENGTH) {
+      const recursiveRoots = [...new Set([process.cwd(), path.dirname(process.cwd()), home])];
+      const recursiveSeen = new Set<string>();
+      for (const root of recursiveRoots) {
+        await addRecursiveMatches(root, query, 5, 50, recursiveSeen);
+      }
     }
   }
 
   const normalizedQuery = query.toLowerCase();
   return [...candidates.values()]
-    .filter((folder) => !normalizedQuery || looksLikePath(query) || folder.displayPath.toLowerCase().includes(normalizedQuery) || folder.name.toLowerCase().includes(normalizedQuery))
-    .sort((a, b) => a.displayPath.localeCompare(b.displayPath))
+    .filter((folder) => !normalizedQuery || looksLikePath(query) || folderSuggestionMatches(folder.search, normalizedQuery))
+    .sort((a, b) => folderSuggestionRank(a, query) - folderSuggestionRank(b, query) || a.displayPath.localeCompare(b.displayPath))
     .slice(0, 50);
 }
 
+function folderSuggestionSearch(folderPath: string, displayedPath: string, name: string) {
+  const withoutSlash = (value: string) => value.replace(/[\\/]+$/g, '') || value;
+  const withSlash = (value: string) => value.endsWith('/') ? value : `${value}/`;
+  return [...new Set([folderPath, withSlash(folderPath), displayedPath, withoutSlash(displayedPath), withSlash(displayedPath), name].filter(Boolean))].join('\n');
+}
+
+function folderSuggestionMatches(value: string, query: string) {
+  const haystack = value.toLowerCase();
+  const needle = query.toLowerCase();
+  if (haystack.includes(needle)) return true;
+  const normalizedHaystack = normalizeFolderSuggestionSearch(haystack);
+  const normalizedNeedle = normalizeFolderSuggestionSearch(needle);
+  if (!normalizedNeedle) return false;
+  return normalizedNeedle.split(' ').every((part) => normalizedHaystack.includes(part));
+}
+
+function folderSuggestionRank(folder: FolderSuggestion, query: string) {
+  const normalizedQuery = normalizeFolderSuggestionPath(query);
+  if (!normalizedQuery) return 0;
+  const paths = [folder.path, folder.displayPath].map(normalizeFolderSuggestionPath);
+  if (paths.includes(normalizedQuery)) return 0;
+  if (folder.name.toLowerCase() === normalizedQuery) return 1;
+  if (paths.some((value) => value.startsWith(`${normalizedQuery}/`) || value.startsWith(`${normalizedQuery}\\`))) return 2;
+  if (folder.name.toLowerCase().startsWith(normalizedQuery)) return 3;
+  return 4;
+}
+
+function normalizeFolderSuggestionPath(value: string) {
+  return value.trim().toLowerCase().replace(/[\\/]+$/g, '');
+}
+
+function normalizeFolderSuggestionSearch(value: string) {
+  return value.toLowerCase().replace(/[\\/_\-.]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function hasTrailingPathSeparator(query: string) {
+  return /[\\/]$/.test(query);
+}
+
 function looksLikePath(query: string) {
-  return query.startsWith('/') || query.startsWith('~') || query.startsWith('.') || query.includes(path.sep);
+  return query.startsWith('/') || query.startsWith('~') || query.startsWith('.') || query.includes('/') || query.includes('\\') || /^[A-Za-z]:[\\/]/.test(query);
 }
 
 function expandHome(value: string, home: string) {
   if (value === '~') return home;
-  if (value.startsWith(`~${path.sep}`)) return path.join(home, value.slice(2));
+  if (value.startsWith('~/') || value.startsWith('~\\')) {
+    const rest = value.slice(2).replace(/^[\\/]+/, '');
+    return rest ? path.join(home, rest) : home;
+  }
   return path.resolve(value || home);
 }
 
 function displayPath(value: string, home: string) {
-  return value === home ? '~/' : value.startsWith(`${home}${path.sep}`) ? `~/${path.relative(home, value)}/` : `${value}/`;
+  const normalizedValue = value.split(path.sep).join('/');
+  const normalizedHome = home.split(path.sep).join('/');
+  if (normalizedValue === normalizedHome) return '~/';
+  if (normalizedValue.startsWith(`${normalizedHome}/`)) return `~/${normalizedValue.slice(normalizedHome.length + 1)}/`;
+  return `${normalizedValue}/`;
 }

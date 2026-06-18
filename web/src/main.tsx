@@ -93,7 +93,7 @@ type ProjectColorId = 'slate' | 'gray' | 'zinc' | 'neutral' | 'stone' | 'red' | 
 type ProjectColor = { id: ProjectColorId; label: string; value: string; foreground: string };
 type ProjectPreference = { color?: ProjectColorId; image?: string };
 type ProjectEditInput = { path: string; color?: ProjectColorId; imageFile?: globalThis.File; clearImage: boolean };
-type ProjectFolder = { path: string; displayPath: string; name: string };
+type ProjectFolder = { path: string; displayPath: string; name: string; search?: string };
 type SessionSummary = { id: string; title: string; updatedAt: string; entryCount: number; sessionUuid?: string };
 type SessionListResponse = { sessions: SessionSummary[]; nextCursor?: string; total?: number };
 type SessionEntry = { type: string; id: string; parentId: string | null; timestamp?: string; role?: string; content?: unknown; text?: string; message?: { role?: string; content?: unknown;[key: string]: unknown };[key: string]: unknown };
@@ -2400,18 +2400,47 @@ function OpenProjectModal(props: { title?: string; initialSearch?: string; proje
   const [search, setSearch] = createSignal(props.initialSearch ?? '');
   const [debouncedSearch, setDebouncedSearch] = createSignal(props.initialSearch ?? '');
   const recentProjects = createMemo(() => mergeRecentProjects(props.projects, readRecentProjects()));
-  const filteredRecent = createMemo(() => filterProjectFolders(recentProjects(), debouncedSearch()));
+  const filteredRecent = createMemo(() => filterProjectFolders(recentProjects(), search()));
+  const folderSearchPending = createMemo(() => search().trim() !== debouncedSearch().trim());
   const folders = createQuery(() => ({
     queryKey: ['project-folders', debouncedSearch()],
     queryFn: ({ signal }) => api<{ folders: ProjectFolder[] }>(`/api/projects/folders?query=${encodeURIComponent(debouncedSearch())}`, { signal }),
     staleTime: 60_000,
   }));
-  const filteredFolders = createMemo(() => filterProjectFolders(folders.data?.folders ?? [], debouncedSearch()).filter((folder) => !recentProjects().some((project) => project.path === folder.path)));
+  const filteredFolders = createMemo(() => {
+    const visibleRecentPaths = new Set(filteredRecent().map(({ path }) => path));
+    const query = search().trim();
+    const serverFolders = folderSearchPending() && looksLikeProjectSearchPath(query) ? [] : folders.data?.folders ?? [];
+    const folderResults = looksLikeProjectSearchPath(query) ? serverFolders : filterProjectFolders(serverFolders, query);
+    return folderResults.filter((folder) => !visibleRecentPaths.has(folder.path));
+  });
+  const visibleFolders = createMemo(() => [...filteredRecent(), ...filteredFolders()]);
+  const [activeFolderIndex, setActiveFolderIndex] = createSignal(-1);
+  const [activeFolderPicked, setActiveFolderPicked] = createSignal(false);
+  const activeFolder = createMemo(() => visibleFolders()[activeFolderIndex()]);
+  let resultsRef: HTMLDivElement | undefined;
+  let visibleFoldersKey = '';
 
   createEffect(() => {
     const value = search();
     const timeout = window.setTimeout(() => setDebouncedSearch(value), 250);
     onCleanup(() => window.clearTimeout(timeout));
+  });
+
+  createEffect(() => {
+    const folders = visibleFolders();
+    const key = folders.map(({ path }) => path).join('\0');
+    if (key === visibleFoldersKey) return;
+    visibleFoldersKey = key;
+    setActiveFolderIndex(-1);
+    setActiveFolderPicked(false);
+  });
+
+  createEffect(() => {
+    visibleFolders();
+    const index = activeFolderIndex();
+    if (!resultsRef || index < 0) return;
+    requestAnimationFrame(() => resultsRef?.querySelector<HTMLElement>(`[data-project-folder-index="${index}"]`)?.scrollIntoView({ block: 'nearest' }));
   });
 
   createEffect(() => {
@@ -2428,8 +2457,50 @@ function OpenProjectModal(props: { title?: string; initialSearch?: string; proje
     if (value) props.onOpen(value);
   }
 
+  function moveActiveFolder(delta: 1 | -1) {
+    const count = visibleFolders().length;
+    if (!count) return;
+    setActiveFolderPicked(true);
+    setActiveFolderIndex((index) => index < 0 ? (delta === 1 ? 0 : count - 1) : (index + delta + count) % count);
+  }
+
+  function handleSearchKeyDown(event: KeyboardEvent) {
+    if (event.key === 'ArrowDown' || (!event.metaKey && !event.altKey && !event.shiftKey && event.ctrlKey && event.key === 'n')) {
+      if (!visibleFolders().length) return;
+      event.preventDefault();
+      moveActiveFolder(1);
+      return;
+    }
+    if (event.key === 'ArrowUp' || (!event.metaKey && !event.altKey && !event.shiftKey && event.ctrlKey && event.key === 'p')) {
+      if (!visibleFolders().length) return;
+      event.preventDefault();
+      moveActiveFolder(-1);
+      return;
+    }
+    if (event.key === 'Tab' && !event.shiftKey) {
+      const folder = activeFolderPicked() ? activeFolder() : projectFolderCompletionTarget(visibleFolders(), search());
+      if (!folder) return;
+      event.preventDefault();
+      const value = projectFolderCompletion(folder, search());
+      setSearch(value);
+      setDebouncedSearch(value);
+      return;
+    }
+    if (event.key === 'Enter' && !event.isComposing) {
+      const folder = activeFolderPicked() ? activeFolder() : undefined;
+      if (!folder) return;
+      event.preventDefault();
+      props.onOpen(folder.path);
+    }
+  }
+
+  const activateFolder = (index: number) => {
+    setActiveFolderIndex(index);
+    setActiveFolderPicked(true);
+  };
+
   return (
-    <div class="project-modal-backdrop" onMouseDown={props.onClose}>
+    <div class="project-modal-backdrop open-project-modal-backdrop" onMouseDown={props.onClose}>
       <form class="project-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
         <div class="mb-5 flex items-center justify-between gap-4">
           <h2 class="text-base font-medium leading-none">{props.title ?? 'Open project'}</h2>
@@ -2437,11 +2508,18 @@ function OpenProjectModal(props: { title?: string; initialSearch?: string; proje
         </div>
         <div class="project-search">
           <Search class="size-5 text-muted-foreground" />
-          <input class="min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground" placeholder="Search folders" value={search()} onInput={(event) => setSearch(event.currentTarget.value)} autofocus />
+          <input class="min-w-0 flex-1 bg-transparent text-base outline-none placeholder:text-muted-foreground" placeholder="Search folders" value={search()} onInput={(event) => { setSearch(event.currentTarget.value); setActiveFolderIndex(-1); setActiveFolderPicked(false); }} onKeyDown={handleSearchKeyDown} autofocus />
         </div>
-        <div class="mt-6 min-h-0 overflow-auto pr-1">
-          <ProjectFolderSection title="Recent projects" folders={filteredRecent()} onOpen={props.onOpen} />
-          <ProjectFolderSection title="Open project" folders={filteredFolders()} onOpen={props.onOpen} />
+        <div ref={resultsRef} class="mt-6 min-h-0 overflow-auto pr-1">
+          <ProjectFolderSection title="Recent projects" folders={filteredRecent()} startIndex={0} activeIndex={activeFolderIndex()} onActiveIndex={activateFolder} onOpen={props.onOpen} />
+          <ProjectFolderSection title="Open project" folders={filteredFolders()} startIndex={filteredRecent().length} activeIndex={activeFolderIndex()} onActiveIndex={activateFolder} onOpen={props.onOpen} />
+          <Show when={!visibleFolders().length}>
+            <div class="project-folder-empty">
+              {folders.error ? `Could not load folders: ${errorMessage(folders.error, 'Unknown error')}`
+                : folderSearchPending() || folders.isFetching ? 'Loading folders...'
+                : 'No folders found.'}
+            </div>
+          </Show>
         </div>
         <div class="dialog-footer justify-end">
           <button type="button" class="button-secondary" onClick={props.onClose}>Cancel</button>
@@ -2846,23 +2924,28 @@ function ShortcutsSettingsPanel() {
   );
 }
 
-function ProjectFolderSection(props: { title: string; folders: ProjectFolder[]; onOpen: (path: string) => void }) {
+function ProjectFolderSection(props: { title: string; folders: ProjectFolder[]; startIndex: number; activeIndex: number; onActiveIndex: (index: number) => void; onOpen: (path: string) => void }) {
   return (
-    <section class="mb-6">
-      <div class="mb-2 px-3 text-sm font-semibold text-muted-foreground">{props.title}</div>
-      <div class="space-y-1">
-        <For each={props.folders}>
-          {(folder) => <ProjectFolderRow folder={folder} onOpen={props.onOpen} />}
-        </For>
-      </div>
-    </section>
+    <Show when={props.folders.length}>
+      <section class="mb-6">
+        <div class="mb-2 px-3 text-sm font-semibold text-muted-foreground">{props.title}</div>
+        <div class="space-y-1">
+          <For each={props.folders}>
+            {(folder, index) => {
+              const rowIndex = () => props.startIndex + index();
+              return <ProjectFolderRow folder={folder} index={rowIndex()} active={props.activeIndex === rowIndex()} onActive={props.onActiveIndex} onOpen={props.onOpen} />;
+            }}
+          </For>
+        </div>
+      </section>
+    </Show>
   );
 }
 
-function ProjectFolderRow(props: { folder: ProjectFolder; onOpen: (path: string) => void }) {
+function ProjectFolderRow(props: { folder: ProjectFolder; index: number; active: boolean; onActive: (index: number) => void; onOpen: (path: string) => void }) {
   const segments = createMemo(() => splitDisplayPath(props.folder.displayPath));
   return (
-    <button type="button" class="project-folder-row" onClick={() => props.onOpen(props.folder.path)}>
+    <button type="button" tabIndex={-1} data-project-folder-index={props.index} aria-selected={props.active} class={`project-folder-row ${props.active ? 'project-folder-row-active' : ''}`} onFocus={() => props.onActive(props.index)} onPointerEnter={() => props.onActive(props.index)} onClick={() => props.onOpen(props.folder.path)}>
       <Folder class="project-folder-icon" />
       <span class="min-w-0 truncate">
         <span class="text-muted-foreground">{segments().prefix}</span><span>{segments().name}</span>
@@ -10597,17 +10680,90 @@ function looksLikeProjectPath(projectPath: string) {
   return projectPath.startsWith('/') || projectPath.startsWith('~') || /^[A-Za-z]:[\\/]/.test(projectPath);
 }
 
+function looksLikeProjectSearchPath(projectPath: string) {
+  return projectPath.startsWith('/') || projectPath.startsWith('~') || projectPath.startsWith('.') || projectPath.includes('/') || projectPath.includes('\\') || /^[A-Za-z]:[\\/]/.test(projectPath);
+}
+
 function mergeRecentProjects(projects: Project[], recentPaths: string[]): ProjectFolder[] {
   const folders = new Map<string, ProjectFolder>();
   for (const project of projects) folders.set(project.path, { path: project.path, displayPath: displayProjectPath(project.path), name: project.name });
-  for (const projectPath of recentPaths) folders.set(projectPath, { path: projectPath, displayPath: displayProjectPath(projectPath), name: projectPath.split('/').filter(Boolean).at(-1) ?? projectPath });
+  for (const projectPath of recentPaths) folders.set(projectPath, { path: projectPath, displayPath: displayProjectPath(projectPath), name: projectPathBaseName(projectPath) });
   return [...folders.values()];
 }
 
 function filterProjectFolders(folders: ProjectFolder[], search: string) {
-  const query = search.trim().toLowerCase();
+  const query = search.trim();
   if (!query) return folders;
-  return folders.filter((folder) => folder.name.toLowerCase().includes(query) || folder.path.toLowerCase().includes(query) || folder.displayPath.toLowerCase().includes(query));
+  return folders
+    .map((folder, index) => ({ folder, index, rank: projectFolderSearchRank(folder, query) }))
+    .filter(({ folder }) => projectFolderMatchesSearch(folder, query))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map(({ folder }) => folder);
+}
+
+function projectFolderMatchesSearch(folder: ProjectFolder, query: string) {
+  const haystack = projectFolderSearchText(folder).toLowerCase();
+  const needle = query.toLowerCase();
+  if (haystack.includes(needle)) return true;
+  const normalizedHaystack = normalizeProjectFolderSearch(haystack);
+  const normalizedNeedle = normalizeProjectFolderSearch(needle);
+  if (!normalizedNeedle) return false;
+  return normalizedNeedle.split(' ').every((part) => normalizedHaystack.includes(part));
+}
+
+function projectFolderSearchRank(folder: ProjectFolder, query: string) {
+  const normalizedQuery = normalizeProjectFolderPath(query);
+  const paths = [folder.path, folder.displayPath].map(normalizeProjectFolderPath);
+  if (paths.includes(normalizedQuery)) return 0;
+  if (folder.name.toLowerCase() === normalizedQuery) return 1;
+  if (paths.some((value) => value.startsWith(`${normalizedQuery}/`) || value.startsWith(`${normalizedQuery}\\`))) return 2;
+  if (folder.name.toLowerCase().startsWith(normalizedQuery)) return 3;
+  return 4;
+}
+
+function projectFolderSearchText(folder: ProjectFolder) {
+  return uniqueProjectSearchValues([
+    folder.search,
+    folder.name,
+    folder.path,
+    ensureTrailingProjectSlash(folder.path),
+    folder.displayPath,
+    ensureTrailingProjectSlash(folder.displayPath),
+    projectPathBaseName(folder.path),
+  ]);
+}
+
+function projectFolderCompletion(folder: ProjectFolder, search: string) {
+  return ensureTrailingProjectSlash(search.trimStart().startsWith('~') && folder.displayPath.startsWith('~') ? folder.displayPath : folder.path);
+}
+
+function projectFolderCompletionTarget(folders: ProjectFolder[], search: string) {
+  const query = search.trim();
+  if (!looksLikeProjectSearchPath(query) || folders.length < 2) return folders[0];
+  const normalizedQuery = normalizeProjectFolderPath(query);
+  return folders.find((folder) => ![folder.path, folder.displayPath].map(normalizeProjectFolderPath).includes(normalizedQuery)) ?? folders[0];
+}
+
+function normalizeProjectFolderSearch(value: string) {
+  return value.toLowerCase().replace(/[\\/_\-.]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeProjectFolderPath(value: string) {
+  return value.trim().toLowerCase().replace(/[\\/]+$/g, '');
+}
+
+function uniqueProjectSearchValues(values: Array<string | undefined>) {
+  return [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))].join('\n');
+}
+
+function ensureTrailingProjectSlash(value: string) {
+  const normalized = value.replace(/\\/g, '/');
+  return normalized.endsWith('/') ? normalized : `${normalized}/`;
+}
+
+function projectPathBaseName(projectPath: string) {
+  const trimmed = projectPath.replace(/[\\/]+$/g, '');
+  return trimmed.split(/[\\/]/).filter(Boolean).at(-1) ?? projectPath;
 }
 
 function splitDisplayPath(value: string) {
