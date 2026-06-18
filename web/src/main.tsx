@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider, createInfiniteQuery, createQuery } from '@tanstack/solid-query';
 import {
+  Activity,
   AlignJustify,
   Archive,
   ArrowUp,
@@ -1942,7 +1943,7 @@ function Shell() {
   if (auth.data?.required && !auth.data.authenticated) return <Login onDone={() => queryClient.invalidateQueries({ queryKey: ['auth'] })} />;
 
   return (
-    <div class="h-screen overflow-hidden bg-background text-foreground">
+    <div class="app-shell bg-background text-foreground">
       <div ref={shellSplitRef} class={`shell-split grid h-full ${sessionSidebarOpen() ? 'bg-sidebar' : 'bg-background'}`} style={{ 'grid-template-columns': sessionSidebarOpen() ? `${PROJECT_RAIL_WIDTH}px ${sessionSidebar.size()}px minmax(0, 1fr)` : `${PROJECT_RAIL_WIDTH}px minmax(0, 1fr)` }}>
         <div class="max-md:hidden">
           <ProjectRail projects={orderedProjects()} activeProjectId={activeProject()?.id} projectNotifications={projectNotificationSummaries()} sessionSidebarOpen={sessionSidebarOpen()} shortcutsEnabled={!workspaceModeActive()} onProject={selectProject} onProjectMenu={setProjectMenu} onAddProject={() => setOpenProjectModal(true)} onSettings={() => setSettingsOpen(true)} onReorder={handleProjectReorder} />
@@ -2137,7 +2138,7 @@ function Login(props: { onDone: () => void }) {
     else setError('Invalid password');
   }
   return (
-    <div class="grid h-screen place-items-center bg-background p-6 text-foreground">
+    <div class="app-shell grid place-items-center bg-background p-6 text-foreground">
       <form onSubmit={submit} class="w-full max-w-sm rounded-2xl bg-card p-6 ring-1 ring-foreground/10">
         <div class="mb-5 flex h-10 w-10 items-center justify-center rounded-4xl bg-primary text-lg font-medium text-primary-foreground">π</div>
         <h1 class="mb-1 text-base font-medium leading-none">Welcome back</h1>
@@ -4473,6 +4474,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
   const [runningCommand, setRunningCommand] = createSignal<string>();
   const [commandSessionId, setCommandSessionId] = createSignal<string>();
   const [pendingUserMessage, setPendingUserMessage] = createSignal<{ sessionId: string; text: string; attachments: UploadAsset[]; userMessageCount: number }>();
+  const [mobileStatusOpen, setMobileStatusOpen] = createSignal(false);
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
@@ -5457,7 +5459,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
     <div class={`grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden${props.contrastUserMessages ? '' : ' chat-user-bubbles-surface'}`}>
       <div
         ref={transcriptScrollerRef}
-        class={`min-h-0 overflow-y-auto overflow-x-hidden px-6 pb-6 pt-24 ${centerTranscript() ? 'grid place-items-center' : ''}`}
+        class={`chat-transcript min-h-0 overflow-y-auto overflow-x-hidden px-6 pb-6 pt-24 ${centerTranscript() ? 'grid place-items-center' : ''}`}
         onWheel={handleTranscriptWheel}
         onScroll={(event) => updateTranscriptStickiness(event.currentTarget)}
       >
@@ -5611,9 +5613,10 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
               onKeyDown={handleComposerKeyDown}
             />
           </div>
-          <AgentStatusBar status={agentStatus.data?.status} loading={agentStatus.isLoading || agentStatus.isFetching} error={agentStatus.error} />
+          <AgentStatusBar status={agentStatus.data?.status} loading={agentStatus.isLoading || agentStatus.isFetching} error={agentStatus.error} mobileOpen={mobileStatusOpen()} />
           <div class="composer-toolbar flex h-12 min-w-0 flex-nowrap items-center gap-1.5 border-t border-border px-3 text-sm max-xl:h-auto max-xl:py-2 max-md:gap-y-2">
             <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files"><Plus class="size-4" /><input class="hidden" type="file" multiple accept="image/*,video/*,.txt,.md,.pdf" onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files).catch((error) => console.error('Could not attach files', error)); }} /></label>
+            <button class={`ghost h-8 w-8 px-0 md:hidden ${mobileStatusOpen() ? 'bg-muted text-foreground' : ''}`} type="button" title={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-label={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-expanded={mobileStatusOpen()} onClick={() => setMobileStatusOpen((open) => !open)}><Activity class="size-4" /></button>
             <UiSelect compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} options={modelOptions()} ariaLabel="Model" />
             <UiSelect
               compact
@@ -5649,7 +5652,7 @@ function ComposerHighlights(props: { text: string; setRef?: (element: HTMLDivEle
   );
 }
 
-function AgentStatusBar(props: { status?: AgentStatusInfo; loading?: boolean; error?: unknown }) {
+function AgentStatusBar(props: { status?: AgentStatusInfo; loading?: boolean; error?: unknown; mobileOpen?: boolean }) {
   const parts = createMemo(() => {
     const statusParts = agentStatusParts(props.status);
     if (statusParts.length) return statusParts;
@@ -5658,7 +5661,7 @@ function AgentStatusBar(props: { status?: AgentStatusInfo; loading?: boolean; er
     return [{ text: 'no status yet' }];
   });
   return (
-    <div class="agent-status-bar max-md:max-h-none">
+    <div class={`agent-status-bar ${props.mobileOpen ? 'agent-status-bar-mobile-open' : ''}`}>
       <For each={parts()}>
         {(part) => <span class={`agent-status-item ${part.tone ? `agent-status-${part.tone}` : ''}`} title={part.title}>{part.text}</span>}
       </For>
@@ -10637,4 +10640,32 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return response.json();
 }
 
+function refreshAppViewportHeight(resetWindowScroll = false) {
+  const height = window.visualViewport?.height ?? window.innerHeight;
+  document.documentElement.style.setProperty('--pi-app-viewport-height', `${height}px`);
+  if (resetWindowScroll) window.scrollTo(0, 0);
+}
+
+function scheduleAppViewportHeightRefresh(resetWindowScroll = false) {
+  refreshAppViewportHeight(resetWindowScroll);
+  requestAnimationFrame(() => refreshAppViewportHeight(resetWindowScroll));
+  window.setTimeout(() => refreshAppViewportHeight(resetWindowScroll), 80);
+  window.setTimeout(() => refreshAppViewportHeight(resetWindowScroll), 240);
+}
+
+function installAppViewportHeight() {
+  const scheduleRefresh = () => scheduleAppViewportHeightRefresh();
+  const scheduleFocusRefresh = (event: FocusEvent) => {
+    const target = event.target;
+    scheduleAppViewportHeightRefresh(target instanceof HTMLElement && Boolean(target.closest('input, textarea, [contenteditable="true"]')));
+  };
+  scheduleAppViewportHeightRefresh();
+  window.addEventListener('resize', scheduleRefresh);
+  window.addEventListener('orientationchange', scheduleRefresh);
+  window.addEventListener('focusin', scheduleFocusRefresh, true);
+  window.visualViewport?.addEventListener('resize', scheduleRefresh);
+  window.visualViewport?.addEventListener('scroll', scheduleRefresh);
+}
+
+installAppViewportHeight();
 render(() => <App />, document.getElementById('root')!);

@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#1b1b1b" media="(prefers-color-scheme: dark)" />
@@ -43,13 +43,23 @@
         color-scheme: dark;
       }
 
+      html,
+      body,
+      #root {
+        height: 100%;
+        min-height: 0;
+        overflow: hidden;
+      }
+
       body {
         margin: 0;
         background: inherit;
       }
 
       #root {
-        min-height: 100vh;
+        height: 100vh;
+        height: 100dvh;
+        height: var(--pi-app-viewport-height, 100dvh);
       }
     </style>
   </head>

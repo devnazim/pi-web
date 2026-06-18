@@ -158,6 +158,26 @@ html.dark {
   color-scheme: dark;
 }
 
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#root,
+.app-shell {
+  height: 100vh;
+  height: 100dvh;
+  height: var(--pi-app-viewport-height, 100dvh);
+  min-height: 0;
+}
+
+.app-shell {
+  overflow: hidden;
+}
+
 body {
   margin: 0;
   background: oklch(var(--background));
@@ -836,7 +856,10 @@ body {
   }
 
   .floating-topbar {
-    @apply pointer-events-none absolute left-4 right-4 top-3 z-40 flex items-center gap-3;
+    @apply pointer-events-none absolute z-40 flex items-center gap-3;
+    left: calc(env(safe-area-inset-left) + 1rem);
+    right: calc(env(safe-area-inset-right) + 1rem);
+    top: calc(env(safe-area-inset-top) + 0.75rem);
   }
 
   .floating-search-wrap {
@@ -1379,6 +1402,11 @@ body {
 
   .agent-status-danger {
     @apply text-destructive/75;
+  }
+
+  .chat-transcript {
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
   }
 
   .asset-preview-backdrop {
@@ -2300,6 +2328,49 @@ body {
 @media (max-width: 767px) {
   .shell-split {
     grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .floating-topbar {
+    gap: 0.5rem;
+  }
+
+  .floating-search-wrap {
+    min-width: 0;
+    max-width: none;
+    flex: 1 1 auto;
+  }
+
+  .composer-form.composer-form {
+    padding-right: calc(env(safe-area-inset-right) + 1rem);
+    padding-bottom: max(0.75rem, calc(env(safe-area-inset-bottom) + 0.75rem));
+    padding-left: calc(env(safe-area-inset-left) + 1rem);
+  }
+
+  .chat-transcript.chat-transcript {
+    padding-top: calc(env(safe-area-inset-top) + 5rem);
+    padding-right: calc(env(safe-area-inset-right) + 1rem);
+    padding-bottom: 1rem;
+    padding-left: calc(env(safe-area-inset-left) + 1rem);
+  }
+
+  .input,
+  .file-search-input,
+  .floating-search,
+  .project-search input,
+  .composer-textarea,
+  .composer-highlights,
+  .extension-ui-editor {
+    font-size: 16px;
+  }
+
+  .agent-status-bar {
+    display: none;
+    justify-content: flex-start;
+    max-height: min(7rem, 28dvh);
+  }
+
+  .agent-status-bar-mobile-open {
+    display: flex;
   }
 
   main .tool-panel {
