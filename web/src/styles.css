@@ -1402,7 +1402,7 @@ body {
   }
 
   .agent-status-bar {
-    @apply flex max-h-14 w-full flex-wrap items-center justify-end gap-2 overflow-y-auto px-4 py-2 text-xs text-muted-foreground;
+    @apply flex max-h-14 w-full flex-wrap items-center justify-end gap-x-2 gap-y-1 overflow-y-auto px-4 py-2 text-xs text-muted-foreground;
     scrollbar-gutter: stable;
   }
 
@@ -2379,7 +2379,7 @@ body {
 
   .agent-status-bar {
     display: none;
-    justify-content: flex-start;
+    justify-content: flex-end;
     max-height: min(7rem, 28dvh);
   }
 
