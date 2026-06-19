@@ -214,7 +214,7 @@ type ChatContentPart = { type: 'text' | 'thinking' | 'tool' | 'image' | 'error';
 type ToolCallInfo = { id?: string; name: string; args: Record<string, unknown> };
 type AgentToolActivity = { id: string; name: string; status: 'running' | 'done' | 'error'; summary?: string };
 type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
-type AgentActivity = { running: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
+type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean };
 type SessionComposerControls = { model?: string; thinking?: ThinkingLevel | '' };
@@ -4662,6 +4662,15 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
     return props.extensionUiRequests.filter((request) => sessionId ? request.sessionId === sessionId : !request.sessionId);
   });
   const busy = createMemo(() => liveActivity().running || Boolean(runningCommand()) || visibleExtensionUiRequests().length > 0);
+  const canSteerAgent = createMemo(() => liveActivity().streaming && !runningCommand() && !liveShellActivity().running && visibleExtensionUiRequests().length === 0);
+  const composerCanSubmit = createMemo(() => {
+    const prompt = text().trim();
+    if (!prompt) return false;
+    if (!busy()) return true;
+    const commandName = composerSlashCommandName(prompt);
+    const extensionCommand = commandName ? slashCommands.data?.commands.find((command) => command.name === commandName)?.source === 'extension' : false;
+    return canSteerAgent() && !extensionCommand && !parseShellComposerCommand(prompt) && parseCompactComposerCommand(prompt) === undefined;
+  });
   const showEmptySessionPrompt = createMemo(() => Boolean(props.sessionId && !session.isLoading && !session.error && visibleTranscriptEntries().length === 0 && !busy() && !pendingUserMessageVisible()));
   const centerTranscript = createMemo(() => (!props.sessionId && !pendingUserMessageVisible()) || showEmptySessionPrompt());
   const agentStatus = createQuery(() => {
@@ -5421,7 +5430,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
 
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
-      if (!busy() && text().trim()) event.currentTarget.form?.requestSubmit();
+      if (composerCanSubmit()) event.currentTarget.form?.requestSubmit();
     }
   }
 
@@ -5429,7 +5438,10 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
     event.preventDefault();
     const prompt = text().trim();
     const uploadAssets = composerUploadAssets(uploads());
-    if (!prompt || busy()) return;
+    const shellCommand = parseShellComposerCommand(prompt);
+    const compactCommand = parseCompactComposerCommand(prompt);
+    const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined;
+    if (!prompt || (busy() && !steeringSubmit)) return;
     const projectId = props.project.id;
     const routeSessionId = props.sessionId;
     const submittedDraftKey = activeComposerDraftKey;
@@ -5439,8 +5451,6 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
     const submittedDefaultModel = defaultModelReference(effectiveSettings());
     const submittedDefaultThinkingLevel = effectiveSettings()?.defaultThinkingLevel;
     let submittedCommandSessionId = commandSessionId();
-    const shellCommand = parseShellComposerCommand(prompt);
-    const compactCommand = parseCompactComposerCommand(prompt);
     let sessionId = routeSessionId ?? commandSessionId();
     const mirrorActiveStream = !routeSessionId;
     if (compactCommand !== undefined && !sessionId) return;
@@ -5459,6 +5469,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
     const extensionCommand = !shellCommand && compactCommand === undefined
       ? await isExtensionComposerCommand(projectId, submittedSessionId, prompt).catch(() => false)
       : false;
+    if (steeringSubmit && extensionCommand) return;
     const submittedComposerStillActive = () => activeComposerDraftKey === submittedDraftKey;
     const submittedWorkspaceStillCurrent = () => props.project.id === projectId && (!props.sessionId || props.sessionId === submittedSessionId);
     const selectSubmittedSession = () => {
@@ -5510,13 +5521,14 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           sessionId: submittedSessionId,
-          treeTargetId: submittedTreeSelection?.entry.id,
-          treeSummary: submittedTreeSelection ? treeSummaryOptions(submittedTreeSelection) : undefined,
+          treeTargetId: steeringSubmit ? undefined : submittedTreeSelection?.entry.id,
+          treeSummary: !steeringSubmit && submittedTreeSelection ? treeSummaryOptions(submittedTreeSelection) : undefined,
           prompt,
           attachments,
           mirrorActiveStream,
           model: submittedModel || submittedDefaultModel,
           thinking: promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel),
+          streamingBehavior: steeringSubmit && !extensionCommand ? 'steer' : undefined,
         }),
       });
       selectSubmittedSession();
@@ -5712,7 +5724,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
               ariaLabel="Thinking level"
             />
             <div class="composer-toolbar-spacer flex-1" />
-            <Show when={busy()} fallback={<button class="button h-8 w-8 px-0" type="submit" title="Send"><ArrowUp class="size-4" /></button>}>
+            <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={busy() && composerCanSubmit() ? 'Send steering message' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><ArrowUp class="size-4" /></button>}>
               <button class="button-danger h-8 w-8 px-0" type="button" title="Interrupt agent (Esc, or double Esc anywhere)" onClick={() => void interruptAgent()} disabled={aborting()}><Square class="size-3.5 fill-current" /></button>
             </Show>
           </div>
@@ -8731,6 +8743,7 @@ function bashActivity(events: string[]): BashActivity {
 
 function agentActivity(events: string[]): AgentActivity {
   let running = false;
+  let streaming = false;
   let error: string | undefined;
   let retry: AgentRetryActivity | undefined;
   let text = '';
@@ -8743,6 +8756,7 @@ function agentActivity(events: string[]): AgentActivity {
     try { parsed = JSON.parse(raw); } catch { continue; }
     if (parsed.type === 'agent:start') {
       running = true;
+      streaming = false;
       error = undefined;
       retry = undefined;
       text = '';
@@ -8753,6 +8767,7 @@ function agentActivity(events: string[]): AgentActivity {
     }
     if (parsed.type === 'agent:finish') {
       running = false;
+      streaming = false;
       retry = undefined;
       continue;
     }
@@ -8763,6 +8778,7 @@ function agentActivity(events: string[]): AgentActivity {
         continue;
       }
       running = false;
+      streaming = false;
       retry = undefined;
       error = message === 'Request was aborted' ? 'Operation aborted' : message;
       continue;
@@ -8776,6 +8792,7 @@ function agentActivity(events: string[]): AgentActivity {
     const type = typeof data.type === 'string' ? data.type : '';
     if (type === 'agent_start') {
       running = true;
+      streaming = true;
       error = undefined;
       retry = undefined;
       text = '';
@@ -8786,11 +8803,16 @@ function agentActivity(events: string[]): AgentActivity {
     }
     if (type === 'agent_end') {
       running = data.willRetry === true;
+      streaming = false;
       if (running) error = undefined;
       else retry = undefined;
       continue;
     }
-    if (['message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'compaction_start'].includes(type)) running = true;
+    if (['message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end'].includes(type)) {
+      running = true;
+      streaming = true;
+    }
+    if (['auto_retry_start', 'compaction_start'].includes(type)) running = true;
     if (type === 'message_update') {
       const event = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
       if (event.type === 'text_delta' && typeof event.delta === 'string') text += event.delta;
@@ -8826,14 +8848,17 @@ function agentActivity(events: string[]): AgentActivity {
     if (type === 'auto_retry_end') {
       retry = undefined;
       notices.push(data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`);
-      if (data.success !== true) running = false;
+      if (data.success !== true) {
+        running = false;
+        streaming = false;
+      }
       continue;
     }
     if (type === 'compaction_start') notices.push('compacting context');
     if (type === 'compaction_end') notices.push(data.aborted ? 'compaction aborted' : 'compaction finished');
   }
 
-  return { running, error, text, thinking, tools: [...tools.values()], notices, retry };
+  return { running, streaming, error, text, thinking, tools: [...tools.values()], notices, retry };
 }
 
 function toolActivitySummary(data: Record<string, unknown>) {

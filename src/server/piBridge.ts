@@ -18,6 +18,7 @@ type WebSocket = {
 
 type TreeSummaryOptions = { mode?: 'none' | 'summary' | 'custom'; instructions?: string; replace?: boolean };
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+type StreamingBehavior = 'steer' | 'followUp';
 
 interface PromptBody {
   sessionId?: string;
@@ -29,6 +30,7 @@ interface PromptBody {
   thinking?: string;
   attachments?: string[];
   mirrorActiveStream?: boolean;
+  streamingBehavior?: StreamingBehavior;
 }
 
 interface NavigateTreeBody {
@@ -254,6 +256,7 @@ export class PiBridge {
   async prompt(projectPath: string, body: PromptBody, key: string | string[], options: PromptRunOptions = {}) {
     let markSessionIdle: () => void = () => undefined;
     let subscription: (() => void) | undefined;
+    let queuedStreamingPrompt = false;
     let preflightReported = false;
     const reportPreflight = (success: boolean, error?: unknown) => {
       if (preflightReported) return;
@@ -266,14 +269,40 @@ export class PiBridge {
       const session = await this.getSession(projectPath, body.sessionId);
       await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       const extensionCommand = this.isExtensionCommandPrompt(session, body.prompt);
-      if (!extensionCommand && (sessionLock.wasActive || this.cachedSessionInUse(session))) {
+      const sessionBusy = sessionLock.wasActive || this.cachedSessionInUse(session);
+      if (extensionCommand && sessionBusy) {
+        const error = new Error('Agent is already processing. Extension commands cannot be queued while streaming.');
+        reportPreflight(false, error);
+        throw error;
+      }
+      if (body.streamingBehavior && (body.treeTargetId || body.treeSummary || 'branchFromId' in body)) {
+        const error = new Error('Streaming behavior cannot be combined with tree navigation or branching.');
+        reportPreflight(false, error);
+        throw error;
+      }
+      const requestedStreamingBehavior = extensionCommand ? undefined : body.streamingBehavior;
+      if (requestedStreamingBehavior && typeof session?.prompt !== 'function') {
+        const error = new Error('Loaded pi SDK session does not support streamingBehavior');
+        reportPreflight(false, error);
+        throw error;
+      }
+      let streamingBehavior = requestedStreamingBehavior;
+      if (requestedStreamingBehavior) {
+        if (this.cachedSessionIsStreaming(session)) queuedStreamingPrompt = true;
+        else if (sessionBusy) {
+          const error = new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
+          reportPreflight(false, error);
+          throw error;
+        } else streamingBehavior = undefined;
+      }
+      if (!extensionCommand && !queuedStreamingPrompt && sessionBusy) {
         const error = new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
         reportPreflight(false, error);
         throw error;
       }
       const lifecycle = { started: false, finished: false };
-      subscription = this.subscribeSessionEvents(session, key, body.sessionId, { mirrorLifecycle: extensionCommand, lifecycle });
-      const useSyntheticStart = (options.startEvent ?? true) && !extensionCommand;
+      subscription = queuedStreamingPrompt ? undefined : this.subscribeSessionEvents(session, key, body.sessionId, { mirrorLifecycle: extensionCommand, lifecycle });
+      const useSyntheticStart = (options.startEvent ?? true) && !extensionCommand && !queuedStreamingPrompt;
       if (useSyntheticStart) this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
 
       if (body.treeTargetId) {
@@ -297,6 +326,7 @@ export class PiBridge {
       if (typeof session?.prompt === 'function') {
         await session.prompt(prompt, {
           source: 'rpc',
+          streamingBehavior,
           preflightResult: (success: boolean) => {
             if (success) reportPreflight(true);
           },
@@ -312,7 +342,7 @@ export class PiBridge {
       if (extensionCommand) await this.waitForCommandActivity(session, lifecycle);
       subscription?.();
       subscription = undefined;
-      const needsSyntheticFinish = !extensionCommand || (!lifecycle.started && options.startEvent === false);
+      const needsSyntheticFinish = !queuedStreamingPrompt && (!extensionCommand || (!lifecycle.started && options.startEvent === false));
       if (needsSyntheticFinish) this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
       else if (lifecycle.started && !lifecycle.finished && !this.cachedSessionInUse(session)) {
         this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
@@ -321,12 +351,12 @@ export class PiBridge {
       subscription?.();
       if (!preflightReported) reportPreflight(false, error);
       const message = error instanceof Error ? error.message : 'Agent failed';
-      this.broadcast(key, isAgentAlreadyProcessingMessage(message)
+      this.broadcast(key, isAgentAlreadyProcessingMessage(message) || queuedStreamingPrompt
         ? { type: 'agent:notice', sessionId: body.sessionId, message, data: { level: 'warning' } }
         : { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
-      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      if (!queuedStreamingPrompt) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
       markSessionIdle();
     }
   }
@@ -336,9 +366,11 @@ export class PiBridge {
     let markSessionIdle: () => void = () => undefined;
     let subscription: (() => void) | undefined;
     try {
-      markSessionIdle = await this.markSessionActive(projectPath, body.sessionId);
-      this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
+      const sessionLock = await this.markSessionActiveWithState(projectPath, body.sessionId);
+      markSessionIdle = sessionLock.release;
       const session = await this.getSession(projectPath, body.sessionId);
+      if (sessionLock.wasActive || this.cachedSessionInUse(session)) throw new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
+      this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
       await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       subscription = typeof session?.subscribe === 'function'
         ? session.subscribe((event: unknown) => this.broadcast(key, { type: 'agent:event', sessionId: body.sessionId, data: event }))
@@ -355,7 +387,10 @@ export class PiBridge {
       return result ?? { cancelled: false };
     } catch (error) {
       subscription?.();
-      this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Tree navigation failed' });
+      const message = error instanceof Error ? error.message : 'Tree navigation failed';
+      this.broadcast(key, isAgentAlreadyProcessingMessage(message)
+        ? { type: 'agent:notice', sessionId: body.sessionId, message, data: { level: 'warning' } }
+        : { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
       this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
@@ -1278,8 +1313,11 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
 
   app.post<{ Params: { projectId: string }; Body: PromptBody }>('/api/projects/:projectId/agent/prompt', async (request, reply) => {
     if (!request.body?.prompt?.trim()) return reply.code(400).send({ error: 'Missing prompt' });
+    if (request.body.streamingBehavior && request.body.streamingBehavior !== 'steer' && request.body.streamingBehavior !== 'followUp') return reply.code(400).send({ error: 'Invalid streaming behavior' });
+    if (request.body.streamingBehavior && (request.body.treeTargetId || request.body.treeSummary || 'branchFromId' in request.body)) return reply.code(400).send({ error: 'Streaming behavior cannot be combined with tree navigation or branching' });
     try {
       const project = registry.get(request.params.projectId);
+      if (request.body.treeTargetId && request.body.sessionId && await bridge.isSessionActive(project.path, request.body.sessionId)) return reply.code(409).send({ error: AGENT_ALREADY_PROCESSING_MESSAGE });
       const key = streamKey(project.id, request.body.sessionId);
       const streamTarget = request.body.mirrorActiveStream && request.body.sessionId
         ? [key, streamKey(project.id, undefined)]
@@ -1358,7 +1396,8 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
       const project = registry.get(request.params.projectId);
       return await bridge.navigateTree(project.path, request.body, streamKey(project.id, request.body.sessionId));
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Tree navigation failed' });
+      const message = error instanceof Error ? error.message : 'Tree navigation failed';
+      return reply.code(isAgentAlreadyProcessingMessage(message) ? 409 : 400).send({ error: message });
     }
   });
 
