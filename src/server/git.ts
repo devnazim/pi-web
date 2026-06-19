@@ -252,7 +252,7 @@ async function gitFileDiff(cwd: string, filePath: string, staged = false) {
     };
   }
   const metadataPatch = await gitDiff(cwd, filePath, staged, patchOldPath).catch(() => '');
-  if (metadataPatch.trim() && original.content !== modified.content && patchIncludesInlineMetadataChange(metadataPatch)) {
+  if (metadataPatch.trim() && original.content !== modified.content && patchNeedsPatchPreview(metadataPatch)) {
     return {
       path: filePath,
       staged,
@@ -263,7 +263,7 @@ async function gitFileDiff(cwd: string, filePath: string, staged = false) {
     };
   }
   const untrackedPatch = !staged && file?.status.includes('?') ? await untrackedFilePatch(cwd, filePath, modified.content) : '';
-  if (untrackedPatch && original.content !== modified.content && patchIncludesInlineMetadataChange(untrackedPatch)) {
+  if (untrackedPatch && original.content !== modified.content && patchNeedsPatchPreview(untrackedPatch)) {
     return {
       path: filePath,
       staged,
@@ -345,8 +345,12 @@ async function untrackedFilePatch(cwd: string, filePath: string, content: string
   return `diff --git a/${patchPath} b/${patchPath}\nnew file mode ${mode}\n--- /dev/null\n+++ b/${patchPath}\n@@ -0,0 +1,${lines.length} @@\n${body}${noNewline}\n`;
 }
 
-function patchIncludesInlineMetadataChange(patch: string) {
-  return /^(old mode|new mode|new file mode|deleted file mode|similarity index|dissimilarity index|rename from|rename to|copy from|copy to) /m.test(patch);
+function patchNeedsPatchPreview(patch: string) {
+  const metadataLines = patch
+    .split('\n')
+    .filter((line) => /^(old mode|new mode|new file mode|deleted file mode|similarity index|dissimilarity index|rename from|rename to|copy from|copy to) /.test(line));
+
+  return metadataLines.some((line) => line !== 'new file mode 100644');
 }
 
 function textContent(content: Buffer) {
