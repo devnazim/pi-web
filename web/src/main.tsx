@@ -216,6 +216,7 @@ type AgentToolActivity = { id: string; name: string; status: 'running' | 'done' 
 type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
 type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
+type AgentServerEvent = { type?: string; message?: string; data?: unknown };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean };
 type SessionComposerControls = { model?: string; thinking?: ThinkingLevel | '' };
 type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; model?: string; thinking?: ThinkingLevel | '' };
@@ -602,6 +603,8 @@ function Shell() {
   const [sessionId, setSessionId] = createSignal<string | undefined>(initialActiveSessionId);
   const [sessionWorkspaceId, setSessionWorkspaceId] = createSignal<string>();
   const [events, setEvents] = createSignal<string[]>([]);
+  const [liveAgentActivity, setLiveAgentActivity] = createSignal<AgentActivity>(emptyAgentActivity());
+  const [liveShellActivity, setLiveShellActivity] = createSignal<BashActivity>(emptyBashActivity());
   const [extensionUiRequests, setExtensionUiRequests] = createSignal<Record<string, ExtensionUiRequest>>({});
   const settledExtensionUiRequestIds = new Set<string>();
   const [toolPanel, setToolPanel] = createSignal<ToolPanel>();
@@ -764,6 +767,7 @@ function Shell() {
       pendingEventPayloads = [];
       pendingEventsFrame = undefined;
       setEvents((items) => [...items, ...payloads].slice(-240));
+      applyLiveEventPayloads(payloads);
     });
   }
 
@@ -774,6 +778,20 @@ function Shell() {
       pendingEventsFrame = undefined;
     }
     setEvents(payloads);
+    applyLiveEventPayloads(payloads, true);
+  }
+
+  function applyLiveEventPayloads(payloads: string[], reset = false) {
+    let nextAgentActivity = reset ? emptyAgentActivity() : untrack(liveAgentActivity);
+    let nextShellActivity = reset ? emptyBashActivity() : untrack(liveShellActivity);
+    for (const payload of payloads) {
+      const parsed = parseAgentServerEvent(payload);
+      if (!parsed) continue;
+      nextAgentActivity = reduceAgentActivityEvent(nextAgentActivity, parsed);
+      nextShellActivity = reduceBashActivityEvent(nextShellActivity, parsed);
+    }
+    setLiveAgentActivity(nextAgentActivity);
+    setLiveShellActivity(nextShellActivity);
   }
 
   function upsertExtensionUiRequest(request: ExtensionUiRequest) {
@@ -1980,7 +1998,7 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} events={events()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} events={events()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -4346,7 +4364,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -4485,14 +4503,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
                     class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
                     style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
                   >
-                    <Chat project={project()} sessionId={props.sessionId} events={props.events} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
+                    <Chat project={project()} sessionId={props.sessionId} events={props.events} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                     <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
                 <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} events={props.events} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
+                  <Chat project={project()} sessionId={props.sessionId} events={props.events} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
                   <div
                     class="terminal-resize-handle"
                     role="separator"
@@ -4524,7 +4542,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
   );
 }
 
-function Chat(props: { project: Project; sessionId?: string; events: string[]; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; events: string[]; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
@@ -4655,8 +4673,8 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; e
   const activeSearchEntryId = createMemo(() => chatSearchMatches()[activeSearchIndex()]?.id);
   const filteredSlashCommands = createMemo(() => filterSlashCommands(slashCommands.data?.commands ?? [], slashCommandMention()?.query ?? ''));
   const commandCompletionOptions = createMemo(() => commandCompletions.data?.completions ?? []);
-  const liveActivity = createMemo(() => agentActivity(props.events));
-  const liveShellActivity = createMemo(() => bashActivity(props.events));
+  const liveActivity = () => props.liveActivity;
+  const liveShellActivity = () => props.liveShellActivity;
   const visibleExtensionUiRequests = createMemo(() => {
     const sessionId = props.sessionId ?? commandSessionId();
     return props.extensionUiRequests.filter((request) => sessionId ? request.sessionId === sessionId : !request.sessionId);
@@ -8583,7 +8601,7 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
     <Show when={props.activity.running || error() || props.activity.notices.length}>
       <div class="live-agent">
         <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
-        <Show when={props.activity.text.trim()}><div class="assistant-message assistant-message-live"><MarkdownContent text={props.activity.text} syntaxTheme={props.syntaxTheme} /></div></Show>
+        <Show when={props.activity.text.trim()}><LiveAgentText text={props.activity.text} running={props.activity.streaming} syntaxTheme={props.syntaxTheme} /></Show>
         <Show when={!props.hideThinking && props.activity.thinking.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{props.activity.thinking}</div></Collapsible></Show>
         <Show when={(props.toolOutputMode !== 'hidden' && props.activity.tools.length) || props.activity.notices.length}>
           <div class="live-agent-tools">
@@ -8595,6 +8613,16 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
         </Show>
       </div>
     </Show>
+  );
+}
+
+function LiveAgentText(props: { text: string; running: boolean; syntaxTheme: ShikiSyntaxTheme }) {
+  return (
+    <div class="assistant-message assistant-message-live">
+      <Show when={props.running} fallback={<MarkdownContent text={props.text} syntaxTheme={props.syntaxTheme} />}>
+        <div class="whitespace-pre-wrap break-words">{props.text}</div>
+      </Show>
+    </div>
   );
 }
 
@@ -8709,156 +8737,88 @@ function isExtensionUiRequestMethod(value: unknown): value is ExtensionUiRequest
   return value === 'select' || value === 'confirm' || value === 'input' || value === 'editor';
 }
 
-function bashActivity(events: string[]): BashActivity {
-  let running = false;
-  let error: string | undefined;
-  let command: string | undefined;
-  let output = '';
-  for (const raw of events) {
-    let parsed: { type?: string; message?: string } = {};
-    try { parsed = JSON.parse(raw); } catch { continue; }
-    if (parsed.type === 'bash:start') {
-      running = true;
-      error = undefined;
-      command = parsed.message;
-      output = '';
-      continue;
-    }
-    if (parsed.type === 'bash:update') {
-      output += parsed.message ?? '';
-      continue;
-    }
-    if (parsed.type === 'bash:finish') {
-      running = false;
-      command = parsed.message ?? command;
-      continue;
-    }
-    if (parsed.type === 'bash:error') {
-      running = false;
-      error = parsed.message ?? 'Shell command failed';
-    }
-  }
-  return { running, error, command, output };
+function emptyBashActivity(): BashActivity {
+  return { running: false, output: '' };
 }
 
-function agentActivity(events: string[]): AgentActivity {
-  let running = false;
-  let streaming = false;
-  let error: string | undefined;
-  let retry: AgentRetryActivity | undefined;
-  let text = '';
-  let thinking = '';
-  const tools = new Map<string, AgentToolActivity>();
-  const notices: string[] = [];
+function emptyAgentActivity(): AgentActivity {
+  return { running: false, streaming: false, text: '', thinking: '', tools: [], notices: [] };
+}
 
-  for (const raw of events) {
-    let parsed: { type?: string; message?: string; data?: unknown } = {};
-    try { parsed = JSON.parse(raw); } catch { continue; }
-    if (parsed.type === 'agent:start') {
-      running = true;
-      streaming = false;
-      error = undefined;
-      retry = undefined;
-      text = '';
-      thinking = '';
-      tools.clear();
-      notices.length = 0;
-      continue;
-    }
-    if (parsed.type === 'agent:finish') {
-      running = false;
-      streaming = false;
-      retry = undefined;
-      continue;
-    }
-    if (parsed.type === 'agent:error' || parsed.type === 'error') {
-      const message = parsed.message ?? 'Agent failed';
-      if (/already processing/i.test(message) && running) {
-        notices.push(message);
-        continue;
-      }
-      running = false;
-      streaming = false;
-      retry = undefined;
-      error = message === 'Request was aborted' ? 'Operation aborted' : message;
-      continue;
-    }
-    if (parsed.type === 'agent:notice') {
-      notices.push(parsed.message ?? 'notice');
-      continue;
-    }
-    if (parsed.type !== 'agent:event' || !parsed.data || typeof parsed.data !== 'object') continue;
-    const data = parsed.data as Record<string, unknown>;
-    const type = typeof data.type === 'string' ? data.type : '';
-    if (type === 'agent_start') {
-      running = true;
-      streaming = true;
-      error = undefined;
-      retry = undefined;
-      text = '';
-      thinking = '';
-      tools.clear();
-      notices.length = 0;
-      continue;
-    }
-    if (type === 'agent_end') {
-      running = data.willRetry === true;
-      streaming = false;
-      if (running) error = undefined;
-      else retry = undefined;
-      continue;
-    }
-    if (['message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end'].includes(type)) {
-      running = true;
-      streaming = true;
-    }
-    if (['auto_retry_start', 'compaction_start'].includes(type)) running = true;
-    if (type === 'message_update') {
-      const event = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
-      if (event.type === 'text_delta' && typeof event.delta === 'string') text += event.delta;
-      if (event.type === 'thinking_delta' && typeof event.delta === 'string') thinking += event.delta;
-      if (event.type === 'text_end' && !text && typeof event.content === 'string') text = event.content;
-      if (event.type === 'thinking_end' && !thinking && typeof event.content === 'string') thinking = event.content;
-      continue;
-    }
-    if (type === 'tool_execution_start' || type === 'tool_execution_update' || type === 'tool_execution_end') {
-      const id = String(data.toolCallId ?? data.toolName ?? tools.size);
-      const name = String(data.toolName ?? 'tool');
-      const existing = tools.get(id);
-      tools.set(id, {
-        id,
-        name,
-        status: type === 'tool_execution_end' ? (data.isError ? 'error' : 'done') : 'running',
-        summary: toolActivitySummary(data) ?? existing?.summary,
-      });
-      continue;
-    }
-    if (type === 'notice') notices.push(String(data.message ?? 'notice'));
-    if (type === 'auto_retry_start') {
-      const attempt = typeof data.attempt === 'number' && Number.isFinite(data.attempt) ? data.attempt : undefined;
-      const maxAttempts = typeof data.maxAttempts === 'number' && Number.isFinite(data.maxAttempts) ? data.maxAttempts : undefined;
-      const delayMs = typeof data.delayMs === 'number' && Number.isFinite(data.delayMs) ? data.delayMs : undefined;
-      const errorMessage = String(data.errorMessage ?? 'provider error');
-      const attemptText = attempt && maxAttempts ? ` (${attempt}/${maxAttempts})` : attempt ? ` (${attempt})` : '';
-      const delayText = delayMs ? ` in ${Math.ceil(delayMs / 1000)}s` : '';
-      retry = { attempt, maxAttempts, delayMs, errorMessage };
-      notices.push(`retrying${attemptText}${delayText} after ${errorMessage}`);
-      continue;
-    }
-    if (type === 'auto_retry_end') {
-      retry = undefined;
-      notices.push(data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`);
-      if (data.success !== true) {
-        running = false;
-        streaming = false;
-      }
-      continue;
-    }
-    if (type === 'compaction_start') notices.push('compacting context');
-    if (type === 'compaction_end') notices.push(data.aborted ? 'compaction aborted' : 'compaction finished');
+function parseAgentServerEvent(raw: string): AgentServerEvent | undefined {
+  try {
+    return JSON.parse(raw) as AgentServerEvent;
+  } catch {
+    return undefined;
   }
+}
 
-  return { running, streaming, error, text, thinking, tools: [...tools.values()], notices, retry };
+function reduceBashActivityEvent(activity: BashActivity, event: AgentServerEvent): BashActivity {
+  if (event.type === 'bash:start') return { running: true, command: event.message, output: '' };
+  if (event.type === 'bash:update') return { ...activity, output: activity.output + (event.message ?? '') };
+  if (event.type === 'bash:finish') return { ...activity, running: false, command: event.message ?? activity.command };
+  if (event.type === 'bash:error') return { ...activity, running: false, error: event.message ?? 'Shell command failed' };
+  return activity;
+}
+
+function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEvent): AgentActivity {
+  if (event.type === 'agent:start') return { ...emptyAgentActivity(), running: true };
+  if (event.type === 'agent:finish') return { ...activity, running: false, streaming: false, retry: undefined };
+  if (event.type === 'agent:error' || event.type === 'error') {
+    const message = event.message ?? 'Agent failed';
+    if (/already processing/i.test(message) && activity.running) return { ...activity, notices: [...activity.notices, message] };
+    return { ...activity, running: false, streaming: false, retry: undefined, error: message === 'Request was aborted' ? 'Operation aborted' : message };
+  }
+  if (event.type === 'agent:notice') return { ...activity, notices: [...activity.notices, event.message ?? 'notice'] };
+  if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return activity;
+
+  const data = event.data as Record<string, unknown>;
+  const type = typeof data.type === 'string' ? data.type : '';
+  if (type === 'agent_start') return { ...emptyAgentActivity(), running: true, streaming: true };
+  if (type === 'agent_end') {
+    const running = data.willRetry === true;
+    return { ...activity, running, streaming: false, error: running ? undefined : activity.error, retry: running ? activity.retry : undefined };
+  }
+  if (type === 'message_update') {
+    const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
+    let text = activity.text;
+    let thinking = activity.thinking;
+    if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') text += messageEvent.delta;
+    if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string') thinking += messageEvent.delta;
+    if (messageEvent.type === 'text_end' && !text && typeof messageEvent.content === 'string') text = messageEvent.content;
+    if (messageEvent.type === 'thinking_end' && !thinking && typeof messageEvent.content === 'string') thinking = messageEvent.content;
+    return { ...activity, running: true, streaming: true, text, thinking };
+  }
+  if (type === 'tool_execution_start' || type === 'tool_execution_update' || type === 'tool_execution_end') {
+    const tools = new Map(activity.tools.map((tool) => [tool.id, tool]));
+    const id = String(data.toolCallId ?? data.toolName ?? tools.size);
+    const name = String(data.toolName ?? 'tool');
+    const existing = tools.get(id);
+    tools.set(id, {
+      id,
+      name,
+      status: type === 'tool_execution_end' ? (data.isError ? 'error' : 'done') : 'running',
+      summary: toolActivitySummary(data) ?? existing?.summary,
+    });
+    return { ...activity, running: true, streaming: true, tools: [...tools.values()] };
+  }
+  if (type === 'notice') return { ...activity, notices: [...activity.notices, String(data.message ?? 'notice')] };
+  if (type === 'auto_retry_start') {
+    const attempt = typeof data.attempt === 'number' && Number.isFinite(data.attempt) ? data.attempt : undefined;
+    const maxAttempts = typeof data.maxAttempts === 'number' && Number.isFinite(data.maxAttempts) ? data.maxAttempts : undefined;
+    const delayMs = typeof data.delayMs === 'number' && Number.isFinite(data.delayMs) ? data.delayMs : undefined;
+    const errorMessage = String(data.errorMessage ?? 'provider error');
+    const attemptText = attempt && maxAttempts ? ` (${attempt}/${maxAttempts})` : attempt ? ` (${attempt})` : '';
+    const delayText = delayMs ? ` in ${Math.ceil(delayMs / 1000)}s` : '';
+    return { ...activity, running: true, retry: { attempt, maxAttempts, delayMs, errorMessage }, notices: [...activity.notices, `retrying${attemptText}${delayText} after ${errorMessage}`] };
+  }
+  if (type === 'auto_retry_end') {
+    const failed = data.success !== true;
+    return { ...activity, retry: undefined, notices: [...activity.notices, data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`], running: failed ? false : activity.running, streaming: failed ? false : activity.streaming };
+  }
+  if (type === 'compaction_start') return { ...activity, running: true, notices: [...activity.notices, 'compacting context'] };
+  if (type === 'compaction_end') return { ...activity, notices: [...activity.notices, data.aborted ? 'compaction aborted' : 'compaction finished'] };
+  return activity;
 }
 
 function toolActivitySummary(data: Record<string, unknown>) {
