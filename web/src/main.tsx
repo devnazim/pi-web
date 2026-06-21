@@ -219,7 +219,7 @@ type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: nu
 type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
 type AgentServerEvent = { type?: string; message?: string; data?: unknown };
-type SelectOption = { value: string; label: JSX.Element; disabled?: boolean };
+type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
 type SessionComposerControls = { model?: string; thinking?: ThinkingLevel | '' };
 type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; model?: string; thinking?: ThinkingLevel | '' };
 type ChatSearchState = { activeIndex: number; total: number };
@@ -3756,23 +3756,42 @@ function NotificationVolumeControl(props: { value: number; onChange: (volume: nu
   );
 }
 
-function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean }) {
+function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean; searchable?: boolean }) {
   const [open, setOpen] = createSignal(false);
+  const [search, setSearch] = createSignal('');
   const [activeIndex, setActiveIndex] = createSignal(0);
   const [position, setPosition] = createSignal({ left: 0, top: 0, width: 0, maxHeight: 260, placement: 'bottom' as 'top' | 'bottom' });
   let triggerRef: HTMLButtonElement | undefined;
   let contentRef: HTMLDivElement | undefined;
+  let searchRef: HTMLInputElement | undefined;
 
   const selected = createMemo(() => props.options.find((option) => option.value === props.value));
+  const filteredOptions = createMemo(() => {
+    const query = normalizedSearchQuery(search());
+    if (!props.searchable || !query) return props.options;
+    return props.options.filter((option) => {
+      const label = option.label;
+      const labelText = typeof label === 'string' || typeof label === 'number'
+        ? String(label)
+        : Array.isArray(label)
+          ? label.map((part) => typeof part === 'string' || typeof part === 'number' ? String(part) : '').join(' ')
+          : '';
+      return [option.value, option.searchText, labelText].filter(Boolean).join(' ').toLowerCase().includes(query);
+    });
+  });
 
-  function firstEnabledIndex() {
-    const index = props.options.findIndex((option) => !option.disabled);
+  function firstEnabledIndex(options = filteredOptions()) {
+    const index = options.findIndex((option) => !option.disabled);
     return index >= 0 ? index : 0;
   }
 
-  function selectedIndex() {
-    const index = props.options.findIndex((option) => option.value === props.value && !option.disabled);
-    return index >= 0 ? index : firstEnabledIndex();
+  function lastEnabledIndex(options = filteredOptions()) {
+    return Math.max(options.map((option, index) => option.disabled ? -1 : index).reduce((max, index) => Math.max(max, index), -1), 0);
+  }
+
+  function selectedIndex(options = filteredOptions()) {
+    const index = options.findIndex((option) => option.value === props.value && !option.disabled);
+    return index >= 0 ? index : firstEnabledIndex(options);
   }
 
   function updatePosition() {
@@ -3801,36 +3820,58 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
     });
   }
 
+  function focusSearch() {
+    if (props.searchable) searchRef?.focus();
+  }
+
+  function closeMenu(focusTrigger = false) {
+    setOpen(false);
+    setSearch('');
+    if (focusTrigger) triggerRef?.focus();
+  }
+
   function openMenu() {
+    setSearch('');
     setActiveIndex(selectedIndex());
     setOpen(true);
-    queueMicrotask(updatePosition);
-    requestAnimationFrame(updatePosition);
+    queueMicrotask(() => {
+      updatePosition();
+      focusSearch();
+    });
+    requestAnimationFrame(() => {
+      updatePosition();
+      focusSearch();
+    });
   }
 
   function chooseOption(option: SelectOption) {
     if (option.disabled) return;
     props.onChange(option.value);
-    setOpen(false);
-    triggerRef?.focus();
+    closeMenu(true);
   }
 
   function moveActive(delta: number) {
-    if (!props.options.length) return;
+    const options = filteredOptions();
+    if (!options.length) return;
     let next = activeIndex();
-    for (let step = 0; step < props.options.length; step += 1) {
-      next = (next + delta + props.options.length) % props.options.length;
-      if (!props.options[next].disabled) {
+    for (let step = 0; step < options.length; step += 1) {
+      next = (next + delta + options.length) % options.length;
+      if (!options[next].disabled) {
         setActiveIndex(next);
         return;
       }
     }
   }
 
+  function chooseActiveOption() {
+    const option = filteredOptions()[activeIndex()];
+    if (option) chooseOption(option);
+  }
+
   function handleKeyDown(event: KeyboardEvent) {
     if (event.key === 'Escape') {
       if (open()) event.preventDefault();
-      setOpen(false);
+      closeMenu();
       return;
     }
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -3842,7 +3883,14 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
     if (event.key === 'Home' || event.key === 'End') {
       event.preventDefault();
       if (!open()) openMenu();
-      setActiveIndex(event.key === 'Home' ? firstEnabledIndex() : Math.max(props.options.map((option, index) => option.disabled ? -1 : index).reduce((max, index) => Math.max(max, index), -1), 0));
+      setActiveIndex(event.key === 'Home' ? firstEnabledIndex() : lastEnabledIndex());
+      return;
+    }
+    if (props.searchable && event.key.length === 1 && event.key !== ' ' && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      event.preventDefault();
+      if (!open()) openMenu();
+      setSearch((current) => `${current}${event.key}`);
+      queueMicrotask(focusSearch);
       return;
     }
     if (event.key === 'Enter' || event.key === ' ') {
@@ -3851,24 +3899,48 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
         openMenu();
         return;
       }
-      const option = props.options[activeIndex()];
-      if (option) chooseOption(option);
+      chooseActiveOption();
+    }
+  }
+
+  function handleSearchKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeMenu(true);
+      return;
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      moveActive(event.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      chooseActiveOption();
     }
   }
 
   createEffect(() => {
     if (!open()) return;
-    setActiveIndex(selectedIndex());
+    const options = filteredOptions();
+    setActiveIndex(selectedIndex(options));
     updatePosition();
     requestAnimationFrame(updatePosition);
+  });
+
+  createEffect(() => {
+    if (!open()) {
+      setSearch('');
+      return;
+    }
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) {
-        setOpen(false);
+        closeMenu();
         return;
       }
       if (triggerRef?.contains(target) || contentRef?.contains(target)) return;
-      setOpen(false);
+      closeMenu();
     };
     window.addEventListener('pointerdown', onPointerDown, true);
     window.addEventListener('resize', updatePosition);
@@ -3891,7 +3963,7 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
         aria-haspopup="listbox"
         aria-label={props.ariaLabel}
         disabled={props.disabled}
-        onClick={() => open() ? setOpen(false) : openMenu()}
+        onClick={() => open() ? closeMenu() : openMenu()}
         onKeyDown={handleKeyDown}
       >
         <span class="select-value">{selected()?.label ?? props.placeholder ?? 'Select'}</span>
@@ -3909,25 +3981,46 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
               'max-height': `${position().maxHeight}px`,
               transform: position().placement === 'top' ? 'translateY(-100%)' : '',
             }}
-            role="listbox"
           >
-            <For each={props.options}>
-              {(option, index) => (
-                <button
-                  type="button"
-                  role="option"
-                  aria-selected={option.value === props.value}
-                  disabled={option.disabled}
-                  class={`select-item ${activeIndex() === index() ? 'select-item-active' : ''} ${option.value === props.value ? 'select-item-selected' : ''}`}
-                  onMouseEnter={() => !option.disabled && setActiveIndex(index())}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => chooseOption(option)}
-                >
-                  <span class="min-w-0 flex-1 truncate">{option.label}</span>
-                  <Show when={option.value === props.value}><Check class="size-4" /></Show>
-                </button>
-              )}
-            </For>
+            <Show when={props.searchable}>
+              <div class="select-search">
+                <Search class="size-3.5 text-muted-foreground" />
+                <input
+                  ref={searchRef}
+                  class="select-search-input"
+                  role="searchbox"
+                  aria-label={`Search ${props.ariaLabel ?? 'options'}`}
+                  placeholder="Search..."
+                  value={search()}
+                  onInput={(event) => setSearch(event.currentTarget.value)}
+                  onKeyDown={handleSearchKeyDown}
+                />
+                <Show when={search()}>
+                  <button type="button" class="select-search-clear" aria-label="Clear search" onMouseDown={(event) => event.preventDefault()} onClick={() => { setSearch(''); searchRef?.focus(); }}><X class="size-3.5" /></button>
+                </Show>
+              </div>
+            </Show>
+            <div role="listbox">
+              <Show when={filteredOptions().length > 0} fallback={<div class="select-empty">No matching options</div>}>
+                <For each={filteredOptions()}>
+                  {(option, index) => (
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={option.value === props.value}
+                      disabled={option.disabled}
+                      class={`select-item ${activeIndex() === index() ? 'select-item-active' : ''} ${option.value === props.value ? 'select-item-selected' : ''}`}
+                      onMouseEnter={() => !option.disabled && setActiveIndex(index())}
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => chooseOption(option)}
+                    >
+                      <span class="min-w-0 flex-1 truncate">{option.label}</span>
+                      <Show when={option.value === props.value}><Check class="size-4" /></Show>
+                    </button>
+                  )}
+                </For>
+              </Show>
+            </div>
           </div>
         </Portal>
       </Show>
@@ -5928,7 +6021,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
           <div class="composer-toolbar flex h-12 min-w-0 flex-nowrap items-center gap-1.5 border-t border-border px-3 text-sm max-xl:h-auto max-xl:py-2 max-md:gap-y-2">
             <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files"><Plus class="size-4" /><input class="hidden" type="file" multiple accept="image/*,video/*,.txt,.md,.pdf" onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files).catch((error) => console.error('Could not attach files', error)); }} /></label>
             <button class={`ghost h-8 w-8 px-0 md:hidden ${mobileStatusOpen() ? 'bg-muted text-foreground' : ''}`} type="button" title={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-label={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-expanded={mobileStatusOpen()} onClick={() => setMobileStatusOpen((open) => !open)}><Activity class="size-4" /></button>
-            <UiSelect compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} options={modelOptions()} ariaLabel="Model" />
+            <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} options={modelOptions()} ariaLabel="Model" />
             <UiSelect
               compact
               class="composer-thinking-select"
