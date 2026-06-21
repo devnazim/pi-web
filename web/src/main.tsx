@@ -40,6 +40,8 @@ import {
   Home,
   LoaderCircle,
   MessageSquare,
+  Mic,
+  MicOff,
   Minus,
   Package,
   Palette,
@@ -229,6 +231,23 @@ type WorkspaceNotificationItem = { id: string; workspaceId: string; sessionId?: 
 type WorkspaceNotificationState = { items: WorkspaceNotificationItem[]; runningSessionIds: string[] };
 type WorkspaceNotificationSummary = { total: number; unread: number; running: number; error: boolean; latest?: WorkspaceNotificationItem };
 type WorkspaceLookupEntry = { workspace: ProjectWorkspace; project: Project; rootProject: Project };
+type BrowserSpeechRecognitionAlternative = { transcript: string };
+type BrowserSpeechRecognitionResult = { isFinal: boolean; [index: number]: BrowserSpeechRecognitionAlternative | undefined };
+type BrowserSpeechRecognitionEvent = { resultIndex: number; results: ArrayLike<BrowserSpeechRecognitionResult> };
+type BrowserSpeechRecognitionErrorEvent = { error?: string; message?: string };
+type BrowserSpeechRecognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onstart: (() => void) | null;
+  onend: (() => void) | null;
+  onresult: ((event: BrowserSpeechRecognitionEvent) => void) | null;
+  onerror: ((event: BrowserSpeechRecognitionErrorEvent) => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
 
 type WorkspaceNotificationServerEvent = { type?: string; projectId?: string; sessionId?: string; message?: string; data?: unknown };
 type FaviconStatus = 'idle' | 'unread' | 'running' | 'error';
@@ -428,6 +447,38 @@ const TERMINAL_SINGLE_STEP_SHORTCUT_BINDINGS: Partial<Record<string, Set<string>
   searchFiles: new Set(['mod+p']),
 };
 const [shortcutBindingsVersion, setShortcutBindingsVersion] = createSignal(0);
+
+function browserSpeechRecognitionConstructor() {
+  if (typeof window === 'undefined') return undefined;
+  const speechWindow = window as Window & typeof globalThis & { SpeechRecognition?: BrowserSpeechRecognitionConstructor; webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor };
+  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+}
+
+const VOICE_PERMISSION_DENIED_MESSAGE = 'Microphone access was denied. Allow microphone access, then try again.';
+const VOICE_TOAST_TTL_MS = 4000;
+
+function isVoicePermissionDeniedError(error: string | undefined) {
+  return error === 'not-allowed' || error === 'service-not-allowed';
+}
+
+function voiceRecognitionErrorMessage(error: string | undefined, message: string | undefined) {
+  if (isVoicePermissionDeniedError(error)) return VOICE_PERMISSION_DENIED_MESSAGE;
+  if (error === 'audio-capture') return 'No microphone was found. Check your input device, then try again.';
+  if (error === 'network') return 'Voice input needs a network connection for this browser.';
+  if (error === 'no-speech') return 'No speech was detected. Try speaking again.';
+  if (error === 'aborted') return 'Voice input was stopped.';
+  return message || 'Voice input stopped unexpectedly.';
+}
+
+function composerVoiceInsertion(value: string, start: number, end: number, transcript: string) {
+  const spoken = transcript.trim().replace(/\s+/g, ' ');
+  const before = value.slice(0, start);
+  const after = value.slice(end);
+  const leading = before && !/\s$/.test(before) && !/^[,.;:!?%)]/.test(spoken) ? ' ' : '';
+  const trailing = after && !/^\s/.test(after) && !/^[,.;:!?%)]/.test(after) ? ' ' : '';
+  const insert = `${leading}${spoken}${trailing}`;
+  return { text: `${before}${insert}${after}`, cursor: before.length + insert.length };
+}
 
 function createResizableDimension(options: {
   defaultSize: number;
@@ -4582,6 +4633,12 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
   const [extensionUiResponding, setExtensionUiResponding] = createSignal<string>();
   const [extensionUiError, setExtensionUiError] = createSignal('');
   const [sessionControlsHydratedKey, setSessionControlsHydratedKey] = createSignal<string>();
+  const [voiceListening, setVoiceListening] = createSignal(false);
+  const [voiceToast, setVoiceToast] = createSignal<{ id: number; message: string; tone: 'warning' | 'error' }>();
+  const [voicePermissionDialogOpen, setVoicePermissionDialogOpen] = createSignal(false);
+  let voiceRecognition: BrowserSpeechRecognition | undefined;
+  let voiceToastSequence = 0;
+  let voiceToastTimeout: number | undefined;
   const autocompleteSessionId = createMemo(() => props.sessionId ?? commandSessionId());
   const session = createQuery(() => ({
     queryKey: ['session', props.project.id, props.sessionId],
@@ -4681,6 +4738,12 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
   });
   const busy = createMemo(() => liveActivity().running || Boolean(runningCommand()) || visibleExtensionUiRequests().length > 0);
   const canSteerAgent = createMemo(() => liveActivity().streaming && !runningCommand() && !liveShellActivity().running && visibleExtensionUiRequests().length === 0);
+  const voiceSupported = createMemo(() => Boolean(browserSpeechRecognitionConstructor()));
+  const voiceButtonTitle = createMemo(() => {
+    if (!voiceSupported()) return 'Voice input is not supported in this browser';
+    return voiceListening() ? 'Stop voice input' : 'Dictate prompt';
+  });
+  const voiceButtonLabel = createMemo(() => voiceSupported() ? voiceListening() ? 'Stop voice input' : 'Dictate prompt' : 'Voice input is not supported in this browser');
   const composerCanSubmit = createMemo(() => {
     const prompt = text().trim();
     if (!prompt) return false;
@@ -4765,6 +4828,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
       activeComposerDraftTreeSelection = nextTreeSelection;
       return;
     }
+    stopVoiceRecognition(true);
     if (activeComposerDraftKey) saveActiveComposerDraft(activeComposerDraftKey);
     activeComposerDraftKey = nextComposerDraftKey;
 
@@ -4861,6 +4925,11 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
     const draftKey = activeComposerDraftKey;
     activeComposerDraftKey = undefined;
     saveActiveComposerDraft(draftKey);
+  });
+
+  onCleanup(() => {
+    clearVoiceToastTimer();
+    stopVoiceRecognition(true);
   });
 
   onMount(() => {
@@ -4983,6 +5052,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
 
   createEffect(() => {
     const selection = props.treeSelection;
+    stopVoiceRecognition(true);
     if (!selection) {
       restoringComposerDraftTreeSelection = undefined;
       return;
@@ -5033,6 +5103,133 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
     if (!composerHighlightsRef) return;
     composerHighlightsRef.scrollTop = target.scrollTop;
     composerHighlightsRef.scrollLeft = target.scrollLeft;
+  }
+
+  function clearVoiceToastTimer() {
+    if (voiceToastTimeout === undefined) return;
+    window.clearTimeout(voiceToastTimeout);
+    voiceToastTimeout = undefined;
+  }
+
+  function showVoiceToast(message: string, tone: 'warning' | 'error' = 'warning') {
+    clearVoiceToastTimer();
+    const id = voiceToastSequence + 1;
+    voiceToastSequence = id;
+    setVoiceToast({ id, message, tone });
+    voiceToastTimeout = window.setTimeout(() => {
+      setVoiceToast((toast) => toast?.id === id ? undefined : toast);
+      voiceToastTimeout = undefined;
+    }, VOICE_TOAST_TTL_MS);
+  }
+
+  function dismissVoiceToast() {
+    clearVoiceToastTimer();
+    setVoiceToast(undefined);
+  }
+
+  function insertVoiceTranscript(transcript: string) {
+    const target = composerRef;
+    const value = target?.value ?? text();
+    const start = target?.selectionStart ?? value.length;
+    const end = target?.selectionEnd ?? start;
+    const inserted = composerVoiceInsertion(value, start, end, transcript);
+    if (!inserted.text.trim() || inserted.text === value) return;
+    resetComposerHistory();
+    setText(inserted.text);
+    updateComposerMentions(inserted.text, inserted.cursor);
+    requestAnimationFrame(() => {
+      composerRef?.focus();
+      composerRef?.setSelectionRange(inserted.cursor, inserted.cursor);
+      syncComposerLayout();
+    });
+  }
+
+  function startVoiceRecognition() {
+    const Recognition = browserSpeechRecognitionConstructor();
+    if (!Recognition) {
+      showVoiceToast('Voice input is not supported in this browser. Try Chrome or Edge.', 'error');
+      return;
+    }
+
+    stopVoiceRecognition(true);
+    dismissVoiceToast();
+    setVoicePermissionDialogOpen(false);
+
+    const recognition = new Recognition();
+    voiceRecognition = recognition;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = navigator.language || 'en-US';
+    recognition.onstart = () => {
+      if (voiceRecognition !== recognition) return;
+      setVoiceListening(true);
+      dismissVoiceToast();
+    };
+    recognition.onend = () => {
+      if (voiceRecognition === recognition) voiceRecognition = undefined;
+      setVoiceListening(false);
+    };
+    recognition.onerror = (event) => {
+      if (voiceRecognition !== recognition) return;
+      const message = voiceRecognitionErrorMessage(event.error, event.message);
+      if (isVoicePermissionDeniedError(event.error)) {
+        setVoicePermissionDialogOpen(true);
+        return;
+      }
+      showVoiceToast(message, event.error === 'no-speech' ? 'warning' : 'error');
+    };
+    recognition.onresult = (event) => {
+      if (voiceRecognition !== recognition) return;
+      let finalTranscript = '';
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        const result = event.results[index];
+        const transcript = result?.[0]?.transcript ?? '';
+        if (result?.isFinal && transcript) finalTranscript += transcript;
+      }
+      if (finalTranscript.trim()) insertVoiceTranscript(finalTranscript);
+    };
+
+    try {
+      recognition.start();
+      setVoiceListening(true);
+    } catch (error) {
+      if (voiceRecognition === recognition) voiceRecognition = undefined;
+      setVoiceListening(false);
+      showVoiceToast(errorMessage(error, 'Could not start voice input.'), 'error');
+    }
+  }
+
+  function stopVoiceRecognition(abort = false) {
+    const recognition = voiceRecognition;
+    if (!recognition) {
+      setVoiceListening(false);
+      return;
+    }
+
+    setVoiceListening(false);
+    if (abort) {
+      voiceRecognition = undefined;
+      recognition.onstart = null;
+      recognition.onend = null;
+      recognition.onresult = null;
+      recognition.onerror = null;
+    }
+
+    try {
+      if (abort) recognition.abort();
+      else recognition.stop();
+    } catch {
+      if (voiceRecognition === recognition) voiceRecognition = undefined;
+    }
+  }
+
+  function toggleVoiceRecognition() {
+    if (voiceRecognition || voiceListening()) stopVoiceRecognition();
+    else startVoiceRecognition();
+  }
+
+  function closeVoicePermissionDialog() {
+    setVoicePermissionDialogOpen(false);
   }
 
   function replaceComposerRange(target: HTMLTextAreaElement, start: number, end: number, insert = '') {
@@ -5460,6 +5657,7 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
     const compactCommand = parseCompactComposerCommand(prompt);
     const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined;
     if (!prompt || (busy() && !steeringSubmit)) return;
+    stopVoiceRecognition(true);
     const projectId = props.project.id;
     const routeSessionId = props.sessionId;
     const submittedDraftKey = activeComposerDraftKey;
@@ -5742,6 +5940,18 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
               ariaLabel="Thinking level"
             />
             <div class="composer-toolbar-spacer flex-1" />
+            <button
+              class={`ghost h-8 w-8 px-0 ${voiceListening() ? 'composer-voice-button-active' : ''}`}
+              type="button"
+              title={voiceButtonTitle()}
+              aria-label={voiceButtonLabel()}
+              aria-pressed={voiceListening()}
+              disabled={!voiceSupported()}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={toggleVoiceRecognition}
+            >
+              <Show when={voiceListening()} fallback={<Mic class="size-4" />}><MicOff class="size-4" /></Show>
+            </button>
             <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={busy() && composerCanSubmit() ? 'Send steering message' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><ArrowUp class="size-4" /></button>}>
               <button class="button-danger h-8 w-8 px-0" type="button" title="Interrupt agent (Esc, or double Esc anywhere)" onClick={() => void interruptAgent()} disabled={aborting()}><Square class="size-3.5 fill-current" /></button>
             </Show>
@@ -5750,6 +5960,12 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
       </form>
       <Show when={previewPath()}>
         {(path) => <AssetPreviewModal project={props.project} path={path()} themeMode={props.themeMode} onClose={() => setPreviewPath(undefined)} />}
+      </Show>
+      <Show when={voiceToast()}>
+        {(toast) => <VoiceToast toast={toast()} onDismiss={dismissVoiceToast} />}
+      </Show>
+      <Show when={voicePermissionDialogOpen()}>
+        <VoicePermissionDialog message={VOICE_PERMISSION_DENIED_MESSAGE} onClose={closeVoicePermissionDialog} />
       </Show>
     </div>
   );
@@ -5778,6 +5994,55 @@ function AgentStatusBar(props: { status?: AgentStatusInfo; loading?: boolean; er
       <For each={parts()}>
         {(part) => <span class={`agent-status-item ${part.tone ? `agent-status-${part.tone}` : ''}`} title={part.title}>{part.text}</span>}
       </For>
+    </div>
+  );
+}
+
+function VoiceToast(props: { toast: { message: string; tone: 'warning' | 'error' }; onDismiss: () => void }) {
+  return (
+    <Portal>
+      <div class="voice-toast-stack" role={props.toast.tone === 'error' ? 'alert' : 'status'} aria-live={props.toast.tone === 'error' ? 'assertive' : 'polite'}>
+        <div class={`notification-toast notification-toast-${props.toast.tone}`}>
+          <div class="notification-toast-body">
+            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground">
+              <MicOff class="size-4" />
+            </span>
+            <span class="min-w-0 flex-1 text-left">
+              <span class="block truncate text-sm font-semibold leading-tight">Voice input</span>
+              <span class="block truncate text-xs text-muted-foreground">{props.toast.message}</span>
+            </span>
+          </div>
+          <button class="notification-toast-close" type="button" title="Dismiss" aria-label="Dismiss" onClick={props.onDismiss}><X class="size-4" /></button>
+          <div class="notification-toast-progress voice-toast-progress" />
+        </div>
+      </div>
+    </Portal>
+  );
+}
+
+function VoicePermissionDialog(props: { message: string; onClose: () => void }) {
+  createEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') props.onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    onCleanup(() => window.removeEventListener('keydown', onKeyDown));
+  });
+
+  return (
+    <div class="confirm-modal-backdrop" onMouseDown={props.onClose}>
+      <div class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="voice-permission-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div class="flex items-start justify-between gap-4">
+          <div class="min-w-0">
+            <h2 id="voice-permission-dialog-title" class="text-base font-medium leading-none">Microphone access blocked</h2>
+            <p class="mt-2 text-sm leading-6 text-muted-foreground">{props.message}</p>
+          </div>
+          <button class="project-modal-close shrink-0" type="button" aria-label="Close" onClick={props.onClose}><X class="size-4" /></button>
+        </div>
+        <div class="dialog-footer justify-end">
+          <button class="button" type="button" autofocus onClick={props.onClose}>Close</button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -1401,6 +1401,22 @@ body {
     @apply opacity-100;
   }
 
+  .composer-voice-button-active {
+    @apply bg-destructive/10 text-destructive hover:bg-destructive/20 hover:text-destructive;
+  }
+
+  .voice-toast-stack {
+    @apply pointer-events-none fixed right-4 top-24 z-[95] flex w-[min(24rem,calc(100vw-2rem))] flex-col gap-2.5;
+  }
+
+  .voice-toast-stack .notification-toast {
+    @apply pointer-events-auto;
+  }
+
+  .voice-toast-progress {
+    animation-duration: 4s;
+  }
+
   .agent-status-bar {
     @apply flex max-h-14 w-full flex-wrap items-center justify-end gap-x-2 gap-y-1 overflow-y-auto px-4 py-2 text-xs text-muted-foreground;
     scrollbar-gutter: stable;
