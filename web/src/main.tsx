@@ -273,6 +273,7 @@ const WEBSOCKET_RECONNECT_MIN_DELAY_MS = 500;
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
 const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
+const LIVE_ACTIVITY_PUBLISH_INTERVAL_MS = 80;
 const CHAT_CODE_HIGHLIGHT_MAX_LENGTH = 200_000;
 const CHAT_ROW_ESTIMATED_HEIGHT = 120;
 const CHAT_TOOL_OUTPUT_OPTIONS: SelectOption[] = [
@@ -815,6 +816,14 @@ function Shell() {
   });
   let pendingEventPayloads: string[] = [];
   let pendingEventsFrame: number | undefined;
+  let liveAgentActivityValue = emptyAgentActivity();
+  let liveShellActivityValue = emptyBashActivity();
+  let pendingLiveTextChunks: string[] = [];
+  let pendingLiveThinkingChunks: string[] = [];
+  let liveActivityDirty = false;
+  let liveActivityPublishTimer: number | undefined;
+  let liveActivityPublishFrame: number | undefined;
+  let lastLiveActivityPublishAt = 0;
   let agentSocketEventGeneration = 0;
   let agentStatusRefreshGeneration = 0;
 
@@ -830,6 +839,71 @@ function Shell() {
     });
   }
 
+  function clearLiveActivityPublishSchedule() {
+    if (liveActivityPublishTimer !== undefined) {
+      window.clearTimeout(liveActivityPublishTimer);
+      liveActivityPublishTimer = undefined;
+    }
+    if (liveActivityPublishFrame !== undefined) {
+      window.cancelAnimationFrame(liveActivityPublishFrame);
+      liveActivityPublishFrame = undefined;
+    }
+  }
+
+  function flushPendingLiveActivityDeltas() {
+    if (!pendingLiveTextChunks.length && !pendingLiveThinkingChunks.length) return;
+    liveAgentActivityValue = {
+      ...liveAgentActivityValue,
+      text: pendingLiveTextChunks.length ? liveAgentActivityValue.text + pendingLiveTextChunks.join('') : liveAgentActivityValue.text,
+      thinking: pendingLiveThinkingChunks.length ? liveAgentActivityValue.thinking + pendingLiveThinkingChunks.join('') : liveAgentActivityValue.thinking,
+    };
+    pendingLiveTextChunks = [];
+    pendingLiveThinkingChunks = [];
+    liveActivityDirty = true;
+  }
+
+  function queueLiveActivityDelta(delta: { text?: string; thinking?: string }) {
+    if (delta.text) pendingLiveTextChunks.push(delta.text);
+    if (delta.thinking) pendingLiveThinkingChunks.push(delta.thinking);
+    if (!liveAgentActivityValue.running || !liveAgentActivityValue.streaming) liveAgentActivityValue = { ...liveAgentActivityValue, running: true, streaming: true };
+    liveActivityDirty = true;
+  }
+
+  function publishLiveActivityNow() {
+    clearLiveActivityPublishSchedule();
+    flushPendingLiveActivityDeltas();
+    if (!liveActivityDirty) return;
+    liveActivityDirty = false;
+    lastLiveActivityPublishAt = performance.now();
+    setLiveAgentActivity(liveAgentActivityValue);
+    setLiveShellActivity(liveShellActivityValue);
+  }
+
+  function scheduleLiveActivityPublish(force = false) {
+    if (force) {
+      publishLiveActivityNow();
+      return;
+    }
+    if (!liveActivityDirty || liveActivityPublishTimer !== undefined || liveActivityPublishFrame !== undefined) return;
+    const delay = Math.max(0, LIVE_ACTIVITY_PUBLISH_INTERVAL_MS - (performance.now() - lastLiveActivityPublishAt));
+    liveActivityPublishTimer = window.setTimeout(() => {
+      liveActivityPublishTimer = undefined;
+      liveActivityPublishFrame = window.requestAnimationFrame(() => {
+        liveActivityPublishFrame = undefined;
+        publishLiveActivityNow();
+      });
+    }, delay);
+  }
+
+  function replaceLiveActivity(agentActivity: AgentActivity, shellActivity = liveShellActivityValue) {
+    pendingLiveTextChunks = [];
+    pendingLiveThinkingChunks = [];
+    liveAgentActivityValue = agentActivity;
+    liveShellActivityValue = shellActivity;
+    liveActivityDirty = true;
+    scheduleLiveActivityPublish(true);
+  }
+
   function resetAgentEvents(payloads: string[] = []) {
     pendingEventPayloads = [];
     if (pendingEventsFrame !== undefined) {
@@ -841,17 +915,37 @@ function Shell() {
   }
 
   function applyLiveEventPayloads(payloads: string[], reset = false) {
-    let nextAgentActivity = reset ? emptyAgentActivity() : untrack(liveAgentActivity);
-    let nextShellActivity = reset ? emptyBashActivity() : untrack(liveShellActivity);
+    if (reset) {
+      pendingLiveTextChunks = [];
+      pendingLiveThinkingChunks = [];
+      liveAgentActivityValue = emptyAgentActivity();
+      liveShellActivityValue = emptyBashActivity();
+      liveActivityDirty = true;
+    }
+    let forcePublish = reset;
     for (const payload of payloads) {
       const parsed = parseAgentServerEvent(payload);
       if (!parsed) continue;
-      nextAgentActivity = reduceAgentActivityEvent(nextAgentActivity, parsed);
-      nextShellActivity = reduceBashActivityEvent(nextShellActivity, parsed);
+      const delta = agentActivityMessageDelta(parsed);
+      if (delta) {
+        queueLiveActivityDelta(delta);
+        continue;
+      }
+      flushPendingLiveActivityDeltas();
+      const previousAgentActivity = liveAgentActivityValue;
+      const previousShellActivity = liveShellActivityValue;
+      liveAgentActivityValue = reduceAgentActivityEvent(liveAgentActivityValue, parsed);
+      liveShellActivityValue = reduceBashActivityEvent(liveShellActivityValue, parsed);
+      liveActivityDirty = liveActivityDirty || liveAgentActivityValue !== previousAgentActivity || liveShellActivityValue !== previousShellActivity;
+      forcePublish = forcePublish || shouldPublishLiveActivityImmediately(parsed);
     }
-    setLiveAgentActivity(nextAgentActivity);
-    setLiveShellActivity(nextShellActivity);
+    scheduleLiveActivityPublish(forcePublish);
   }
+
+  onCleanup(() => {
+    if (pendingEventsFrame !== undefined) window.cancelAnimationFrame(pendingEventsFrame);
+    clearLiveActivityPublishSchedule();
+  });
 
   function upsertExtensionUiRequest(request: ExtensionUiRequest) {
     if (settledExtensionUiRequestIds.has(request.id)) return;
@@ -1539,11 +1633,10 @@ function Shell() {
                 : state.runningSessionIds.filter((id) => id !== currentActiveSessionId),
             }));
             if (status.running) {
-              setLiveAgentActivity((activity) => activity.running ? activity : { ...emptyAgentActivity(), running: true });
+              if (!liveAgentActivityValue.running) replaceLiveActivity({ ...emptyAgentActivity(), running: true });
               return;
             }
-            setLiveAgentActivity(emptyAgentActivity());
-            setLiveShellActivity(emptyBashActivity());
+            replaceLiveActivity(emptyAgentActivity(), emptyBashActivity());
             removeSessionExtensionUiRequests(currentActiveSessionId);
           })
           .catch((error) => console.warn('Could not refresh agent status', error));
@@ -4753,6 +4846,10 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
   let runningCommandToken: symbol | undefined;
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
+  let transcriptScrollFrame: number | undefined;
+  let transcriptScrollFollowupFrame: number | undefined;
+  let transcriptScrollForce = false;
+  let composerLayoutFrame: number | undefined;
   let composerHistoryIndex: number | undefined;
   let composerHistoryMode: ComposerHistoryMode | undefined;
   let composerHistoryDraft: ComposerHistoryItem = { text: '', uploads: [] };
@@ -4919,8 +5016,14 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
     props.sessionId;
     session.data?.leafId;
     transcriptEntries().map((entry) => entry.id).join('|');
-    props.events.length;
-    props.events[props.events.length - 1];
+    const activity = liveActivity();
+    activity.text.length;
+    activity.thinking.length;
+    activity.tools.length;
+    activity.notices.length;
+    const shellActivity = liveShellActivity();
+    shellActivity.output.length;
+    shellActivity.running;
     uploads().length;
     runningCommand();
     if (stickToBottom()) scrollTranscriptToBottom();
@@ -5074,6 +5177,12 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
   });
 
   onCleanup(() => {
+    if (transcriptScrollFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFrame);
+    if (transcriptScrollFollowupFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFollowupFrame);
+    if (composerLayoutFrame !== undefined) window.cancelAnimationFrame(composerLayoutFrame);
+  });
+
+  onCleanup(() => {
     clearVoiceToastTimer();
     stopVoiceRecognition(true);
   });
@@ -5139,14 +5248,23 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
   }
 
   function scrollTranscriptToBottom(force = false) {
-    if (force) userScrollingTranscriptAwayFromBottom = false;
-    requestAnimationFrame(() => {
+    if (force) {
+      userScrollingTranscriptAwayFromBottom = false;
+      transcriptScrollForce = true;
+    }
+    if (transcriptScrollFrame !== undefined) return;
+    transcriptScrollFrame = requestAnimationFrame(() => {
+      transcriptScrollFrame = undefined;
+      const shouldForce = transcriptScrollForce;
+      transcriptScrollForce = false;
       const element = transcriptScrollerRef;
-      if (!element || (!force && !stickToBottom())) return;
+      if (!element || (!shouldForce && !stickToBottom())) return;
       element.scrollTop = element.scrollHeight;
-      requestAnimationFrame(() => {
-        if (!force && !stickToBottom()) return;
-        element.scrollTop = element.scrollHeight;
+      if (!shouldForce || transcriptScrollFollowupFrame !== undefined) return;
+      transcriptScrollFollowupFrame = requestAnimationFrame(() => {
+        transcriptScrollFollowupFrame = undefined;
+        const target = transcriptScrollerRef;
+        if (target) target.scrollTop = target.scrollHeight;
       });
     });
   }
@@ -5226,7 +5344,9 @@ function Chat(props: { project: Project; sessionId?: string; events: string[]; l
   }
 
   function syncComposerLayout() {
-    requestAnimationFrame(() => {
+    if (composerLayoutFrame !== undefined) return;
+    composerLayoutFrame = requestAnimationFrame(() => {
+      composerLayoutFrame = undefined;
       const target = composerRef;
       if (!target) return;
       const style = window.getComputedStyle(target);
@@ -9162,6 +9282,27 @@ function parseAgentServerEvent(raw: string): AgentServerEvent | undefined {
   } catch {
     return undefined;
   }
+}
+
+function shouldPublishLiveActivityImmediately(event: AgentServerEvent) {
+  if (event.type === 'bash:update') return false;
+  if (event.type !== 'agent:event') return true;
+  if (!event.data || typeof event.data !== 'object') return false;
+  const data = event.data as Record<string, unknown>;
+  const type = typeof data.type === 'string' ? data.type : '';
+  if (type !== 'message_update') return true;
+  const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
+  return messageEvent.type === 'text_end' || messageEvent.type === 'thinking_end';
+}
+
+function agentActivityMessageDelta(event: AgentServerEvent): { text?: string; thinking?: string } | undefined {
+  if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return undefined;
+  const data = event.data as Record<string, unknown>;
+  if (data.type !== 'message_update') return undefined;
+  const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
+  if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { text: messageEvent.delta };
+  if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { thinking: messageEvent.delta };
+  return undefined;
 }
 
 function reduceBashActivityEvent(activity: BashActivity, event: AgentServerEvent): BashActivity {
