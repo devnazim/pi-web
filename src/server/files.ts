@@ -315,6 +315,14 @@ function attachFileWatchSocket(sessions: Map<string, FileWatchSession>, session:
   session.sockets.add(socket);
   if (!session.watchers.size && !session.scanPromise) void refreshFileWatchers(session);
   sendFileWatchMessage(socket, { type: 'ready', watching: session.watchers.size > 0 || Boolean(session.scanPromise) });
+  socket.on('message', (data: { toString(): string }) => {
+    try {
+      const message = JSON.parse(data.toString()) as { type?: string };
+      if (message.type === 'ping') sendFileWatchMessage(socket, { type: 'pong' });
+    } catch {
+      sendFileWatchMessage(socket, { type: 'error', message: 'Invalid websocket message' });
+    }
+  });
   socket.on('close', () => {
     session.sockets.delete(socket);
     if (!session.sockets.size) {

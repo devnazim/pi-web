@@ -148,6 +148,7 @@ type CommandCompletion = { value: string; label?: string; description?: string }
 type BashCommandResult = { output: string; exitCode?: number; cancelled?: boolean; truncated?: boolean; fullOutputPath?: string };
 type AgentStatusInfo = {
   branch?: string;
+  running: boolean;
   sessionName?: string;
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number; cost: number; subscription: boolean };
   context?: { tokens: number | null; contextWindow: number; percent: number | null; autoCompact: boolean };
@@ -219,6 +220,7 @@ type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: nu
 type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
 type AgentServerEvent = { type?: string; message?: string; data?: unknown };
+type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; heartbeat?: boolean };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
 type SessionComposerControls = { model?: string; thinking?: ThinkingLevel | '' };
 type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; model?: string; thinking?: ThinkingLevel | '' };
@@ -267,6 +269,10 @@ const CHAT_SEARCH_DEBOUNCE_MS = 200;
 const FILE_SEARCH_DEBOUNCE_MS = 250;
 const SETTINGS_CACHE_STALE_TIME_MS = 60_000;
 const SESSION_DETAIL_CACHE_STALE_TIME_MS = 30_000;
+const WEBSOCKET_RECONNECT_MIN_DELAY_MS = 500;
+const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
+const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
+const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
 const CHAT_CODE_HIGHLIGHT_MAX_LENGTH = 200_000;
 const CHAT_ROW_ESTIMATED_HEIGHT = 120;
 const CHAT_TOOL_OUTPUT_OPTIONS: SelectOption[] = [
@@ -809,6 +815,8 @@ function Shell() {
   });
   let pendingEventPayloads: string[] = [];
   let pendingEventsFrame: number | undefined;
+  let agentSocketEventGeneration = 0;
+  let agentStatusRefreshGeneration = 0;
 
   function queueAgentEvent(payload: string) {
     pendingEventPayloads.push(payload);
@@ -1508,70 +1516,115 @@ function Shell() {
     const project = workspaceProject();
     const currentActiveSessionId = activeSessionId();
     if (!project) return;
-    const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentActiveSessionId ? `?sessionId=${currentActiveSessionId}` : ''}`));
-    socket.addEventListener('message', (event) => {
-      try {
-        const parsed = JSON.parse(event.data) as { type?: string; sessionId?: string; data?: unknown };
-        const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
-        if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([event.data]);
-        else if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
-        const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
-        if (parsed.type === 'agent:ui-request') {
-          const request = readExtensionUiRequest(parsed.data, eventSessionId);
-          if (request) upsertExtensionUiRequest(request);
-        }
-        if (parsed.type === 'agent:ui-response') {
-          const id = readExtensionUiResponseId(parsed.data);
-          if (id) removeExtensionUiRequest(id);
-        }
-        if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
-        if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
-          removeSessionExtensionUiRequests(eventSessionId);
-          queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
-          queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
-          queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
-          queryClient.invalidateQueries({ queryKey: ['agent-status', project.id, eventSessionId] });
-          invalidateProjectFileCaches(project.id);
-        }
-      } catch {
-        if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
+    const refreshAgentQueries = () => {
+      queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
+      if (currentActiveSessionId) {
+        queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
+        queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, currentActiveSessionId] });
+        const statusEventGeneration = agentSocketEventGeneration;
+        const statusRefreshGeneration = ++agentStatusRefreshGeneration;
+        void api<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
+          .then(({ status }) => {
+            if (
+              workspaceProject()?.id !== project.id
+              || activeSessionId() !== currentActiveSessionId
+              || statusEventGeneration !== agentSocketEventGeneration
+              || statusRefreshGeneration !== agentStatusRefreshGeneration
+            ) return;
+            queryClient.setQueryData(['agent-status', project.id, currentActiveSessionId], { status });
+            updateWorkspaceNotifications(project.id, (state) => ({
+              ...state,
+              runningSessionIds: status.running
+                ? uniqueStrings([...state.runningSessionIds, currentActiveSessionId])
+                : state.runningSessionIds.filter((id) => id !== currentActiveSessionId),
+            }));
+            if (status.running) {
+              setLiveAgentActivity((activity) => activity.running ? activity : { ...emptyAgentActivity(), running: true });
+              return;
+            }
+            setLiveAgentActivity(emptyAgentActivity());
+            setLiveShellActivity(emptyBashActivity());
+            removeSessionExtensionUiRequests(currentActiveSessionId);
+          })
+          .catch((error) => console.warn('Could not refresh agent status', error));
       }
+      const query = currentActiveSessionId ? `?sessionId=${encodeURIComponent(currentActiveSessionId)}` : '';
+      void api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests${query}`)
+        .then(({ requests }) => {
+          if (workspaceProject()?.id === project.id) mergeExtensionUiRequests(requests);
+        })
+        .catch((error) => console.warn('Could not load extension UI requests', error));
+    };
+    const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentActiveSessionId ? `?sessionId=${encodeURIComponent(currentActiveSessionId)}` : ''}`), {
+      heartbeat: true,
+      onOpen: refreshAgentQueries,
+      onMessage: (event) => {
+        agentSocketEventGeneration += 1;
+        try {
+          const parsed = JSON.parse(event.data) as { type?: string; sessionId?: string; data?: unknown };
+          const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
+          if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([event.data]);
+          else if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
+          const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
+          if (parsed.type === 'agent:ui-request') {
+            const request = readExtensionUiRequest(parsed.data, eventSessionId);
+            if (request) upsertExtensionUiRequest(request);
+          }
+          if (parsed.type === 'agent:ui-response') {
+            const id = readExtensionUiResponseId(parsed.data);
+            if (id) removeExtensionUiRequest(id);
+          }
+          if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
+          if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
+            removeSessionExtensionUiRequests(eventSessionId);
+            queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
+            queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
+            queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
+            queryClient.invalidateQueries({ queryKey: ['agent-status', project.id, eventSessionId] });
+            invalidateProjectFileCaches(project.id);
+          }
+        } catch {
+          if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
+        }
+      },
     });
-    onCleanup(() => socket.close());
+    onCleanup(cleanup);
   });
 
   createEffect(() => {
     const project = workspaceProject();
     if (!project) return;
-    const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${project.id}/files`));
-    socket.addEventListener('message', (event) => {
-      try {
-        const parsed = JSON.parse(event.data) as { type?: string };
-        if (parsed.type === 'files:change') invalidateProjectFileQueries(project.id);
-      } catch {
-        // Ignore malformed file watcher events.
-      }
+    const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/files`), {
+      heartbeat: true,
+      onOpen: () => invalidateProjectFileCaches(project.id),
+      onMessage: (event) => {
+        try {
+          const parsed = JSON.parse(event.data) as { type?: string };
+          if (parsed.type === 'files:change') invalidateProjectFileQueries(project.id);
+        } catch {
+          // Ignore malformed file watcher events.
+        }
+      },
     });
-    onCleanup(() => socket.close());
+    onCleanup(cleanup);
   });
 
   createEffect(() => {
     const ids = Object.keys(workspaceLookup()).sort();
     if (!ids.length) return;
-    const sockets = ids.map((workspaceId) => {
-      const socket = new WebSocket(appWebSocketUrl(`/ws/projects/${workspaceId}/notifications`));
-      socket.addEventListener('message', (event) => {
+    const cleanups = ids.map((workspaceId) => connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${workspaceId}/notifications`), {
+      heartbeat: true,
+      onMessage: (event) => {
         try {
           const parsed = JSON.parse(event.data) as WorkspaceNotificationServerEvent;
-          if (parsed.type === 'pong' || parsed.type === 'error') return;
+          if (parsed.type === 'error') return;
           handleWorkspaceNotificationEvent(workspaceId, parsed);
         } catch {
           // Ignore malformed notification events.
         }
-      });
-      return socket;
-    });
-    onCleanup(() => sockets.forEach((socket) => socket.close()));
+      },
+    }));
+    onCleanup(() => cleanups.forEach((cleanup) => cleanup()));
   });
 
   createEffect(() => {
@@ -11126,6 +11179,123 @@ function errorMessage(error: unknown, fallback: string) {
 
 function apiErrorStatus(error: unknown) {
   return error && typeof error === 'object' && typeof (error as { status?: unknown }).status === 'number' ? (error as { status: number }).status : undefined;
+}
+
+function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocketOptions) {
+  let socket: WebSocket | undefined;
+  let reconnectTimer: number | undefined;
+  let heartbeatInterval: number | undefined;
+  let heartbeatTimeout: number | undefined;
+  let reconnectAttempt = 0;
+  let disposed = false;
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimer === undefined) return;
+    window.clearTimeout(reconnectTimer);
+    reconnectTimer = undefined;
+  };
+  const clearHeartbeatTimeout = () => {
+    if (heartbeatTimeout === undefined) return;
+    window.clearTimeout(heartbeatTimeout);
+    heartbeatTimeout = undefined;
+  };
+  const clearHeartbeatTimers = () => {
+    if (heartbeatInterval !== undefined) {
+      window.clearInterval(heartbeatInterval);
+      heartbeatInterval = undefined;
+    }
+    clearHeartbeatTimeout();
+  };
+  const closeSocket = (target: WebSocket) => {
+    try {
+      target.close();
+    } catch {
+      // Ignore close races.
+    }
+  };
+  const sendHeartbeat = () => {
+    const current = socket;
+    if (!options.heartbeat || !current || current.readyState !== WebSocket.OPEN || heartbeatTimeout !== undefined) return;
+    try {
+      current.send(JSON.stringify({ type: 'ping' }));
+    } catch {
+      closeSocket(current);
+      return;
+    }
+    heartbeatTimeout = window.setTimeout(() => {
+      heartbeatTimeout = undefined;
+      if (socket === current && current.readyState === WebSocket.OPEN) closeSocket(current);
+    }, WEBSOCKET_HEARTBEAT_TIMEOUT_MS);
+  };
+  const startHeartbeat = () => {
+    if (!options.heartbeat) return;
+    clearHeartbeatTimers();
+    sendHeartbeat();
+    heartbeatInterval = window.setInterval(sendHeartbeat, WEBSOCKET_HEARTBEAT_INTERVAL_MS);
+  };
+  const scheduleReconnect = (current?: WebSocket) => {
+    if (disposed || (current && socket !== current)) return;
+    if (current && socket === current) socket = undefined;
+    clearHeartbeatTimers();
+    if (reconnectTimer !== undefined) return;
+    const delay = Math.min(WEBSOCKET_RECONNECT_MAX_DELAY_MS, WEBSOCKET_RECONNECT_MIN_DELAY_MS * 2 ** Math.min(reconnectAttempt, 5));
+    reconnectAttempt += 1;
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = undefined;
+      connect();
+    }, delay + Math.round(delay * 0.2 * Math.random()));
+  };
+  function connect() {
+    if (disposed) return;
+    clearReconnectTimer();
+    let current: WebSocket;
+    try {
+      current = new WebSocket(url);
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+    socket = current;
+    current.addEventListener('open', () => {
+      if (disposed || socket !== current) return;
+      reconnectAttempt = 0;
+      options.onOpen?.();
+      startHeartbeat();
+    });
+    current.addEventListener('message', (event) => {
+      if (disposed || socket !== current) return;
+      if (options.heartbeat) {
+        const pong = isWebSocketPongMessage(event.data);
+        clearHeartbeatTimeout();
+        if (pong) return;
+      }
+      options.onMessage(event);
+    });
+    current.addEventListener('close', () => scheduleReconnect(current));
+    current.addEventListener('error', () => {
+      if (!disposed && socket === current) closeSocket(current);
+    });
+  }
+
+  connect();
+  return () => {
+    disposed = true;
+    clearReconnectTimer();
+    clearHeartbeatTimers();
+    const current = socket;
+    socket = undefined;
+    if (current) closeSocket(current);
+  };
+}
+
+function isWebSocketPongMessage(data: unknown) {
+  if (typeof data !== 'string') return false;
+  try {
+    const parsed = JSON.parse(data) as { type?: unknown };
+    return parsed.type === 'pong';
+  } catch {
+    return false;
+  }
 }
 
 async function api<T>(url: string, init?: RequestInit): Promise<T> {

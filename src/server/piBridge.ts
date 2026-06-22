@@ -102,6 +102,7 @@ type ModelInfo = { value: string; label: string; provider: string; id: string; r
 
 type AgentStatus = {
   branch?: string;
+  running: boolean;
   sessionName?: string;
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number; cost: number; subscription: boolean };
   context?: { tokens: number | null; contextWindow: number; percent: number | null; autoCompact: boolean };
@@ -152,9 +153,12 @@ export class PiBridge {
     const payload = JSON.stringify(event);
     const keys = Array.isArray(key) ? new Set(key) : new Set([key]);
     for (const item of keys) {
-      for (const socket of this.sockets.get(item) ?? []) {
-        if (socket.readyState === 1) socket.send(payload);
+      const sockets = this.sockets.get(item);
+      if (!sockets) continue;
+      for (const socket of [...sockets]) {
+        if (!this.sendSocketPayload(socket, payload)) sockets.delete(socket);
       }
+      if (!sockets.size) this.sockets.delete(item);
     }
     this.broadcastNotificationEvent(keys, event);
   }
@@ -163,10 +167,23 @@ export class PiBridge {
     if (!isWorkspaceNotificationEvent(event)) return;
     const projectIds = new Set([...keys].map(projectIdFromStreamKey).filter((id): id is string => Boolean(id)));
     for (const projectId of projectIds) {
+      const sockets = this.notificationSockets.get(projectId);
+      if (!sockets) continue;
       const payload = JSON.stringify({ ...event, projectId });
-      for (const socket of this.notificationSockets.get(projectId) ?? []) {
-        if (socket.readyState === 1) socket.send(payload);
+      for (const socket of [...sockets]) {
+        if (!this.sendSocketPayload(socket, payload)) sockets.delete(socket);
       }
+      if (!sockets.size) this.notificationSockets.delete(projectId);
+    }
+  }
+
+  private sendSocketPayload(socket: WebSocket, payload: string) {
+    if (socket.readyState !== 1) return false;
+    try {
+      socket.send(payload);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -438,12 +455,14 @@ export class PiBridge {
     const branch = await getGitBranch(projectPath).catch(() => undefined);
     if (!sessionId) return {
       branch,
+      running: false,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, subscription: false },
       statuses: [],
     };
+    const running = await this.isSessionActive(projectPath, sessionId);
     const session = await this.getSession(projectPath, sessionId);
     await this.bindWebExtensions(session, projectPath, sessionId, key);
-    return this.agentStatus(session, branch);
+    return this.agentStatus(session, branch, running);
   }
 
   async compact(projectPath: string, body: CompactBody, key: string | string[]) {
@@ -778,7 +797,7 @@ export class PiBridge {
     };
   }
 
-  private agentStatus(session: any, branch?: string): AgentStatus {
+  private agentStatus(session: any, branch?: string, running = false): AgentStatus {
     const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, subscription: false };
     for (const entry of typeof session?.sessionManager?.getEntries === 'function' ? session.sessionManager.getEntries() : []) {
       const message = entry?.type === 'message' ? entry.message : undefined;
@@ -809,6 +828,7 @@ export class PiBridge {
 
     return {
       branch,
+      running,
       sessionName: typeof session?.sessionManager?.getSessionName === 'function' ? session.sessionManager.getSessionName() || undefined : undefined,
       usage,
       context,
@@ -1231,9 +1251,9 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
     socket.on('message', (data: { toString(): string }) => {
       try {
         const message = JSON.parse(data.toString()) as { type?: string };
-        if (message.type === 'ping') socket.send(JSON.stringify({ type: 'pong' }));
+        if (message.type === 'ping') sendWebSocketJson(socket, { type: 'pong' });
       } catch {
-        socket.send(JSON.stringify({ type: 'error', message: 'Invalid websocket message' }));
+        sendWebSocketJson(socket, { type: 'error', message: 'Invalid websocket message' });
       }
     });
   });
@@ -1244,15 +1264,15 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
       const project = registry.get(request.params.projectId);
       bridge.subscribeNotifications(project.id, socket);
     } catch {
-      socket.send(JSON.stringify({ type: 'error', message: 'Unknown project' }));
+      sendWebSocketJson(socket, { type: 'error', message: 'Unknown project' });
       return socket.close?.();
     }
     socket.on('message', (data: { toString(): string }) => {
       try {
         const message = JSON.parse(data.toString()) as { type?: string };
-        if (message.type === 'ping') socket.send(JSON.stringify({ type: 'pong' }));
+        if (message.type === 'ping') sendWebSocketJson(socket, { type: 'pong' });
       } catch {
-        socket.send(JSON.stringify({ type: 'error', message: 'Invalid websocket message' }));
+        sendWebSocketJson(socket, { type: 'error', message: 'Invalid websocket message' });
       }
     });
   });
@@ -1410,6 +1430,15 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Abort failed' });
     }
   });
+}
+
+function sendWebSocketJson(socket: WebSocket, message: Record<string, unknown>) {
+  if (socket.readyState !== 1) return;
+  try {
+    socket.send(JSON.stringify(message));
+  } catch {
+    // Ignore write races with websocket close.
+  }
 }
 
 function streamKey(projectId: string, sessionId?: string) {
