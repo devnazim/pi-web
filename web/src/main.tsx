@@ -274,8 +274,8 @@ const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
 const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
 const LIVE_ACTIVITY_PUBLISH_INTERVAL_MS = 80;
-const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 24_000;
-const LIVE_SHELL_OUTPUT_MAX_LENGTH = 16_000;
+const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 8_000;
+const LIVE_SHELL_OUTPUT_MAX_LENGTH = 8_000;
 const CHAT_CODE_HIGHLIGHT_MAX_LENGTH = 200_000;
 const CHAT_ROW_ESTIMATED_HEIGHT = 120;
 const CHAT_TOOL_OUTPUT_OPTIONS: SelectOption[] = [
@@ -816,8 +816,8 @@ function Shell() {
     const mode = themeMode();
     return mode === 'system' ? systemThemeMode() : mode;
   });
-  let pendingEventPayloads: string[] = [];
-  let pendingEventsFrame: number | undefined;
+  let pendingStoredEventPayloads: string[] = [];
+  let pendingStoredEventsFrame: number | undefined;
   let liveAgentActivityValue = emptyAgentActivity();
   let liveShellActivityValue = emptyBashActivity();
   let pendingLiveTextChunks: string[] = [];
@@ -829,17 +829,24 @@ function Shell() {
   let agentSocketEventGeneration = 0;
   let agentStatusRefreshGeneration = 0;
 
-  function queueAgentEvent(payload: string) {
-    pendingEventPayloads.push(payload);
-    if (pendingEventsFrame !== undefined) return;
-    pendingEventsFrame = window.requestAnimationFrame(() => {
-      const payloads = pendingEventPayloads;
-      pendingEventPayloads = [];
-      pendingEventsFrame = undefined;
-      const eventPayloads = payloads.filter(shouldStoreAgentEvent);
-      if (eventPayloads.length) setEvents((items) => [...items, ...eventPayloads].slice(-240));
-      applyLiveEventPayloads(payloads);
+  function queueStoredAgentEvent(payload: string) {
+    pendingStoredEventPayloads.push(payload);
+    if (pendingStoredEventsFrame !== undefined) return;
+    pendingStoredEventsFrame = window.requestAnimationFrame(() => {
+      const payloads = pendingStoredEventPayloads;
+      pendingStoredEventPayloads = [];
+      pendingStoredEventsFrame = undefined;
+      setEvents((items) => [...items, ...payloads].slice(-240));
     });
+  }
+
+  function handleAgentEvent(payload: string, event = parseAgentServerEvent(payload)) {
+    if (!event) {
+      queueStoredAgentEvent(payload);
+      return;
+    }
+    if (shouldStoreAgentEvent(event)) queueStoredAgentEvent(payload);
+    applyLiveEvent(event);
   }
 
   function clearLiveActivityPublishSchedule() {
@@ -908,45 +915,45 @@ function Shell() {
   }
 
   function resetAgentEvents(payloads: string[] = []) {
-    pendingEventPayloads = [];
-    if (pendingEventsFrame !== undefined) {
-      window.cancelAnimationFrame(pendingEventsFrame);
-      pendingEventsFrame = undefined;
+    pendingStoredEventPayloads = [];
+    if (pendingStoredEventsFrame !== undefined) {
+      window.cancelAnimationFrame(pendingStoredEventsFrame);
+      pendingStoredEventsFrame = undefined;
     }
-    setEvents(payloads);
-    applyLiveEventPayloads(payloads, true);
+    setEvents(payloads.filter((payload) => {
+      const event = parseAgentServerEvent(payload);
+      return !event || shouldStoreAgentEvent(event);
+    }));
+    pendingLiveTextChunks = [];
+    pendingLiveThinkingChunks = [];
+    liveAgentActivityValue = emptyAgentActivity();
+    liveShellActivityValue = emptyBashActivity();
+    liveActivityDirty = true;
+    for (const payload of payloads) {
+      const event = parseAgentServerEvent(payload);
+      if (event) applyLiveEvent(event, { skipSchedule: true });
+    }
+    scheduleLiveActivityPublish(true);
   }
 
-  function applyLiveEventPayloads(payloads: string[], reset = false) {
-    if (reset) {
-      pendingLiveTextChunks = [];
-      pendingLiveThinkingChunks = [];
-      liveAgentActivityValue = emptyAgentActivity();
-      liveShellActivityValue = emptyBashActivity();
-      liveActivityDirty = true;
+  function applyLiveEvent(event: AgentServerEvent, options: { skipSchedule?: boolean } = {}) {
+    const delta = agentActivityMessageDelta(event);
+    if (delta) {
+      queueLiveActivityDelta(delta);
+      if (!options.skipSchedule) scheduleLiveActivityPublish();
+      return;
     }
-    let forcePublish = reset;
-    for (const payload of payloads) {
-      const parsed = parseAgentServerEvent(payload);
-      if (!parsed) continue;
-      const delta = agentActivityMessageDelta(parsed);
-      if (delta) {
-        queueLiveActivityDelta(delta);
-        continue;
-      }
-      flushPendingLiveActivityDeltas();
-      const previousAgentActivity = liveAgentActivityValue;
-      const previousShellActivity = liveShellActivityValue;
-      liveAgentActivityValue = reduceAgentActivityEvent(liveAgentActivityValue, parsed);
-      liveShellActivityValue = reduceBashActivityEvent(liveShellActivityValue, parsed);
-      liveActivityDirty = liveActivityDirty || liveAgentActivityValue !== previousAgentActivity || liveShellActivityValue !== previousShellActivity;
-      forcePublish = forcePublish || shouldPublishLiveActivityImmediately(parsed);
-    }
-    scheduleLiveActivityPublish(forcePublish);
+    flushPendingLiveActivityDeltas();
+    const previousAgentActivity = liveAgentActivityValue;
+    const previousShellActivity = liveShellActivityValue;
+    liveAgentActivityValue = reduceAgentActivityEvent(liveAgentActivityValue, event);
+    liveShellActivityValue = reduceBashActivityEvent(liveShellActivityValue, event);
+    liveActivityDirty = liveActivityDirty || liveAgentActivityValue !== previousAgentActivity || liveShellActivityValue !== previousShellActivity;
+    if (!options.skipSchedule) scheduleLiveActivityPublish(shouldPublishLiveActivityImmediately(event));
   }
 
   onCleanup(() => {
-    if (pendingEventsFrame !== undefined) window.cancelAnimationFrame(pendingEventsFrame);
+    if (pendingStoredEventsFrame !== undefined) window.cancelAnimationFrame(pendingStoredEventsFrame);
     clearLiveActivityPublishSchedule();
   });
 
@@ -1255,10 +1262,6 @@ function Shell() {
     localStorage.setItem(WORKSPACE_NOTIFICATIONS_BROWSER_KEY, String(enabled));
     if (!enabled) setAppError({ title: 'Browser notifications blocked', description: 'Enable notifications for this site in your browser settings to receive workspace alerts.' });
   }
-
-  onCleanup(() => {
-    if (pendingEventsFrame !== undefined) window.cancelAnimationFrame(pendingEventsFrame);
-  });
 
   onMount(() => {
     let chordTimer: number | undefined;
@@ -1657,10 +1660,10 @@ function Shell() {
       onMessage: (event) => {
         agentSocketEventGeneration += 1;
         try {
-          const parsed = JSON.parse(event.data) as { type?: string; sessionId?: string; data?: unknown };
+          const parsed = JSON.parse(event.data) as AgentServerEvent & { sessionId?: string };
           const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
           if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([event.data]);
-          else if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
+          else if (shouldHandleAgentEvent(parsed)) handleAgentEvent(event.data, parsed);
           const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
           if (parsed.type === 'agent:ui-request') {
             const request = readExtensionUiRequest(parsed.data, eventSessionId);
@@ -1680,7 +1683,7 @@ function Shell() {
             invalidateProjectFileCaches(project.id);
           }
         } catch {
-          if (shouldShowAgentEvent(event.data)) queueAgentEvent(event.data);
+          if (shouldShowAgentEvent(event.data)) handleAgentEvent(event.data);
         }
       },
     });
@@ -9198,22 +9201,23 @@ function ToolSummary(props: { event: string }) {
 
 function shouldShowAgentEvent(payload: string) {
   try {
-    const parsed = JSON.parse(payload) as { type?: string; data?: unknown };
-    if (parsed.type !== 'agent:event') return ['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'bash:start', 'bash:update', 'bash:finish', 'bash:error', 'error'].includes(parsed.type ?? '');
-    const dataType = agentEventDataType(parsed.data);
-    return ['agent_start', 'agent_end', 'message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
+    return shouldHandleAgentEvent(JSON.parse(payload) as AgentServerEvent);
   } catch {
     return true;
   }
 }
 
-function shouldStoreAgentEvent(payload: string) {
-  try {
-    const parsed = JSON.parse(payload) as { type?: string; data?: unknown };
-    return parsed.type !== 'agent:event' || agentEventDataType(parsed.data) !== 'message_update';
-  } catch {
-    return true;
-  }
+function shouldHandleAgentEvent(event: AgentServerEvent) {
+  if (event.type !== 'agent:event') return ['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'bash:start', 'bash:update', 'bash:finish', 'bash:error', 'error'].includes(event.type ?? '');
+  const dataType = agentEventDataType(event.data);
+  return ['agent_start', 'agent_end', 'message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
+}
+
+function shouldStoreAgentEvent(event: AgentServerEvent) {
+  if (event.type === 'bash:update') return false;
+  if (event.type !== 'agent:event') return true;
+  const dataType = agentEventDataType(event.data);
+  return dataType !== 'message_update' && dataType !== 'tool_execution_update';
 }
 
 function eventsBelongToSession(events: string[], sessionId: string) {
@@ -9313,6 +9317,7 @@ function shouldPublishLiveActivityImmediately(event: AgentServerEvent) {
   if (!event.data || typeof event.data !== 'object') return false;
   const data = event.data as Record<string, unknown>;
   const type = typeof data.type === 'string' ? data.type : '';
+  if (type === 'tool_execution_update') return false;
   if (type !== 'message_update') return true;
   const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
   return messageEvent.type === 'text_end' || messageEvent.type === 'thinking_end';
