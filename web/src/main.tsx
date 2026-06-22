@@ -1,5 +1,4 @@
 import { QueryClient, QueryClientProvider, createInfiniteQuery, createQuery } from '@tanstack/solid-query';
-import { createVirtualizer, type VirtualItem } from '@tanstack/solid-virtual';
 import {
   Activity,
   AlignJustify,
@@ -280,7 +279,6 @@ const LIVE_ACTIVITY_PUBLISH_INTERVAL_MS = 80;
 const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 8_000;
 const LIVE_SHELL_OUTPUT_MAX_LENGTH = 8_000;
 const CHAT_CODE_HIGHLIGHT_MAX_LENGTH = 200_000;
-const CHAT_ROW_ESTIMATED_HEIGHT = 120;
 const CHAT_TOOL_OUTPUT_OPTIONS: SelectOption[] = [
   { value: '', label: 'Inherited' },
   { value: 'compact', label: 'Compact/collapsed' },
@@ -5016,18 +5014,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (pendingUserMessageVisible() && !entries.some(isUserMessageEntry)) return [];
     return chatDisplayEntries(entries);
   });
-  const transcriptVirtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
-    get count() {
-      return visibleTranscriptEntries().length;
-    },
-    getScrollElement: () => transcriptScrollerRef ?? null,
-    estimateSize: () => CHAT_ROW_ESTIMATED_HEIGHT,
-    getItemKey: (index) => visibleTranscriptEntries()[index]?.id ?? index,
-    overscan: 8,
-    onChange: () => {
-      if (stickToBottom()) scrollTranscriptToBottom();
-    },
-  });
   const toolCalls = createMemo(() => toolCallMap(transcriptEntries()));
   const chatSearchMatches = createMemo(() => {
     const query = normalizedSearchQuery(props.searchQuery);
@@ -5134,7 +5120,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (!activeId || !normalizedSearchQuery(props.searchQuery)) return;
     const index = visibleTranscriptEntries().findIndex((entry) => entry.id === activeId);
     if (index === -1) return;
-    transcriptVirtualizer.scrollToIndex(index, { align: 'center' });
     const scrollActiveEntryIntoView = () => {
       const element = transcriptEntryRefs.get(activeId);
       if (!element) return false;
@@ -6143,31 +6128,26 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
             <Show when={props.sessionId && session.error}>
               <div class="mb-4 rounded-2xl bg-card p-5 text-sm text-destructive ring-1 ring-destructive/20">{session.error instanceof Error ? session.error.message : 'Could not load session'}</div>
             </Show>
-            <div class="relative w-full" style={{ height: `${transcriptVirtualizer.getTotalSize()}px` }}>
-              <For each={transcriptVirtualizer.getVirtualItems()}>
-                {(virtualItem) => {
-                  const item = () => visibleTranscriptEntries()[virtualItem.index];
-                  return (
-                    <VirtualTranscriptEntryRow
-                      virtualItem={virtualItem}
-                      entry={item()}
-                      project={props.project}
-                      hideThinking={hideThinking()}
-                      toolOutputMode={toolOutputMode()}
-                      toolCalls={toolCalls()}
-                      syntaxTheme={syntaxTheme()}
-                      searchQuery={props.searchQuery}
-                      searchMatch={Boolean(item() && chatSearchMatchIds().has(item()!.id))}
-                      searchActive={activeSearchEntryId() === item()?.id}
-                      measureElement={(element) => transcriptVirtualizer.measureElement(element)}
-                      setEntryRef={setTranscriptEntryRef}
-                      deleteEntryRef={deleteTranscriptEntryRef}
-                      onPreviewAttachment={setPreviewPath}
-                    />
-                  );
-                }}
-              </For>
-            </div>
+            <For each={visibleTranscriptEntries()}>
+              {(item, index) => {
+                let element: HTMLDivElement | undefined;
+                onCleanup(() => {
+                  if (element) deleteTranscriptEntryRef(item.id, element);
+                });
+                return (
+                  <div
+                    ref={(node) => {
+                      element = node;
+                      setTranscriptEntryRef(item.id, node);
+                    }}
+                    data-index={index()}
+                    class={`chat-search-entry ${chatSearchMatchIds().has(item.id) ? 'chat-search-entry-match' : ''} ${activeSearchEntryId() === item.id ? 'chat-search-entry-active' : ''}`}
+                  >
+                    <TranscriptEntry entry={item} project={props.project} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} toolCalls={toolCalls()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
+                  </div>
+                );
+              }}
+            </For>
             <Show when={pendingUserMessageVisible() ? pendingUserMessage() : undefined}>
               {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending().text }]} attachments={pending().attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
             </Show>
@@ -8702,69 +8682,6 @@ function PanelSection(props: { title: string; children: JSX.Element; open?: bool
     >
       {props.children}
     </Collapsible>
-  );
-}
-
-function VirtualTranscriptEntryRow(props: {
-  virtualItem: VirtualItem;
-  entry?: SessionEntry;
-  project: Project;
-  hideThinking: boolean;
-  toolOutputMode: ChatToolOutputMode;
-  toolCalls: Map<string, ToolCallInfo>;
-  syntaxTheme: ShikiSyntaxTheme;
-  searchQuery?: string;
-  searchMatch: boolean;
-  searchActive: boolean;
-  measureElement: (element: HTMLDivElement | null) => void;
-  setEntryRef: (id: string, element: HTMLDivElement) => void;
-  deleteEntryRef: (id: string, element: HTMLDivElement) => void;
-  onPreviewAttachment: (path: string) => void;
-}) {
-  let element: HTMLDivElement | undefined;
-  let registeredEntryId: string | undefined;
-
-  function syncEntryRef() {
-    if (!element) return;
-    const entry = props.entry;
-    if (!entry) {
-      if (registeredEntryId) props.deleteEntryRef(registeredEntryId, element);
-      registeredEntryId = undefined;
-      return;
-    }
-    if (registeredEntryId && registeredEntryId !== entry.id) props.deleteEntryRef(registeredEntryId, element);
-    registeredEntryId = entry.id;
-    props.setEntryRef(entry.id, element);
-  }
-
-  createEffect(syncEntryRef);
-
-  createEffect(() => {
-    const index = props.virtualItem.index;
-    if (!element) return;
-    element.dataset.index = String(index);
-    props.measureElement(element);
-  });
-
-  onCleanup(() => {
-    if (registeredEntryId && element) props.deleteEntryRef(registeredEntryId, element);
-  });
-
-  return (
-    <div
-      ref={(node) => {
-        element = node;
-        element.dataset.index = String(props.virtualItem.index);
-        syncEntryRef();
-      }}
-      data-index={props.virtualItem.index}
-      class={`chat-search-entry ${props.searchMatch ? 'chat-search-entry-match' : ''} ${props.searchActive ? 'chat-search-entry-active' : ''}`}
-      style={{ position: 'absolute', top: '0', left: '0', width: '100%', transform: `translateY(${props.virtualItem.start}px)` }}
-    >
-      <Show when={props.entry} keyed>
-        {(entry) => <TranscriptEntry entry={entry} project={props.project} hideThinking={props.hideThinking} toolOutputMode={props.toolOutputMode} toolCalls={props.toolCalls} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} onPreviewAttachment={props.onPreviewAttachment} />}
-      </Show>
-    </div>
   );
 }
 
