@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider, createInfiniteQuery, createQuery } from '@tanstack/solid-query';
+import { createVirtualizer, type VirtualItem } from '@tanstack/solid-virtual';
 import {
   Activity,
   AlignJustify,
@@ -273,6 +274,8 @@ const WEBSOCKET_RECONNECT_MIN_DELAY_MS = 500;
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
 const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
+const AGENT_SOCKET_EVENT_BATCH_BUDGET_MS = 8;
+const AGENT_SOCKET_EVENT_BATCH_MAX = 100;
 const LIVE_ACTIVITY_PUBLISH_INTERVAL_MS = 80;
 const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 8_000;
 const LIVE_SHELL_OUTPUT_MAX_LENGTH = 8_000;
@@ -1654,40 +1657,86 @@ function Shell() {
         })
         .catch((error) => console.warn('Could not load extension UI requests', error));
     };
+    let pendingAgentSocketPayloads: string[] = [];
+    let pendingAgentSocketOffset = 0;
+    let pendingAgentSocketFrame: number | undefined;
+
+    const processAgentSocketPayload = (payload: string) => {
+      try {
+        const parsed = JSON.parse(payload) as AgentServerEvent & { sessionId?: string };
+        const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
+        if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([payload]);
+        else if (shouldHandleAgentEvent(parsed)) handleAgentEvent(payload, parsed);
+        const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
+        if (parsed.type === 'agent:ui-request') {
+          const request = readExtensionUiRequest(parsed.data, eventSessionId);
+          if (request) upsertExtensionUiRequest(request);
+        }
+        if (parsed.type === 'agent:ui-response') {
+          const id = readExtensionUiResponseId(parsed.data);
+          if (id) removeExtensionUiRequest(id);
+        }
+        if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
+        if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
+          removeSessionExtensionUiRequests(eventSessionId);
+          queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
+          queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
+          queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
+          queryClient.invalidateQueries({ queryKey: ['agent-status', project.id, eventSessionId] });
+          invalidateProjectFileCaches(project.id);
+        }
+      } catch {
+        if (shouldShowAgentEvent(payload)) handleAgentEvent(payload);
+      }
+    };
+
+    const scheduleAgentSocketFlush = () => {
+      if (pendingAgentSocketFrame !== undefined) return;
+      pendingAgentSocketFrame = window.requestAnimationFrame(() => {
+        pendingAgentSocketFrame = undefined;
+        const deadline = performance.now() + AGENT_SOCKET_EVENT_BATCH_BUDGET_MS;
+        let processed = 0;
+        while (
+          pendingAgentSocketOffset < pendingAgentSocketPayloads.length
+          && processed < AGENT_SOCKET_EVENT_BATCH_MAX
+          && performance.now() < deadline
+        ) {
+          processAgentSocketPayload(pendingAgentSocketPayloads[pendingAgentSocketOffset]);
+          pendingAgentSocketOffset += 1;
+          processed += 1;
+        }
+        if (pendingAgentSocketOffset >= pendingAgentSocketPayloads.length) {
+          pendingAgentSocketPayloads = [];
+          pendingAgentSocketOffset = 0;
+          return;
+        }
+        if (pendingAgentSocketOffset > AGENT_SOCKET_EVENT_BATCH_MAX * 2) {
+          pendingAgentSocketPayloads = pendingAgentSocketPayloads.slice(pendingAgentSocketOffset);
+          pendingAgentSocketOffset = 0;
+        }
+        scheduleAgentSocketFlush();
+      });
+    };
+
     const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentActiveSessionId ? `?sessionId=${encodeURIComponent(currentActiveSessionId)}` : ''}`), {
       heartbeat: true,
       onOpen: refreshAgentQueries,
       onMessage: (event) => {
         agentSocketEventGeneration += 1;
-        try {
-          const parsed = JSON.parse(event.data) as AgentServerEvent & { sessionId?: string };
-          const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
-          if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([event.data]);
-          else if (shouldHandleAgentEvent(parsed)) handleAgentEvent(event.data, parsed);
-          const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
-          if (parsed.type === 'agent:ui-request') {
-            const request = readExtensionUiRequest(parsed.data, eventSessionId);
-            if (request) upsertExtensionUiRequest(request);
-          }
-          if (parsed.type === 'agent:ui-response') {
-            const id = readExtensionUiResponseId(parsed.data);
-            if (id) removeExtensionUiRequest(id);
-          }
-          if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
-          if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
-            removeSessionExtensionUiRequests(eventSessionId);
-            queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
-            queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
-            queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
-            queryClient.invalidateQueries({ queryKey: ['agent-status', project.id, eventSessionId] });
-            invalidateProjectFileCaches(project.id);
-          }
-        } catch {
-          if (shouldShowAgentEvent(event.data)) handleAgentEvent(event.data);
-        }
+        pendingAgentSocketPayloads.push(typeof event.data === 'string' ? event.data : String(event.data));
+        scheduleAgentSocketFlush();
       },
     });
-    onCleanup(cleanup);
+    onCleanup(() => {
+      cleanup();
+      if (pendingAgentSocketFrame !== undefined) window.cancelAnimationFrame(pendingAgentSocketFrame);
+      while (pendingAgentSocketOffset < pendingAgentSocketPayloads.length) {
+        processAgentSocketPayload(pendingAgentSocketPayloads[pendingAgentSocketOffset]);
+        pendingAgentSocketOffset += 1;
+      }
+      pendingAgentSocketPayloads = [];
+      pendingAgentSocketOffset = 0;
+    });
   });
 
   createEffect(() => {
@@ -4967,6 +5016,18 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (pendingUserMessageVisible() && !entries.some(isUserMessageEntry)) return [];
     return chatDisplayEntries(entries);
   });
+  const transcriptVirtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() {
+      return visibleTranscriptEntries().length;
+    },
+    getScrollElement: () => transcriptScrollerRef ?? null,
+    estimateSize: () => CHAT_ROW_ESTIMATED_HEIGHT,
+    getItemKey: (index) => visibleTranscriptEntries()[index]?.id ?? index,
+    overscan: 8,
+    onChange: () => {
+      if (stickToBottom()) scrollTranscriptToBottom();
+    },
+  });
   const toolCalls = createMemo(() => toolCallMap(transcriptEntries()));
   const chatSearchMatches = createMemo(() => {
     const query = normalizedSearchQuery(props.searchQuery);
@@ -5073,7 +5134,21 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (!activeId || !normalizedSearchQuery(props.searchQuery)) return;
     const index = visibleTranscriptEntries().findIndex((entry) => entry.id === activeId);
     if (index === -1) return;
-    requestAnimationFrame(() => transcriptEntryRefs.get(activeId)?.scrollIntoView({ block: 'center', behavior: 'smooth' }));
+    transcriptVirtualizer.scrollToIndex(index, { align: 'center' });
+    const scrollActiveEntryIntoView = () => {
+      const element = transcriptEntryRefs.get(activeId);
+      if (!element) return false;
+      element.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      return true;
+    };
+    let followupFrame: number | undefined;
+    const frame = window.requestAnimationFrame(() => {
+      if (!scrollActiveEntryIntoView()) followupFrame = window.requestAnimationFrame(scrollActiveEntryIntoView);
+    });
+    onCleanup(() => {
+      window.cancelAnimationFrame(frame);
+      if (followupFrame !== undefined) window.cancelAnimationFrame(followupFrame);
+    });
   });
 
   createEffect(() => {
@@ -5232,6 +5307,14 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       }
     }
     saveComposerDraft(key, draft);
+  }
+
+  function setTranscriptEntryRef(id: string, element: HTMLDivElement) {
+    transcriptEntryRefs.set(id, element);
+  }
+
+  function deleteTranscriptEntryRef(id: string, element: HTMLDivElement) {
+    if (transcriptEntryRefs.get(id) === element) transcriptEntryRefs.delete(id);
   }
 
   function transcriptDistanceFromBottom(element: HTMLElement) {
@@ -6060,20 +6143,31 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
             <Show when={props.sessionId && session.error}>
               <div class="mb-4 rounded-2xl bg-card p-5 text-sm text-destructive ring-1 ring-destructive/20">{session.error instanceof Error ? session.error.message : 'Could not load session'}</div>
             </Show>
-            <For each={visibleTranscriptEntries()}>
-              {(item, index) => {
-                onCleanup(() => transcriptEntryRefs.delete(item.id));
-                return (
-                  <div
-                    ref={(element) => transcriptEntryRefs.set(item.id, element)}
-                    data-index={index()}
-                    class={`chat-search-entry ${chatSearchMatchIds().has(item.id) ? 'chat-search-entry-match' : ''} ${activeSearchEntryId() === item.id ? 'chat-search-entry-active' : ''}`}
-                  >
-                    <TranscriptEntry entry={item} project={props.project} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} toolCalls={toolCalls()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
-                  </div>
-                );
-              }}
-            </For>
+            <div class="relative w-full" style={{ height: `${transcriptVirtualizer.getTotalSize()}px` }}>
+              <For each={transcriptVirtualizer.getVirtualItems()}>
+                {(virtualItem) => {
+                  const item = () => visibleTranscriptEntries()[virtualItem.index];
+                  return (
+                    <VirtualTranscriptEntryRow
+                      virtualItem={virtualItem}
+                      entry={item()}
+                      project={props.project}
+                      hideThinking={hideThinking()}
+                      toolOutputMode={toolOutputMode()}
+                      toolCalls={toolCalls()}
+                      syntaxTheme={syntaxTheme()}
+                      searchQuery={props.searchQuery}
+                      searchMatch={Boolean(item() && chatSearchMatchIds().has(item()!.id))}
+                      searchActive={activeSearchEntryId() === item()?.id}
+                      measureElement={(element) => transcriptVirtualizer.measureElement(element)}
+                      setEntryRef={setTranscriptEntryRef}
+                      deleteEntryRef={deleteTranscriptEntryRef}
+                      onPreviewAttachment={setPreviewPath}
+                    />
+                  );
+                }}
+              </For>
+            </div>
             <Show when={pendingUserMessageVisible() ? pendingUserMessage() : undefined}>
               {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending().text }]} attachments={pending().attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
             </Show>
@@ -8608,6 +8702,69 @@ function PanelSection(props: { title: string; children: JSX.Element; open?: bool
     >
       {props.children}
     </Collapsible>
+  );
+}
+
+function VirtualTranscriptEntryRow(props: {
+  virtualItem: VirtualItem;
+  entry?: SessionEntry;
+  project: Project;
+  hideThinking: boolean;
+  toolOutputMode: ChatToolOutputMode;
+  toolCalls: Map<string, ToolCallInfo>;
+  syntaxTheme: ShikiSyntaxTheme;
+  searchQuery?: string;
+  searchMatch: boolean;
+  searchActive: boolean;
+  measureElement: (element: HTMLDivElement | null) => void;
+  setEntryRef: (id: string, element: HTMLDivElement) => void;
+  deleteEntryRef: (id: string, element: HTMLDivElement) => void;
+  onPreviewAttachment: (path: string) => void;
+}) {
+  let element: HTMLDivElement | undefined;
+  let registeredEntryId: string | undefined;
+
+  function syncEntryRef() {
+    if (!element) return;
+    const entry = props.entry;
+    if (!entry) {
+      if (registeredEntryId) props.deleteEntryRef(registeredEntryId, element);
+      registeredEntryId = undefined;
+      return;
+    }
+    if (registeredEntryId && registeredEntryId !== entry.id) props.deleteEntryRef(registeredEntryId, element);
+    registeredEntryId = entry.id;
+    props.setEntryRef(entry.id, element);
+  }
+
+  createEffect(syncEntryRef);
+
+  createEffect(() => {
+    const index = props.virtualItem.index;
+    if (!element) return;
+    element.dataset.index = String(index);
+    props.measureElement(element);
+  });
+
+  onCleanup(() => {
+    if (registeredEntryId && element) props.deleteEntryRef(registeredEntryId, element);
+  });
+
+  return (
+    <div
+      ref={(node) => {
+        element = node;
+        element.dataset.index = String(props.virtualItem.index);
+        syncEntryRef();
+      }}
+      data-index={props.virtualItem.index}
+      class={`chat-search-entry ${props.searchMatch ? 'chat-search-entry-match' : ''} ${props.searchActive ? 'chat-search-entry-active' : ''}`}
+      style={{ position: 'absolute', top: '0', left: '0', width: '100%', transform: `translateY(${props.virtualItem.start}px)` }}
+    >
+      <Show when={props.entry} keyed>
+        {(entry) => <TranscriptEntry entry={entry} project={props.project} hideThinking={props.hideThinking} toolOutputMode={props.toolOutputMode} toolCalls={props.toolCalls} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} onPreviewAttachment={props.onPreviewAttachment} />}
+      </Show>
+    </div>
   );
 }
 
