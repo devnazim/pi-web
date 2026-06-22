@@ -274,6 +274,8 @@ const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
 const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
 const LIVE_ACTIVITY_PUBLISH_INTERVAL_MS = 80;
+const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 24_000;
+const LIVE_SHELL_OUTPUT_MAX_LENGTH = 16_000;
 const CHAT_CODE_HIGHLIGHT_MAX_LENGTH = 200_000;
 const CHAT_ROW_ESTIMATED_HEIGHT = 120;
 const CHAT_TOOL_OUTPUT_OPTIONS: SelectOption[] = [
@@ -834,7 +836,8 @@ function Shell() {
       const payloads = pendingEventPayloads;
       pendingEventPayloads = [];
       pendingEventsFrame = undefined;
-      setEvents((items) => [...items, ...payloads].slice(-240));
+      const eventPayloads = payloads.filter(shouldStoreAgentEvent);
+      if (eventPayloads.length) setEvents((items) => [...items, ...eventPayloads].slice(-240));
       applyLiveEventPayloads(payloads);
     });
   }
@@ -854,8 +857,8 @@ function Shell() {
     if (!pendingLiveTextChunks.length && !pendingLiveThinkingChunks.length) return;
     liveAgentActivityValue = {
       ...liveAgentActivityValue,
-      text: pendingLiveTextChunks.length ? liveAgentActivityValue.text + pendingLiveTextChunks.join('') : liveAgentActivityValue.text,
-      thinking: pendingLiveThinkingChunks.length ? liveAgentActivityValue.thinking + pendingLiveThinkingChunks.join('') : liveAgentActivityValue.thinking,
+      text: pendingLiveTextChunks.length ? appendLivePreviewText(liveAgentActivityValue.text, pendingLiveTextChunks.join(''), LIVE_ACTIVITY_TEXT_MAX_LENGTH) : liveAgentActivityValue.text,
+      thinking: pendingLiveThinkingChunks.length ? appendLivePreviewText(liveAgentActivityValue.thinking, pendingLiveThinkingChunks.join(''), LIVE_ACTIVITY_TEXT_MAX_LENGTH) : liveAgentActivityValue.thinking,
     };
     pendingLiveTextChunks = [];
     pendingLiveThinkingChunks = [];
@@ -2195,7 +2198,7 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} events={events()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -4654,7 +4657,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; events: string[]; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -4793,14 +4796,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
                     class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
                     style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
                   >
-                    <Chat project={project()} sessionId={props.sessionId} events={props.events} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
+                    <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                     <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
                 <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} events={props.events} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
+                  <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
                   <div
                     class="terminal-resize-handle"
                     role="separator"
@@ -4832,7 +4835,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; events: s
   );
 }
 
-function Chat(props: { project: Project; sessionId?: string; events: string[]; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
@@ -9204,6 +9207,15 @@ function shouldShowAgentEvent(payload: string) {
   }
 }
 
+function shouldStoreAgentEvent(payload: string) {
+  try {
+    const parsed = JSON.parse(payload) as { type?: string; data?: unknown };
+    return parsed.type !== 'agent:event' || agentEventDataType(parsed.data) !== 'message_update';
+  } catch {
+    return true;
+  }
+}
+
 function eventsBelongToSession(events: string[], sessionId: string) {
   return events.some((payload) => {
     try {
@@ -9284,6 +9296,17 @@ function parseAgentServerEvent(raw: string): AgentServerEvent | undefined {
   }
 }
 
+function appendLivePreviewText(current: string, delta: string, maxLength: number) {
+  const next = `${current}${delta}`;
+  if (next.length <= maxLength) return next;
+  return `…\n${next.slice(Math.max(0, next.length - maxLength))}`;
+}
+
+function livePreviewText(value: string, maxLength: number) {
+  if (value.length <= maxLength) return value;
+  return `…\n${value.slice(Math.max(0, value.length - maxLength))}`;
+}
+
 function shouldPublishLiveActivityImmediately(event: AgentServerEvent) {
   if (event.type === 'bash:update') return false;
   if (event.type !== 'agent:event') return true;
@@ -9307,7 +9330,7 @@ function agentActivityMessageDelta(event: AgentServerEvent): { text?: string; th
 
 function reduceBashActivityEvent(activity: BashActivity, event: AgentServerEvent): BashActivity {
   if (event.type === 'bash:start') return { running: true, command: event.message, output: '' };
-  if (event.type === 'bash:update') return { ...activity, output: activity.output + (event.message ?? '') };
+  if (event.type === 'bash:update') return { ...activity, output: appendLivePreviewText(activity.output, event.message ?? '', LIVE_SHELL_OUTPUT_MAX_LENGTH) };
   if (event.type === 'bash:finish') return { ...activity, running: false, command: event.message ?? activity.command };
   if (event.type === 'bash:error') return { ...activity, running: false, error: event.message ?? 'Shell command failed' };
   return activity;
@@ -9335,10 +9358,10 @@ function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEve
     const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
     let text = activity.text;
     let thinking = activity.thinking;
-    if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') text += messageEvent.delta;
-    if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string') thinking += messageEvent.delta;
-    if (messageEvent.type === 'text_end' && !text && typeof messageEvent.content === 'string') text = messageEvent.content;
-    if (messageEvent.type === 'thinking_end' && !thinking && typeof messageEvent.content === 'string') thinking = messageEvent.content;
+    if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') text = appendLivePreviewText(text, messageEvent.delta, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
+    if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string') thinking = appendLivePreviewText(thinking, messageEvent.delta, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
+    if (messageEvent.type === 'text_end' && !text && typeof messageEvent.content === 'string') text = livePreviewText(messageEvent.content, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
+    if (messageEvent.type === 'thinking_end' && !thinking && typeof messageEvent.content === 'string') thinking = livePreviewText(messageEvent.content, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
     return { ...activity, running: true, streaming: true, text, thinking };
   }
   if (type === 'tool_execution_start' || type === 'tool_execution_update' || type === 'tool_execution_end') {
