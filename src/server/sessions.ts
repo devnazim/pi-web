@@ -129,16 +129,36 @@ export function readSessionDetail(filePath: string, cwd?: string): SessionDetail
 }
 
 export function sessionDetailFromManager(filePath: string, manager: SessionManager): SessionDetail {
+  const entries = manager.getEntries();
+  const leafId = manager.getLeafId();
   return {
     sessionId: sessionIdFromPath(filePath),
     path: filePath,
     header: manager.getHeader(),
-    entries: manager.getEntries(),
-    branch: manager.getBranch(),
-    tree: manager.getTree(),
-    leafId: manager.getLeafId(),
+    entries,
+    branch: sessionBranchFromEntries(entries, leafId),
+    // Do not serialize the nested tree from SessionManager.getTree(). Long linear
+    // sessions create thousands of nested child objects and can overflow
+    // JSON.stringify's call stack in Fastify. The web client reconstructs the
+    // tree iteratively from the flat entries instead.
+    tree: [],
+    leafId,
     name: manager.getSessionName(),
   };
+}
+
+function sessionBranchFromEntries(entries: SessionDetail['entries'], leafId: string | null) {
+  if (!leafId) return [];
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const branch: SessionDetail['entries'] = [];
+  const visited = new Set<string>();
+  let entry = byId.get(leafId);
+  while (entry && !visited.has(entry.id)) {
+    visited.add(entry.id);
+    branch.push(entry);
+    entry = entry.parentId ? byId.get(entry.parentId) : undefined;
+  }
+  return branch.reverse();
 }
 
 type PendingSessionInfoManager = Pick<SessionManager, 'appendSessionInfo' | 'getSessionFile'> & Partial<Pick<SessionManager, 'getSessionName'>>;

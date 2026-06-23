@@ -10156,35 +10156,94 @@ function branchForEntry(entries: SessionEntry[], leafId: string | null | undefin
   if (leafId === null) return [];
   const byId = new Map(entries.map((entry) => [entry.id, entry]));
   const branch: SessionEntry[] = [];
+  const visited = new Set<string>();
   let entry = byId.get(leafId);
-  while (entry) {
-    branch.unshift(entry);
+  while (entry && !visited.has(entry.id)) {
+    visited.add(entry.id);
+    branch.push(entry);
     entry = entry.parentId ? byId.get(entry.parentId) : undefined;
   }
-  return branch;
+  return branch.reverse();
 }
 
 function sessionTreeViewFromDetail(detail: SessionDetail): SessionTreeView {
-  const containsActive = treeActivePathMap(detail.tree, detail.leafId);
-  return { ...detail, tree: orderTreeNodesByActivePath(detail.tree, containsActive).map((node) => treeViewNodeFromSessionNode(node, containsActive)) };
+  const tree = detail.tree?.length ? detail.tree : sessionTreeNodesFromEntries(detail.entries);
+  const containsActive = treeActivePathMap(tree, detail.leafId);
+  return { ...detail, tree: treeViewNodesFromSessionNodes(tree, containsActive) };
 }
 
-function treeViewNodeFromSessionNode(node: SessionTreeNode, containsActive: Map<SessionTreeNode, boolean>): TreeViewNode {
-  const display = treeEntryDisplay(node.entry);
-  return {
-    ...node,
-    id: node.entry.id,
-    children: orderTreeNodesByActivePath(node.children, containsActive).map((child) => treeViewNodeFromSessionNode(child, containsActive)),
-    display,
-    roleClass: entryRoleClass(node.entry),
-    searchText: [node.label, entryRole(node.entry), entryText(node.entry), display].filter(Boolean).join(' ').toLowerCase(),
-    isSettingsEntry: ['label', 'custom', 'model_change', 'thinking_level_change', 'session_info'].includes(node.entry.type),
-    isEmptyAssistant: node.entry.type === 'message'
-      && node.entry.message?.role === 'assistant'
-      && !hasTextContent(node.entry.message.content)
-      && node.entry.message.stopReason !== 'aborted'
-      && !node.entry.message.errorMessage,
-  };
+function sessionTreeNodesFromEntries(entries: SessionEntry[]): SessionTreeNode[] {
+  const labelsById = new Map<string, { label: string; timestamp?: string }>();
+  for (const entry of entries) {
+    if (entry.type !== 'label' || typeof entry.targetId !== 'string') continue;
+    if (typeof entry.label === 'string' && entry.label) labelsById.set(entry.targetId, { label: entry.label, timestamp: entry.timestamp });
+    else labelsById.delete(entry.targetId);
+  }
+
+  const nodeMap = new Map<string, SessionTreeNode>();
+  for (const entry of entries) {
+    const label = labelsById.get(entry.id);
+    nodeMap.set(entry.id, { entry, children: [], label: label?.label, labelTimestamp: label?.timestamp });
+  }
+
+  const roots: SessionTreeNode[] = [];
+  for (const entry of entries) {
+    const node = nodeMap.get(entry.id);
+    if (!node || entry.parentId === null || entry.parentId === entry.id) {
+      if (node) roots.push(node);
+      continue;
+    }
+
+    const parent = nodeMap.get(entry.parentId);
+    if (parent && parent !== node) parent.children.push(node);
+    else roots.push(node);
+  }
+
+  const stack = [...roots];
+  const visited = new Set<SessionTreeNode>();
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (visited.has(node)) continue;
+    visited.add(node);
+    node.children.sort(compareSessionTreeNodeTimestamp);
+    stack.push(...node.children);
+  }
+  return roots;
+}
+
+function treeViewNodesFromSessionNodes(roots: SessionTreeNode[], containsActive: Map<SessionTreeNode, boolean>): TreeViewNode[] {
+  const allNodes: SessionTreeNode[] = [];
+  const stack = [...roots];
+  const visited = new Set<SessionTreeNode>();
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (visited.has(node)) continue;
+    visited.add(node);
+    allNodes.push(node);
+    for (let i = node.children.length - 1; i >= 0; i -= 1) stack.push(node.children[i]);
+  }
+
+  const viewByNode = new Map<SessionTreeNode, TreeViewNode>();
+  for (let i = allNodes.length - 1; i >= 0; i -= 1) {
+    const node = allNodes[i];
+    const display = treeEntryDisplay(node.entry);
+    viewByNode.set(node, {
+      ...node,
+      id: node.entry.id,
+      children: orderTreeNodesByActivePath(node.children, containsActive).flatMap((child) => viewByNode.get(child) ?? []),
+      display,
+      roleClass: entryRoleClass(node.entry),
+      searchText: [node.label, entryRole(node.entry), entryText(node.entry), display].filter(Boolean).join(' ').toLowerCase(),
+      isSettingsEntry: ['label', 'custom', 'model_change', 'thinking_level_change', 'session_info'].includes(node.entry.type),
+      isEmptyAssistant: node.entry.type === 'message'
+        && node.entry.message?.role === 'assistant'
+        && !hasTextContent(node.entry.message.content)
+        && node.entry.message.stopReason !== 'aborted'
+        && !node.entry.message.errorMessage,
+    });
+  }
+
+  return orderTreeNodesByActivePath(roots, containsActive).flatMap((node) => viewByNode.get(node) ?? []);
 }
 
 function flattenSessionTree(roots: TreeViewNode[], collapsedIds: Set<string>): FlatTreeNode[] {
@@ -10195,8 +10254,11 @@ function flattenSessionTree(roots: TreeViewNode[], collapsedIds: Set<string>): F
     stack.push([roots[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, i === roots.length - 1, [], multipleRoots]);
   }
 
+  const visited = new Set<TreeViewNode>();
   while (stack.length) {
     const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop()!;
+    if (visited.has(node)) continue;
+    visited.add(node);
     result.push({ node, indent, showConnector, isLast, gutters, isVirtualRootChild });
 
     if (collapsedIds.has(node.entry.id)) continue;
@@ -10218,8 +10280,11 @@ function treeActivePathMap(roots: SessionTreeNode[], leafId: string | null) {
   const containsActive = new Map<SessionTreeNode, boolean>();
   const allNodes: SessionTreeNode[] = [];
   const stack = [...roots];
+  const visited = new Set<SessionTreeNode>();
   while (stack.length) {
     const node = stack.pop()!;
+    if (visited.has(node)) continue;
+    visited.add(node);
     allNodes.push(node);
     for (let i = node.children.length - 1; i >= 0; i -= 1) stack.push(node.children[i]);
   }
@@ -10232,6 +10297,15 @@ function treeActivePathMap(roots: SessionTreeNode[], leafId: string | null) {
 
 function orderTreeNodesByActivePath(nodes: SessionTreeNode[], containsActive: Map<SessionTreeNode, boolean>) {
   return [...nodes].sort((a, b) => Number(containsActive.get(b)) - Number(containsActive.get(a)));
+}
+
+function compareSessionTreeNodeTimestamp(a: SessionTreeNode, b: SessionTreeNode) {
+  return sessionEntryTimestampMs(a.entry) - sessionEntryTimestampMs(b.entry);
+}
+
+function sessionEntryTimestampMs(entry: SessionEntry) {
+  const parsed = Date.parse(entry.timestamp ?? '');
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
 function filterTreeNodes(nodes: FlatTreeNode[], search: string, filterMode: TreeFilterMode, leafId: string | null) {
