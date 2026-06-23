@@ -4903,6 +4903,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let transcriptScrollFollowupFrame: number | undefined;
   let transcriptScrollForce = false;
   let composerLayoutFrame: number | undefined;
+  let composerLayoutPasses = 0;
   let composerHistoryIndex: number | undefined;
   let composerHistoryMode: ComposerHistoryMode | undefined;
   let composerHistoryDraft: ComposerHistoryItem = { text: '', uploads: [] };
@@ -5267,7 +5268,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     };
     window.addEventListener('keydown', onKeyDown);
 
-    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(syncComposerLayout);
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => syncComposerLayout());
     if (observer && composerRef) observer.observe(composerRef);
     onCleanup(() => {
       window.removeEventListener('keydown', onKeyDown);
@@ -5417,25 +5418,29 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setCommandArgumentMention(commandArgument);
   }
 
-  function syncComposerLayout() {
+  function syncComposerLayout(passes = 1) {
+    composerLayoutPasses = Math.max(composerLayoutPasses, passes);
     if (composerLayoutFrame !== undefined) return;
     composerLayoutFrame = requestAnimationFrame(() => {
       composerLayoutFrame = undefined;
+      composerLayoutPasses = Math.max(0, composerLayoutPasses - 1);
       const target = composerRef;
-      if (!target) return;
-      const style = window.getComputedStyle(target);
-      const lineHeight = Number.parseFloat(style.lineHeight);
-      const verticalPadding = (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0);
-      const lineHeightPx = Number.isFinite(lineHeight) ? lineHeight : 24;
-      const minHeight = lineHeightPx * COMPOSER_MIN_LINES + verticalPadding;
-      const maxHeight = lineHeightPx * COMPOSER_MAX_LINES + verticalPadding;
-      const scrollTop = target.scrollTop;
-      const scrollLeft = target.scrollLeft;
-      target.style.height = 'auto';
-      target.style.height = `${Math.min(Math.max(target.scrollHeight, minHeight), maxHeight)}px`;
-      target.scrollTop = Math.min(scrollTop, Math.max(target.scrollHeight - target.clientHeight, 0));
-      target.scrollLeft = scrollLeft;
-      syncComposerHighlightsScroll(target);
+      if (target) {
+        const style = window.getComputedStyle(target);
+        const lineHeight = Number.parseFloat(style.lineHeight);
+        const verticalPadding = (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0);
+        const lineHeightPx = Number.isFinite(lineHeight) ? lineHeight : 24;
+        const minHeight = lineHeightPx * COMPOSER_MIN_LINES + verticalPadding;
+        const maxHeight = lineHeightPx * COMPOSER_MAX_LINES + verticalPadding;
+        const scrollTop = target.scrollTop;
+        const scrollLeft = target.scrollLeft;
+        target.style.height = 'auto';
+        target.style.height = `${Math.min(Math.max(target.scrollHeight, minHeight), maxHeight)}px`;
+        target.scrollTop = Math.min(scrollTop, Math.max(target.scrollHeight - target.clientHeight, 0));
+        target.scrollLeft = scrollLeft;
+        syncComposerHighlightsScroll(target);
+      }
+      if (composerLayoutPasses > 0) syncComposerLayout(0);
     });
   }
 
@@ -6258,7 +6263,14 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
               placeholder={props.treeSelection ? 'Prompt for selected tree node...' : 'Ask anything...'}
               value={text()}
               rows={1}
-              onInput={(event) => { resetComposerHistory(); setText(event.currentTarget.value); updateFileMention(event.currentTarget); syncComposerLayout(); }}
+              onInput={(event) => {
+                const target = event.currentTarget;
+                resetComposerHistory();
+                setText(target.value);
+                updateFileMention(target);
+                syncComposerHighlightsScroll(target);
+                syncComposerLayout(2);
+              }}
               onClick={(event) => updateFileMention(event.currentTarget)}
               onScroll={(event) => {
                 if (!composerHighlightsRef) return;
@@ -6323,6 +6335,8 @@ function ComposerHighlights(props: { text: string; setRef?: (element: HTMLDivEle
       <For each={composerHighlightParts(props.text)}>
         {(part) => <span class={part.kind === 'file' ? 'composer-highlight-file' : ''}>{part.text}</span>}
       </For>
+      {/* Keep the mirror's final line box aligned with textarea trailing newlines/spaces. */}
+      <span>{'\u200b'}</span>
     </div>
   );
 }
