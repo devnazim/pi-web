@@ -318,7 +318,11 @@ export class PiBridge {
         throw error;
       }
       const lifecycle = { started: false, finished: false };
-      subscription = queuedStreamingPrompt ? undefined : this.subscribeSessionEvents(session, key, body.sessionId, { mirrorLifecycle: extensionCommand, lifecycle });
+      subscription = queuedStreamingPrompt ? undefined : this.subscribeSessionEvents(session, key, body.sessionId, {
+        mirrorLifecycle: extensionCommand,
+        lifecycle,
+        onActivityStart: extensionCommand ? () => reportPreflight(true) : undefined,
+      });
       const useSyntheticStart = (options.startEvent ?? true) && !extensionCommand && !queuedStreamingPrompt;
       if (useSyntheticStart) this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
 
@@ -339,16 +343,15 @@ export class PiBridge {
         ? `${body.prompt}\n\nAttached files in the workspace:\n${body.attachments.map((file) => `- ${file}`).join('\n')}`
         : body.prompt;
 
-      if (extensionCommand) reportPreflight(true);
       if (typeof session?.prompt === 'function') {
         await session.prompt(prompt, {
           source: 'rpc',
           streamingBehavior,
           preflightResult: (success: boolean) => {
-            if (success) reportPreflight(true);
+            if (success && !extensionCommand) reportPreflight(true);
           },
         });
-        reportPreflight(true);
+        if (!extensionCommand) reportPreflight(true);
       } else if (typeof session?.followUp === 'function') {
         await session.followUp(prompt);
         reportPreflight(true);
@@ -356,7 +359,13 @@ export class PiBridge {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
       }
 
-      if (extensionCommand) await this.waitForCommandActivity(session, lifecycle);
+      if (extensionCommand) {
+        // Some extension commands only update extension state/UI (for example `/xplan steps` without a task).
+        // Hold the HTTP preflight response until we know whether real agent activity started; otherwise
+        // a status refresh can observe this temporary bridge lock as a running agent and leave the web UI busy.
+        await this.waitForCommandActivity(session, lifecycle, () => reportPreflight(true));
+        reportPreflight(true);
+      }
       subscription?.();
       subscription = undefined;
       const needsSyntheticFinish = !queuedStreamingPrompt && (!extensionCommand || (!lifecycle.started && options.startEvent === false));
@@ -557,12 +566,13 @@ export class PiBridge {
     return pending.request;
   }
 
-  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean } } = {}) {
+  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void } = {}) {
     if (typeof session?.subscribe !== 'function') return undefined;
     return session.subscribe((event: unknown) => {
       const type = agentEventType(event);
       if (options.mirrorLifecycle && isCommandActivityStartEvent(type) && !options.lifecycle?.started) {
         if (options.lifecycle) options.lifecycle.started = true;
+        options.onActivityStart?.();
         this.broadcast(key, { type: 'agent:start', sessionId });
       }
       this.broadcast(key, { type: 'agent:event', sessionId, data: event });
@@ -578,8 +588,9 @@ export class PiBridge {
     return Boolean(commandName && typeof session?.extensionRunner?.getCommand === 'function' && session.extensionRunner.getCommand(commandName));
   }
 
-  private async waitForCommandActivity(session: any, lifecycle: { started: boolean; finished: boolean }) {
-    if (this.cachedSessionInUse(session)) {
+  private async waitForCommandActivity(session: any, lifecycle: { started: boolean; finished: boolean }, onActivityStart?: () => void) {
+    if (lifecycle.started || this.cachedSessionInUse(session)) {
+      onActivityStart?.();
       await this.waitForSessionIdle(session);
       return;
     }
@@ -588,11 +599,13 @@ export class PiBridge {
     while (!lifecycle.started && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 25));
       if (this.cachedSessionInUse(session)) {
+        onActivityStart?.();
         await this.waitForSessionIdle(session);
         return;
       }
     }
 
+    if (lifecycle.started) onActivityStart?.();
     if (lifecycle.started && !lifecycle.finished && this.cachedSessionInUse(session)) await this.waitForSessionIdle(session);
   }
 
