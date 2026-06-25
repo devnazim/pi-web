@@ -177,7 +177,7 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
   session.sockets.add(socket);
   resizeTerminalSession(session, cols, rows);
   sendTerminalMessage(socket, { type: 'ready', cwd: session.cwd, title: session.title, shell: session.shell, shellName: session.shellName, terminalId: session.id, persistent: true });
-  if (session.replay) sendTerminalMessage(socket, { type: 'data', data: session.replay });
+  if (session.replay) sendTerminalMessage(socket, { type: 'data', data: session.replay, replay: true });
 
   socket.on('message', (data: { toString(): string }) => {
     if (session.disposed) return;

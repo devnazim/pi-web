@@ -7,7 +7,7 @@ import './terminal-font.css';
 type TerminalProject = { id: string; path: string };
 type ResolvedThemeMode = 'light' | 'dark';
 type TerminalStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
-type TerminalServerMessage = { type?: string; data?: string; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
+type TerminalServerMessage = { type?: string; data?: string; replay?: boolean; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
 type TerminalRuntime = { Terminal: typeof import('@xterm/xterm').Terminal; FitAddon: typeof import('@xterm/addon-fit').FitAddon };
 type Disposable = { dispose(): void };
 type TerminalModifier = 'ctrl' | 'alt' | 'shift';
@@ -88,6 +88,7 @@ const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
   '/': '?',
 };
 let terminalRuntimePromise: Promise<TerminalRuntime> | undefined;
+let terminalPrimaryClipboardText = '';
 
 export default function TerminalPanel(props: { project: TerminalProject; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onClose: () => void }) {
   let terminalElement: HTMLDivElement | undefined;
@@ -187,6 +188,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let inputDisposable: Disposable | undefined;
     let titleDisposable: Disposable | undefined;
     let osc7Disposable: Disposable | undefined;
+    let osc52Disposable: Disposable | undefined;
     let osc633Disposable: Disposable | undefined;
     let resizeObserver: ResizeObserver | undefined;
     let resizeTimer: number | undefined;
@@ -201,6 +203,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let pendingInput = '';
     let pendingMetadata: { cwd?: string; title?: string } = {};
     let terminalExited = false;
+    let replayClipboardSuppression = 0;
     let resizeTerminal: ((immediate?: boolean, forceRefresh?: boolean) => void) | undefined;
     let scheduleResizeTerminal: (() => void) | undefined;
 
@@ -227,6 +230,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           fontWeightBold: 600,
           letterSpacing: TERMINAL_LETTER_SPACING,
           lineHeight: TERMINAL_LINE_HEIGHT,
+          macOptionClickForcesSelection: true,
           rescaleOverlappingGlyphs: true,
           scrollback: 6000,
           theme: terminalTheme(),
@@ -257,11 +261,28 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (sendTerminalClientMessage(socket, { type: 'input', data })) return;
           if (socket?.readyState === WebSocket.CONNECTING) pendingInput = trimTerminalQueuedInput(pendingInput + data);
         };
+        const writeTerminalData = (data: string, replay = false) => {
+          if (!replay) {
+            xterm?.write(data);
+            return;
+          }
+          replayClipboardSuppression += 1;
+          xterm?.write(data, () => {
+            replayClipboardSuppression = Math.max(0, replayClipboardSuppression - 1);
+          });
+        };
         sendInputRef = sendTerminalInput;
         titleDisposable = xterm.onTitleChange(updateTerminalTitle);
         osc7Disposable = xterm.parser.registerOscHandler(7, (data) => {
           const nextCwd = terminalCwdFromOsc7(data);
           if (nextCwd) updateTerminalCwd(nextCwd);
+          return true;
+        });
+        osc52Disposable = xterm.parser.registerOscHandler(52, (data) => {
+          if (replayClipboardSuppression === 0) {
+            const clipboard = terminalClipboardTextFromOsc52(data);
+            if (clipboard) void writeTerminalClipboardText(clipboard.selection, clipboard.text);
+          }
           return true;
         });
         osc633Disposable = xterm.parser.registerOscHandler(633, (data) => {
@@ -405,7 +426,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             if (nextCwd) setCwd(nextCwd);
           } else if (message.type === 'data' && typeof message.data === 'string') {
             props.onFilesystemActivity?.();
-            xterm.write(message.data);
+            writeTerminalData(message.data, message.replay === true);
           } else if (message.type === 'error') {
             setStatus('error');
             xterm.writeln(`\r\n\x1b[31m${message.message ?? 'Terminal error'}\x1b[0m`);
@@ -482,6 +503,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
       inputDisposable?.dispose();
       titleDisposable?.dispose();
       osc7Disposable?.dispose();
+      osc52Disposable?.dispose();
       osc633Disposable?.dispose();
       if (terminalSocket === socket) terminalSocket = undefined;
       socket?.close();
@@ -669,6 +691,44 @@ function terminalTildeKey(number: number, modifiers: TerminalModifiers) {
 }
 
 async function copyTerminalSelection(text: string) {
+  if (await writeClipboardText(text)) return;
+  copyTextWithHiddenTextarea(text);
+}
+
+type TerminalClipboardSelection = 'c' | 'p';
+
+function terminalClipboardTextFromOsc52(data: string): { selection: TerminalClipboardSelection; text: string } | undefined {
+  const separatorIndex = data.indexOf(';');
+  if (separatorIndex < 0) return undefined;
+
+  const selection = terminalClipboardSelection(data.slice(0, separatorIndex));
+  const payload = data.slice(separatorIndex + 1);
+  if (!selection || payload === '?') return undefined;
+
+  const text = decodeTerminalClipboardBase64(payload);
+  return text === undefined ? undefined : { selection, text };
+}
+
+function terminalClipboardSelection(value: string): TerminalClipboardSelection | undefined {
+  if (value === '' || value === 'c') return 'c';
+  return value === 'p' ? 'p' : undefined;
+}
+
+function decodeTerminalClipboardBase64(value: string) {
+  try {
+    const binary = atob(value);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeTerminalClipboardText(selection: TerminalClipboardSelection, text: string) {
+  if (selection === 'p') {
+    terminalPrimaryClipboardText = text;
+    return;
+  }
   if (await writeClipboardText(text)) return;
   copyTextWithHiddenTextarea(text);
 }
