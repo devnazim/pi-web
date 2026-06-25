@@ -7,15 +7,20 @@
     "pi-web": "dist/server/cli.js"
   },
   "files": [
-    "dist",
+    "dist/server/**/*.js",
+    "dist/server/**/*.d.ts",
+    "dist/web",
+    "!dist/**/*.map",
     "README.md",
     "APP.md"
   ],
   "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "dev": "node scripts/dev.mjs",
     "dev:server": "tsx watch src/server/cli.ts --dev",
     "dev:web": "vite --host 127.0.0.1",
-    "build": "npm run build:web && npm run build:server",
+    "build": "npm run clean && npm run build:web && npm run build:server",
+    "prepack": "npm run build",
     "build:web": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
