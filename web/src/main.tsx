@@ -1067,9 +1067,9 @@ function Shell() {
     setNotificationToasts((items) => items.filter((item) => item.id !== id));
   }
 
-  function showNotificationToast(notification: WorkspaceNotificationItem) {
+  function showNotificationToast(notification: WorkspaceNotificationItem, playSound = true) {
     setNotificationToasts((items) => [notification, ...items.filter((item) => item.id !== notification.id)].slice(0, 4));
-    playWorkspaceNotificationSound(notification.level);
+    if (playSound) playWorkspaceNotificationSound(notification.level);
     window.setTimeout(() => removeNotificationToast(notification.id), WORKSPACE_NOTIFICATION_TOAST_TTL_MS);
   }
 
@@ -1229,7 +1229,9 @@ function Shell() {
     }
 
     if (!notification) return;
-    if (!read) showNotificationToast(notification);
+    const actionNeeded = isActionNeededNotification(notification);
+    if (!read) showNotificationToast(notification, !actionNeeded);
+    if (actionNeeded) playWorkspaceNotificationSound(notification.level);
     if (workspace) maybeShowBrowserNotification(notification, workspace, read);
   }
 
@@ -9872,7 +9874,7 @@ function workspaceNotificationFromEvent(event: WorkspaceNotificationServerEvent,
   if (event.type === 'agent:notice') return { ...base, title: 'Pi notice', message: singleLine(event.message ?? 'Notice'), level: notificationLevelFromUnknown((event.data as { level?: unknown } | undefined)?.level), kind: 'notice' };
   if (event.type === 'agent:ui-request') {
     const request = readExtensionUiRequest(event.data, event.sessionId);
-    const title = request?.method === 'confirm' ? 'Confirmation needed' : request?.method === 'select' ? 'Selection needed' : 'Input needed';
+    const title = request?.method === 'confirm' ? 'Confirmation needed' : request?.method === 'select' ? 'Selection needed' : request?.method === 'editor' ? 'Text needed' : 'Input needed';
     return { ...base, title, message: singleLine(request?.title ?? 'Extension UI request'), level: 'warning', kind: 'notice' };
   }
   if (event.type === 'bash:finish') return { ...base, title: 'Command completed', message: singleLine(event.message ?? 'Shell command finished'), level: 'success', kind: 'command' };
@@ -9906,6 +9908,12 @@ function isWorkspaceNotificationLevel(value: unknown): value is WorkspaceNotific
 
 function isWorkspaceNotificationKind(value: unknown): value is WorkspaceNotificationKind {
   return value === 'agent' || value === 'command' || value === 'notice' || value === 'retry' || value === 'compaction' || value === 'review';
+}
+
+function isActionNeededNotification(notification: WorkspaceNotificationItem) {
+  return notification.level === 'warning'
+    && notification.kind === 'notice'
+    && /^(Approval|Confirmation|Input|Selection|Text) needed$/.test(notification.title);
 }
 
 function readBrowserNotificationsEnabled() {
