@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
@@ -24,8 +25,7 @@ export async function deleteSessionUploads(projectPath: string, sessionIds: Iter
   for (const sessionId of sessionIds) {
     if (!sessionId) continue;
     roots.add(sessionUploadRoot(projectPath, sessionId));
-    const previousDir = previousSessionUploadDirName(sessionId);
-    if (previousDir) roots.add(resolveWithin(projectPath, path.join(UPLOADS_ROOT, SESSION_UPLOAD_DIR, previousDir)));
+    for (const previousDir of previousSessionUploadDirNames(sessionId)) roots.add(resolveWithin(projectPath, path.join(UPLOADS_ROOT, SESSION_UPLOAD_DIR, previousDir)));
     const legacyDir = legacySessionUploadDirName(sessionId);
     if (legacyDir) roots.add(resolveWithin(projectPath, path.join(UPLOADS_ROOT, legacyDir)));
   }
@@ -38,8 +38,7 @@ export async function cleanupOrphanedSessionUploads(projectPath: string, validSe
   for (const sessionId of validSessionIds) {
     if (!sessionId) continue;
     validSessionDirs.add(sessionUploadDirName(sessionId));
-    const previousDir = previousSessionUploadDirName(sessionId);
-    if (previousDir) validSessionDirs.add(previousDir);
+    for (const previousDir of previousSessionUploadDirNames(sessionId)) validSessionDirs.add(previousDir);
     const legacyDir = legacySessionUploadDirName(sessionId);
     if (legacyDir) validLegacyDirs.add(legacyDir);
   }
@@ -56,11 +55,14 @@ export async function cleanupOrphanedSessionUploads(projectPath: string, validSe
 }
 
 function sessionUploadDirName(sessionId: string) {
-  return `${SESSION_UPLOAD_DIR_PREFIX}${Buffer.from(sessionId).toString('base64url')}`;
+  return `${SESSION_UPLOAD_DIR_PREFIX}${createHash('sha256').update(sessionId).digest('base64url')}`;
 }
 
-function previousSessionUploadDirName(sessionId: string) {
-  return safeUploadPathSegment(encodeURIComponent(sessionId));
+function previousSessionUploadDirNames(sessionId: string) {
+  return [
+    safeUploadPathSegment(encodeURIComponent(sessionId)),
+    safeUploadPathSegment(`${SESSION_UPLOAD_DIR_PREFIX}${Buffer.from(sessionId).toString('base64url')}`),
+  ].filter((name): name is string => Boolean(name));
 }
 
 function legacySessionUploadDirName(sessionId: string) {
@@ -69,7 +71,7 @@ function legacySessionUploadDirName(sessionId: string) {
 }
 
 function safeUploadPathSegment(name: string) {
-  if (!name || name === '.' || name === '..' || RESERVED_UPLOAD_DIRS.has(name)) return undefined;
+  if (!name || name.length > 255 || name === '.' || name === '..' || RESERVED_UPLOAD_DIRS.has(name)) return undefined;
   if (name.includes('/') || name.includes('\\') || path.basename(name) !== name) return undefined;
   return name;
 }

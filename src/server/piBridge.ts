@@ -1,13 +1,15 @@
-import { AuthStorage, ModelRegistry } from '@earendil-works/pi-coding-agent';
+import { AuthStorage, ModelRegistry, resizeImage } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
 import { randomUUID } from 'node:crypto';
+import { constants, type Stats } from 'node:fs';
+import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { clearProjectFileCaches } from './files.js';
 import { getGitBranch } from './git.js';
 import type { ProjectRegistry } from './projects.js';
 import { applyPendingSessionInfo, projectSessionDir, resolveSessionFile, sessionDetailFromManager } from './sessions.js';
 import type { AgentEvent } from './types.js';
-import { sessionIdFromPath } from './util.js';
+import { resolveWithin, sessionIdFromPath } from './util.js';
 
 type WebSocket = {
   readyState: number;
@@ -19,6 +21,7 @@ type WebSocket = {
 type TreeSummaryOptions = { mode?: 'none' | 'summary' | 'custom'; instructions?: string; replace?: boolean };
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 type StreamingBehavior = 'steer' | 'followUp';
+type ImageContent = { type: 'image'; mimeType: string; data: string };
 
 interface PromptBody {
   sessionId?: string;
@@ -117,6 +120,14 @@ const WEB_BUILTIN_COMMAND_NAMES = new Set(['compact']);
 const AGENT_ALREADY_PROCESSING_MESSAGE = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 const SESSION_CACHE_TTL_MS = 30 * 60_000;
 const SESSION_CACHE_BUSY_RETRY_MS = 60_000;
+const IMAGE_TYPE_SNIFF_BYTES = 4100;
+const MAX_PROMPT_ATTACHMENT_PATHS = 100;
+const MAX_PROMPT_IMAGE_ATTACHMENTS = 20;
+const MAX_PROMPT_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
+const MAX_PROMPT_IMAGE_TOTAL_INPUT_BYTES = 20 * 1024 * 1024;
+const MAX_PROMPT_IMAGE_TOTAL_DATA_CHARS = 20 * 1024 * 1024;
+const MAX_PNG_ANIMATION_SCAN_CHUNKS = 4096;
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
 export class PiBridge {
   private readonly sockets = new Map<string, Set<WebSocket>>();
@@ -339,21 +350,20 @@ export class PiBridge {
 
       await this.applySessionControls(session, body);
 
-      const prompt = body.attachments?.length
-        ? `${body.prompt}\n\nAttached files in the workspace:\n${body.attachments.map((file) => `- ${file}`).join('\n')}`
-        : body.prompt;
+      const { prompt, images } = await this.preparePromptAttachments(projectPath, body.prompt, body.attachments);
 
       if (typeof session?.prompt === 'function') {
         await session.prompt(prompt, {
           source: 'rpc',
           streamingBehavior,
+          images: images.length ? images : undefined,
           preflightResult: (success: boolean) => {
             if (success && !extensionCommand) reportPreflight(true);
           },
         });
         if (!extensionCommand) reportPreflight(true);
       } else if (typeof session?.followUp === 'function') {
-        await session.followUp(prompt);
+        await session.followUp(prompt, images.length ? images : undefined);
         reportPreflight(true);
       } else {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
@@ -385,6 +395,32 @@ export class PiBridge {
       if (!queuedStreamingPrompt) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
       markSessionIdle();
     }
+  }
+
+  private async preparePromptAttachments(projectPath: string, prompt: string, attachments?: string[]) {
+    const paths = uniqueAttachmentPaths(attachments);
+    if (!paths.length) return { prompt, images: [] as ImageContent[] };
+    for (const filePath of paths) resolveWithin(projectPath, filePath);
+
+    const realProjectPath = await realpath(projectPath);
+    const images: ImageContent[] = [];
+    let totalInputBytes = 0;
+    let totalDataChars = 0;
+    for (const filePath of paths) {
+      if (images.length >= MAX_PROMPT_IMAGE_ATTACHMENTS) break;
+      const attachment = await readSupportedImageAttachment(projectPath, realProjectPath, filePath, totalInputBytes).catch(() => undefined);
+      if (!attachment) continue;
+      totalInputBytes += attachment.inputBytes;
+      const resized = await resizeImage(attachment.data, attachment.mimeType).catch(() => undefined);
+      if (!resized || totalDataChars + resized.data.length > MAX_PROMPT_IMAGE_TOTAL_DATA_CHARS) continue;
+      totalDataChars += resized.data.length;
+      images.push({ type: 'image', mimeType: resized.mimeType, data: resized.data });
+    }
+
+    return {
+      prompt: `${prompt}\n\nAttached files in the workspace:\n${paths.map((file) => `- ${file}`).join('\n')}`,
+      images,
+    };
   }
 
   async navigateTree(projectPath: string, body: NavigateTreeBody, key: string | string[], options: { finishEvent?: boolean } = {}) {
@@ -1461,6 +1497,145 @@ function streamKey(projectId: string, sessionId?: string) {
 function slashCommandName(prompt: string) {
   const match = prompt.trim().match(/^\/([^\s/]+)/);
   return match?.[1];
+}
+
+function uniqueAttachmentPaths(attachments: string[] | undefined) {
+  if (attachments !== undefined && !Array.isArray(attachments)) throw new Error('Attachments must be an array.');
+  if ((attachments?.length ?? 0) > MAX_PROMPT_ATTACHMENT_PATHS) throw new Error(`Too many attachments; maximum is ${MAX_PROMPT_ATTACHMENT_PATHS}.`);
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const attachment of attachments ?? []) {
+    if (typeof attachment !== 'string') throw new Error('Attachment path must be a string.');
+    const filePath = attachment.trim();
+    if (!filePath) continue;
+    if (filePath !== attachment || /[\0-\x1f\x7f-\x9f\u2028\u2029]/.test(filePath)) throw new Error('Attachment path contains invalid characters.');
+    if (seen.has(filePath)) continue;
+    seen.add(filePath);
+    paths.push(filePath);
+  }
+  return paths;
+}
+
+type AttachmentImageData = { mimeType: string; data: Uint8Array; inputBytes: number };
+
+async function readSupportedImageAttachment(projectPath: string, realProjectPath: string, filePath: string, currentTotalInputBytes: number): Promise<AttachmentImageData | undefined> {
+  const { file, fileStat } = await openAttachmentFileWithin(projectPath, realProjectPath, filePath);
+  try {
+    if (fileStat.size <= 0 || fileStat.size > MAX_PROMPT_IMAGE_INPUT_BYTES) return undefined;
+    const sniff = await readFileRange(file, 0, Math.min(IMAGE_TYPE_SNIFF_BYTES, fileStat.size));
+    const mimeType = detectSupportedImageMimeType(sniff);
+    if (!mimeType || currentTotalInputBytes + fileStat.size > MAX_PROMPT_IMAGE_TOTAL_INPUT_BYTES) return undefined;
+    if (mimeType === 'image/png') {
+      const animated = await hasAnimatedPngControlChunk(file, fileStat.size);
+      if (animated !== false) return undefined;
+    }
+    return { mimeType, data: await readFileBytes(file, fileStat.size), inputBytes: fileStat.size };
+  } finally {
+    await file.close().catch(() => undefined);
+  }
+}
+
+async function openAttachmentFileWithin(projectPath: string, realProjectPath: string, filePath: string) {
+  const target = resolveWithin(projectPath, filePath);
+  const realTarget = await realpath(target);
+  if (!isPathWithin(realProjectPath, realTarget)) throw new Error('Path escapes workspace');
+  const file = await open(realTarget, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let verified = false;
+  try {
+    await assertOpenAttachmentHandleWithin(realProjectPath, file, realTarget);
+    const fileStat = await file.stat();
+    if (!fileStat.isFile()) throw new Error('Attachment path is not a file');
+    verified = true;
+    return { file, fileStat };
+  } finally {
+    if (!verified) await file.close().catch(() => undefined);
+  }
+}
+
+async function assertOpenAttachmentHandleWithin(realProjectPath: string, file: FileHandle, realTarget: string) {
+  if (process.platform === 'linux') {
+    const handlePath = await realpath(`/proc/self/fd/${file.fd}`);
+    if (!isPathWithin(realProjectPath, handlePath)) throw new Error('Path escapes workspace');
+    return;
+  }
+
+  const currentRealTarget = await realpath(realTarget);
+  if (!isPathWithin(realProjectPath, currentRealTarget)) throw new Error('Path escapes workspace');
+  const [handleStat, pathStat] = await Promise.all([file.stat(), stat(currentRealTarget)]);
+  if (!sameFileIdentity(handleStat, pathStat)) throw new Error('Path changed while opening');
+}
+
+function sameFileIdentity(left: Stats, right: Stats) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function isPathWithin(root: string, target: string) {
+  const relative = path.relative(root, target);
+  return !relative || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+async function readFileRange(file: FileHandle, position: number, length: number) {
+  const buffer = Buffer.alloc(length);
+  const { bytesRead } = await file.read(buffer, 0, length, position);
+  return buffer.subarray(0, bytesRead);
+}
+
+async function readFileBytes(file: FileHandle, size: number) {
+  const buffer = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await file.read(buffer, offset, size - offset, offset);
+    if (!bytesRead) break;
+    offset += bytesRead;
+  }
+  return buffer.subarray(0, offset);
+}
+
+async function hasAnimatedPngControlChunk(file: FileHandle, fileSize: number): Promise<boolean | undefined> {
+  let offset = PNG_SIGNATURE.length;
+  for (let chunks = 0; chunks < MAX_PNG_ANIMATION_SCAN_CHUNKS && offset + 8 <= fileSize; chunks += 1) {
+    const header = await readFileRange(file, offset, 8);
+    if (header.length < 8) return undefined;
+    const chunkLength = readUint32BE(header, 0);
+    if (startsWithAscii(header, 4, 'acTL')) return true;
+    if (startsWithAscii(header, 4, 'IDAT')) return false;
+    const nextOffset = offset + 8 + chunkLength + 4;
+    if (!Number.isSafeInteger(nextOffset) || nextOffset <= offset || nextOffset > fileSize) return undefined;
+    offset = nextOffset;
+  }
+  return undefined;
+}
+
+function detectSupportedImageMimeType(buffer: Uint8Array) {
+  if (startsWith(buffer, [0xff, 0xd8, 0xff])) return buffer[3] === 0xf7 ? undefined : 'image/jpeg';
+  if (startsWith(buffer, PNG_SIGNATURE)) return isPng(buffer) ? 'image/png' : undefined;
+  if (startsWithAscii(buffer, 0, 'GIF')) return 'image/gif';
+  if (startsWithAscii(buffer, 0, 'RIFF') && startsWithAscii(buffer, 8, 'WEBP')) return 'image/webp';
+  return undefined;
+}
+
+function isPng(buffer: Uint8Array) {
+  return buffer.length >= 16 && readUint32BE(buffer, PNG_SIGNATURE.length) === 13 && startsWithAscii(buffer, 12, 'IHDR');
+}
+
+function readUint32BE(buffer: Uint8Array, offset: number) {
+  return ((buffer[offset] ?? 0) * 0x1000000)
+    + ((buffer[offset + 1] ?? 0) << 16)
+    + ((buffer[offset + 2] ?? 0) << 8)
+    + (buffer[offset + 3] ?? 0);
+}
+
+function startsWith(buffer: Uint8Array, bytes: number[]) {
+  if (buffer.length < bytes.length) return false;
+  return bytes.every((byte, index) => buffer[index] === byte);
+}
+
+function startsWithAscii(buffer: Uint8Array, offset: number, text: string) {
+  if (buffer.length < offset + text.length) return false;
+  for (let index = 0; index < text.length; index += 1) {
+    if (buffer[offset + index] !== text.charCodeAt(index)) return false;
+  }
+  return true;
 }
 
 function agentEventType(event: unknown) {

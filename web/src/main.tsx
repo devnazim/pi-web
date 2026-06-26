@@ -4929,6 +4929,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
+  const [attachBusy, setAttachBusy] = createSignal(false);
+  const [attachErrorToast, setAttachErrorToast] = createSignal<{ id: number; message: string }>();
   const [extensionUiResponding, setExtensionUiResponding] = createSignal<string>();
   const [extensionUiError, setExtensionUiError] = createSignal('');
   const [sessionControlsHydratedKey, setSessionControlsHydratedKey] = createSignal<string>();
@@ -4936,6 +4938,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [voiceToast, setVoiceToast] = createSignal<{ id: number; message: string; tone: 'warning' | 'error' }>();
   const [voicePermissionDialogOpen, setVoicePermissionDialogOpen] = createSignal(false);
   let voiceRecognition: BrowserSpeechRecognition | undefined;
+  let attachToastSequence = 0;
+  let attachToastTimeout: number | undefined;
   let voiceToastSequence = 0;
   let voiceToastTimeout: number | undefined;
   const autocompleteSessionId = createMemo(() => props.sessionId ?? commandSessionId());
@@ -5045,7 +5049,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const voiceButtonLabel = createMemo(() => voiceSupported() ? voiceListening() ? 'Stop voice input' : 'Dictate prompt' : 'Voice input is not supported in this browser');
   const composerCanSubmit = createMemo(() => {
     const prompt = text().trim();
-    if (!prompt) return false;
+    if (!prompt || attachBusy()) return false;
     if (!busy()) return true;
     const commandName = composerSlashCommandName(prompt);
     const extensionCommand = commandName ? slashCommands.data?.commands.find((command) => command.name === commandName)?.source === 'extension' : false;
@@ -5249,6 +5253,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (transcriptScrollFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFrame);
     if (transcriptScrollFollowupFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFollowupFrame);
     if (composerLayoutFrame !== undefined) window.cancelAnimationFrame(composerLayoutFrame);
+    clearAttachToastTimer();
   });
 
   onCleanup(() => {
@@ -5367,28 +5372,42 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   }
 
   async function attach(files: Array<globalThis.File> | null) {
-    if (!files?.length) return;
-    const draftKey = activeComposerDraftKey;
+    if (!files?.length || attachBusy()) return;
+    const draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId);
     const draftSessionId = props.sessionId;
     const projectId = props.project.id;
-    let sessionId = draftSessionId ?? commandSessionId();
-    if (!sessionId) sessionId = await ensureCommandSession(draftKey);
-    if (!sessionId) return;
-    const form = new FormData();
-    files.forEach((file) => form.append('file', file));
-    const result = await api<{ uploaded: Array<{ filename: string; path: string; bytes: number }> }>(`/api/projects/${projectId}/uploads?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST', body: form });
-    if (activeComposerDraftKey === draftKey) {
-      resetComposerHistory();
-      setUploads((items) => composerUploadAssets([...items, ...result.uploaded]));
-      return;
+    setAttachBusy(true);
+    dismissAttachErrorToast();
+    try {
+      let sessionId = draftSessionId ?? commandSessionId();
+      if (!sessionId) sessionId = await ensureCommandSession(draftKey);
+      if (!sessionId) throw new Error('Could not create a session for attachments.');
+      if (!draftSessionId && props.project.id === projectId && !props.sessionId) setCommandSessionId(sessionId);
+      const form = new FormData();
+      files.forEach((file) => form.append('file', file));
+      const result = await api<{ uploaded: Array<{ filename: string; path: string; bytes: number }> }>(`/api/projects/${projectId}/uploads?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST', body: form });
+      const uploaded = composerUploadAssets(result.uploaded);
+      if (!uploaded.length) throw new Error('No files were uploaded.');
+      const activeSessionMatchesUpload = props.project.id === projectId && (props.sessionId === sessionId || (!props.sessionId && commandSessionId() === sessionId));
+      if (activeComposerDraftKey === draftKey || activeSessionMatchesUpload) {
+        resetComposerHistory();
+        setUploads((items) => composerUploadAssets([...items, ...uploaded]));
+        syncComposerLayout();
+        return;
+      }
+      if (!draftKey) return;
+      const draft = readComposerDraft(draftKey);
+      saveComposerDraft(draftKey, {
+        ...draft,
+        uploads: uniqueUploadAssets([...draft.uploads, ...uploaded]),
+        commandSessionId: draft.commandSessionId ?? (draftSessionId ? undefined : sessionId),
+      });
+    } catch (error) {
+      console.error('Could not attach files', error);
+      showAttachErrorToast(errorMessage(error, 'Could not attach files'));
+    } finally {
+      setAttachBusy(false);
     }
-    if (!draftKey) return;
-    const draft = readComposerDraft(draftKey);
-    saveComposerDraft(draftKey, {
-      ...draft,
-      uploads: uniqueUploadAssets([...draft.uploads, ...result.uploaded]),
-      commandSessionId: draft.commandSessionId ?? (draftSessionId ? undefined : sessionId),
-    });
   }
 
   createEffect(() => {
@@ -5450,6 +5469,28 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (!composerHighlightsRef) return;
     composerHighlightsRef.scrollTop = target.scrollTop;
     composerHighlightsRef.scrollLeft = target.scrollLeft;
+  }
+
+  function clearAttachToastTimer() {
+    if (attachToastTimeout === undefined) return;
+    window.clearTimeout(attachToastTimeout);
+    attachToastTimeout = undefined;
+  }
+
+  function showAttachErrorToast(message: string) {
+    clearAttachToastTimer();
+    const id = attachToastSequence + 1;
+    attachToastSequence = id;
+    setAttachErrorToast({ id, message });
+    attachToastTimeout = window.setTimeout(() => {
+      setAttachErrorToast((toast) => toast?.id === id ? undefined : toast);
+      attachToastTimeout = undefined;
+    }, VOICE_TOAST_TTL_MS);
+  }
+
+  function dismissAttachErrorToast() {
+    clearAttachToastTimer();
+    setAttachErrorToast(undefined);
   }
 
   function clearVoiceToastTimer() {
@@ -6003,7 +6044,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     const shellCommand = parseShellComposerCommand(prompt);
     const compactCommand = parseCompactComposerCommand(prompt);
     const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined;
-    if (!prompt || (busy() && !steeringSubmit)) return;
+    if (!prompt || attachBusy() || (busy() && !steeringSubmit)) return;
     stopVoiceRecognition(true);
     const projectId = props.project.id;
     const routeSessionId = props.sessionId;
@@ -6286,7 +6327,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           </div>
           <AgentStatusBar status={agentStatus.data?.status} loading={agentStatus.isLoading || agentStatus.isFetching} error={agentStatus.error} mobileOpen={mobileStatusOpen()} />
           <div class="composer-toolbar flex h-12 min-w-0 flex-nowrap items-center gap-1.5 border-t border-border px-3 text-sm max-xl:h-auto max-xl:py-2 max-md:gap-y-2">
-            <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files"><Plus class="size-4" /><input class="hidden" type="file" multiple accept="image/*,video/*,.txt,.md,.pdf,.json,.jsonc,application/json" onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files).catch((error) => console.error('Could not attach files', error)); }} /></label>
+            <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files" aria-disabled={attachBusy()}><Plus class="size-4" /><input class="hidden" type="file" multiple disabled={attachBusy()} accept="image/*,video/*,.txt,.md,.pdf,.json,.jsonc,application/json" onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files); }} /></label>
             <button class={`ghost h-8 w-8 px-0 md:hidden ${mobileStatusOpen() ? 'bg-muted text-foreground' : ''}`} type="button" title={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-label={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-expanded={mobileStatusOpen()} onClick={() => setMobileStatusOpen((open) => !open)}><Activity class="size-4" /></button>
             <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} options={modelOptions()} ariaLabel="Model" />
             <UiSelect
@@ -6320,6 +6361,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       </form>
       <Show when={previewPath()}>
         {(path) => <AssetPreviewModal project={props.project} path={path()} themeMode={props.themeMode} onClose={() => setPreviewPath(undefined)} />}
+      </Show>
+      <Show when={attachErrorToast()}>
+        {(toast) => <AttachmentToast toast={toast()} onDismiss={dismissAttachErrorToast} />}
       </Show>
       <Show when={voiceToast()}>
         {(toast) => <VoiceToast toast={toast()} onDismiss={dismissVoiceToast} />}
@@ -6357,6 +6401,27 @@ function AgentStatusBar(props: { status?: AgentStatusInfo; loading?: boolean; er
         {(part) => <span class={`agent-status-item ${part.tone ? `agent-status-${part.tone}` : ''}`} title={part.title}>{part.text}</span>}
       </For>
     </div>
+  );
+}
+
+function AttachmentToast(props: { toast: { message: string }; onDismiss: () => void }) {
+  return (
+    <Portal>
+      <div class="voice-toast-stack" role="alert" aria-live="assertive">
+        <div class="notification-toast notification-toast-error">
+          <div class="notification-toast-body">
+            <span class="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-muted text-muted-foreground">
+              <FilePlus class="size-4" />
+            </span>
+            <span class="min-w-0 flex-1 text-left">
+              <span class="block truncate text-sm font-semibold leading-tight">Could not attach files</span>
+              <span class="block truncate text-xs text-muted-foreground">{props.toast.message}</span>
+            </span>
+          </div>
+          <button class="notification-toast-close" type="button" title="Dismiss" aria-label="Dismiss" onClick={props.onDismiss}><X class="size-4" /></button>
+        </div>
+      </div>
+    </Portal>
   );
 }
 
@@ -10116,7 +10181,9 @@ function stripAttachmentTrailerFromParts(parts: ChatContentPart[]): ChatContentP
   if (index === -1) return parts;
   const split = splitAttachmentTrailer(parts[index].text);
   if (!split.attachments.length) return parts;
-  return parts.map((part, partIndex) => partIndex === index ? { ...part, text: split.text } : part).filter((part) => part.text.trim());
+  return parts
+    .map((part, partIndex) => partIndex === index ? { ...part, text: split.text } : part)
+    .filter((part) => part.type !== 'image' && part.text.trim());
 }
 
 function splitAttachmentTrailer(text: string): { text: string; attachments: UploadAsset[] } {
