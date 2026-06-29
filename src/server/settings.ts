@@ -12,6 +12,7 @@ const editableKeys = [
   'defaultModel',
   'defaultThinkingLevel',
   'hideThinkingBlock',
+  'optimizeStreamingRender',
   'chatToolOutput',
   'theme',
   'syntaxHighlightTheme',

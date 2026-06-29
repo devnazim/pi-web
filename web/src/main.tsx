@@ -198,6 +198,7 @@ type PiSettings = {
   defaultThinkingLevel?: ThinkingLevel;
   enabledModels?: string[];
   hideThinkingBlock?: boolean;
+  optimizeStreamingRender?: boolean;
   chatToolOutput?: ChatToolOutputMode;
   theme?: string;
   syntaxHighlightTheme?: SyntaxHighlightTheme;
@@ -2986,6 +2987,7 @@ function SettingsModal(props: {
 
                   <SettingsSection title="Chat and Tree">
                     <SettingsToggleRow label="Hide thinking blocks in chat output" checked={form().hideThinkingBlock ?? (scope() === 'project' ? effective().hideThinkingBlock ?? false : false)} onChange={(checked) => update('hideThinkingBlock', checked)} />
+                    <SettingsToggleRow label="Optimize streaming render" description="Render live assistant text as plain text while streaming to reduce CPU usage. Disable for live Markdown formatting while the response streams." checked={form().optimizeStreamingRender ?? (scope() === 'project' ? effective().optimizeStreamingRender ?? false : false)} onChange={(checked) => update('optimizeStreamingRender', checked)} />
                     <div class="settings-field"><span>Tool output in chat</span><UiSelect class="w-full" value={form().chatToolOutput ?? ''} onChange={(value) => update('chatToolOutput', (value || undefined) as ChatToolOutputMode | undefined)} options={CHAT_TOOL_OUTPUT_OPTIONS} ariaLabel="Tool output in chat" /></div>
                     <div class="settings-field"><span>Tree filter default</span><UiSelect class="w-full" value={form().treeFilterMode ?? ''} onChange={(value) => update('treeFilterMode', (value || undefined) as TreeFilterMode | undefined)} options={[{ value: '', label: 'Inherited' }, ...TREE_FILTER_OPTIONS]} ariaLabel="Tree filter default" /></div>
                   </SettingsSection>
@@ -4999,6 +5001,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   }));
   const effectiveSettings = createMemo(() => settings.data?.effective);
   const hideThinking = createMemo(() => Boolean(effectiveSettings()?.hideThinkingBlock));
+  const optimizeStreamingRender = createMemo(() => Boolean(effectiveSettings()?.optimizeStreamingRender));
   const toolOutputMode = createMemo(() => chatToolOutputMode(effectiveSettings()));
   const syntaxTheme = createMemo(() => shikiSyntaxTheme(props.themeMode, effectiveSettings()));
   const modelOptions = createMemo(() => composerModelOptions(effectiveSettings(), models.data?.models ?? [], model()));
@@ -6199,7 +6202,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
             <Show when={pendingUserMessageVisible() ? pendingUserMessage() : undefined}>
               {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending().text }]} attachments={pending().attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
             </Show>
-            <LiveAgentActivity activity={liveActivity()} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
+            <LiveAgentActivity activity={liveActivity()} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
             <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
           </div>
         </div>
@@ -9281,7 +9284,7 @@ function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; synt
   );
 }
 
-function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
+function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
   const error = createMemo(() => props.activity.error === 'Operation aborted' ? undefined : props.activity.error);
   const statusText = createMemo(() => {
     const retry = props.activity.retry;
@@ -9293,7 +9296,7 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
     <Show when={props.activity.running || error() || props.activity.notices.length}>
       <div class="live-agent">
         <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
-        <Show when={props.activity.text.trim()}><LiveAgentText text={props.activity.text} running={props.activity.streaming} syntaxTheme={props.syntaxTheme} /></Show>
+        <Show when={props.activity.text.trim()}><LiveAgentText text={props.activity.text} running={props.activity.streaming} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>
         <Show when={!props.hideThinking && props.activity.thinking.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{props.activity.thinking}</div></Collapsible></Show>
         <Show when={(props.toolOutputMode !== 'hidden' && props.activity.tools.length) || props.activity.notices.length}>
           <div class="live-agent-tools">
@@ -9308,10 +9311,10 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
   );
 }
 
-function LiveAgentText(props: { text: string; running: boolean; syntaxTheme: ShikiSyntaxTheme }) {
+function LiveAgentText(props: { text: string; running: boolean; optimizeStreamingRender: boolean; syntaxTheme: ShikiSyntaxTheme }) {
   return (
     <div class="assistant-message assistant-message-live">
-      <Show when={props.running} fallback={<MarkdownContent text={props.text} syntaxTheme={props.syntaxTheme} />}>
+      <Show when={props.running && props.optimizeStreamingRender} fallback={<MarkdownContent text={props.text} syntaxTheme={props.syntaxTheme} />}>
         <div class="whitespace-pre-wrap break-words">{props.text}</div>
       </Show>
     </div>
