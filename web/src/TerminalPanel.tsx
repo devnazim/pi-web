@@ -40,8 +40,7 @@ const TERMINAL_MOBILE_SHORTCUTS: TerminalMobileShortcut[] = [
   { label: '^W', title: 'Ctrl + W', data: '\x17' },
   { label: '^R', title: 'Ctrl + R', data: '\x12' },
   { label: '^I', title: 'Ctrl + I / Tab', data: '\x09' },
-  { label: '^S', title: 'Ctrl + S', data: '\x13' },
-  { label: '^Q', title: 'Ctrl + Q', data: '\x11' },
+  { label: '^Q', title: 'Ctrl + Q / resume output', data: '\x11' },
   { label: '/', title: 'Slash', text: '/' },
   { label: '|', title: 'Pipe', text: '|' },
   { label: '~', title: 'Tilde', text: '~' },
@@ -57,13 +56,12 @@ const TERMINAL_LETTER_SPACING = 0;
 const MAX_TERMINAL_QUEUED_INPUT_LENGTH = 64 * 1024;
 const MAX_TERMINAL_METADATA_LENGTH = 2048;
 const TERMINAL_HEARTBEAT_MS = 30_000;
-const TERMINAL_HEARTBEAT_TIMEOUT_MS = TERMINAL_HEARTBEAT_MS * 3;
+const TERMINAL_HEARTBEAT_TIMEOUT_MS = 10_000;
 const TERMINAL_RESIZE_SEND_DELAY_MS = 80;
 const TERMINAL_RESIZE_SETTLE_DELAY_MS = 180;
 const TERMINAL_RECONNECT_BASE_DELAY_MS = 750;
 const TERMINAL_RECONNECT_MAX_DELAY_MS = 8_000;
 const TERMINAL_RECONNECT_STABLE_MS = 10_000;
-const TERMINAL_AUTO_RECONNECT_MAX_ATTEMPTS = 8;
 const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
   '`': '~',
   '1': '!',
@@ -198,7 +196,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let reconnectTimer: number | undefined;
     let reconnectAttemptResetTimer: number | undefined;
     let heartbeatTimer: number | undefined;
-    let pendingHeartbeatAt = 0;
+    let heartbeatTimeoutTimer: number | undefined;
     let resumeHeartbeat: (() => void) | undefined;
     let pendingInput = '';
     let pendingMetadata: { cwd?: string; title?: string } = {};
@@ -355,12 +353,54 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         lastSentCols = xterm.cols;
         lastSentRows = xterm.rows;
         const params = new URLSearchParams({ cols: String(xterm.cols), rows: String(xterm.rows), terminalId: 'main' });
+        const clearHeartbeatTimeout = () => {
+          if (heartbeatTimeoutTimer === undefined) return;
+          window.clearTimeout(heartbeatTimeoutTimer);
+          heartbeatTimeoutTimer = undefined;
+        };
+        const clearHeartbeatTimers = () => {
+          if (heartbeatTimer !== undefined) {
+            window.clearInterval(heartbeatTimer);
+            heartbeatTimer = undefined;
+          }
+          clearHeartbeatTimeout();
+        };
+        const closeTerminalSocket = () => {
+          if (!socket || socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) return;
+          try {
+            socket.close();
+          } catch {
+            // Ignore close races.
+          }
+        };
+        const sendTerminalHeartbeat = () => {
+          if (document.visibilityState === 'hidden' || heartbeatTimeoutTimer !== undefined) return;
+          const currentSocket = socket;
+          if (!currentSocket || currentSocket.readyState !== WebSocket.OPEN) return;
+          if (!sendTerminalClientMessage(currentSocket, { type: 'ping' })) {
+            closeTerminalSocket();
+            return;
+          }
+          heartbeatTimeoutTimer = window.setTimeout(() => {
+            heartbeatTimeoutTimer = undefined;
+            if (terminalSocket === currentSocket && currentSocket.readyState === WebSocket.OPEN) closeTerminalSocket();
+          }, TERMINAL_HEARTBEAT_TIMEOUT_MS);
+        };
+        const startTerminalHeartbeat = () => {
+          clearHeartbeatTimers();
+          sendTerminalHeartbeat();
+          heartbeatTimer = window.setInterval(sendTerminalHeartbeat, TERMINAL_HEARTBEAT_MS);
+        };
+
         socket = new WebSocket(appWebSocketUrl(`/ws/projects/${projectId}/terminal?${params}`));
         terminalSocket = socket;
         resumeHeartbeat = () => {
-          if (document.visibilityState === 'hidden') return;
-          pendingHeartbeatAt = 0;
-          if (sendTerminalClientMessage(socket, { type: 'ping' })) pendingHeartbeatAt = Date.now();
+          if (document.visibilityState === 'hidden') {
+            clearHeartbeatTimeout();
+            return;
+          }
+          clearHeartbeatTimeout();
+          sendTerminalHeartbeat();
         };
         document.addEventListener('visibilitychange', resumeHeartbeat);
         window.addEventListener('focus', resumeHeartbeat);
@@ -380,25 +420,13 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         socket.addEventListener('open', () => {
           if (terminalSocket !== socket || !resizeTerminal || !xterm) return;
           setStatus('connected');
-          pendingHeartbeatAt = 0;
           resizeTerminal(true, true);
           if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
           if (pendingInput) {
             sendTerminalClientMessage(socket, { type: 'input', data: pendingInput });
             pendingInput = '';
           }
-          heartbeatTimer = window.setInterval(() => {
-            if (document.visibilityState === 'hidden') return;
-            const now = Date.now();
-            if (pendingHeartbeatAt) {
-              if (now - pendingHeartbeatAt >= TERMINAL_HEARTBEAT_TIMEOUT_MS) {
-                setStatus('disconnected');
-                socket?.close();
-              }
-              return;
-            }
-            if (sendTerminalClientMessage(socket, { type: 'ping' })) pendingHeartbeatAt = now;
-          }, TERMINAL_HEARTBEAT_MS);
+          startTerminalHeartbeat();
           xterm.focus();
         });
         socket.addEventListener('message', (event) => {
@@ -409,7 +437,8 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           } catch {
             return;
           }
-          pendingHeartbeatAt = 0;
+          clearHeartbeatTimeout();
+          if (message.type === 'pong') return;
 
           if (message.type === 'ready') {
             if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
@@ -441,10 +470,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         });
         socket.addEventListener('close', () => {
           if (terminalSocket !== socket) return;
-          if (heartbeatTimer !== undefined) {
-            window.clearInterval(heartbeatTimer);
-            heartbeatTimer = undefined;
-          }
+          clearHeartbeatTimers();
           if (resizeMessageTimer !== undefined) {
             window.clearTimeout(resizeMessageTimer);
             resizeMessageTimer = undefined;
@@ -454,19 +480,20 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             reconnectAttemptResetTimer = undefined;
           }
           setStatus(status() === 'error' ? 'error' : 'disconnected');
-          if (disposed || terminalExited || autoReconnectAttempts >= TERMINAL_AUTO_RECONNECT_MAX_ATTEMPTS) return;
+          if (disposed || terminalExited) return;
 
-          const delay = Math.min(TERMINAL_RECONNECT_MAX_DELAY_MS, TERMINAL_RECONNECT_BASE_DELAY_MS * (2 ** autoReconnectAttempts));
+          const delay = Math.min(TERMINAL_RECONNECT_MAX_DELAY_MS, TERMINAL_RECONNECT_BASE_DELAY_MS * (2 ** Math.min(autoReconnectAttempts, 5)));
           autoReconnectAttempts += 1;
           reconnectTimer = window.setTimeout(() => {
             reconnectTimer = undefined;
             if (disposed || terminalExited || terminalSocket !== socket) return;
             setReconnectKey((key) => key + 1);
-          }, delay);
+          }, delay + Math.round(delay * 0.2 * Math.random()));
         });
         socket.addEventListener('error', () => {
           if (terminalSocket !== socket) return;
           setStatus('error');
+          closeTerminalSocket();
         });
 
         resizeObserver = new ResizeObserver(() => scheduleResizeTerminal?.());
@@ -491,6 +518,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
       if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer);
+      if (heartbeatTimeoutTimer !== undefined) window.clearTimeout(heartbeatTimeoutTimer);
       if (resumeHeartbeat) {
         document.removeEventListener('visibilitychange', resumeHeartbeat);
         window.removeEventListener('focus', resumeHeartbeat);
@@ -587,6 +615,11 @@ function handleTerminalKeyEvent(event: KeyboardEvent, terminal: XTermTerminal) {
   if (shortcutModifier && !event.altKey && key === 'c') {
     event.preventDefault();
     if (terminal.hasSelection()) void copyTerminalSelection(terminal.getSelection());
+    return false;
+  }
+
+  if (!event.altKey && key === 's' && (event.ctrlKey || event.metaKey)) {
+    event.preventDefault();
     return false;
   }
 
