@@ -114,12 +114,14 @@ type AgentStatus = {
 
 type CachedSession = { promise: Promise<unknown>; expiresAt: number; timer?: NodeJS.Timeout };
 type RuntimeSessionLock = { release: () => void; wasActive: boolean };
+type StreamKeyLock = { key: string | string[]; token: symbol };
 type PromptRunOptions = { startEvent?: boolean; preflightResult?: (success: boolean, error?: unknown) => void };
 
 const WEB_BUILTIN_COMMAND_NAMES = new Set(['compact']);
 const AGENT_ALREADY_PROCESSING_MESSAGE = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 const SESSION_CACHE_TTL_MS = 30 * 60_000;
 const SESSION_CACHE_BUSY_RETRY_MS = 60_000;
+const EXTENSION_COMMAND_BUSY_DELAY_MS = 300;
 const IMAGE_TYPE_SNIFF_BYTES = 4100;
 const MAX_PROMPT_ATTACHMENT_PATHS = 100;
 const MAX_PROMPT_IMAGE_ATTACHMENTS = 20;
@@ -136,6 +138,10 @@ export class PiBridge {
   private readonly commandSessions = new Map<string, CachedSession>();
   private readonly boundSessions = new WeakSet<object>();
   private readonly sessionStreamKeys = new WeakMap<object, string | string[]>();
+  private readonly sessionStreamKeyLocks = new WeakMap<object, StreamKeyLock>();
+  private readonly extensionAsyncWrappedSessions = new WeakSet<object>();
+  private readonly extensionAsyncTasks = new WeakMap<object, Set<Promise<unknown>>>();
+  private readonly extensionErrorCounts = new WeakMap<object, number>();
   private readonly extensionStatuses = new WeakMap<object, Map<string, string>>();
   private readonly pendingExtensionUiRequests = new Map<string, PendingExtensionUiRequest<any>>();
   private readonly activeRuntimeSessions = new Map<string, number>();
@@ -283,9 +289,17 @@ export class PiBridge {
 
   async prompt(projectPath: string, body: PromptBody, key: string | string[], options: PromptRunOptions = {}) {
     let markSessionIdle: () => void = () => undefined;
+    let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
     let queuedStreamingPrompt = false;
+    let commandBusyTimer: NodeJS.Timeout | undefined;
+    let commandBusyStarted = false;
     let preflightReported = false;
+    const clearCommandBusyTimer = () => {
+      if (!commandBusyTimer) return;
+      clearTimeout(commandBusyTimer);
+      commandBusyTimer = undefined;
+    };
     const reportPreflight = (success: boolean, error?: unknown) => {
       if (preflightReported) return;
       preflightReported = true;
@@ -295,7 +309,6 @@ export class PiBridge {
       const sessionLock = await this.markSessionActiveWithState(projectPath, body.sessionId);
       markSessionIdle = sessionLock.release;
       const session = await this.getSession(projectPath, body.sessionId);
-      await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       const extensionCommand = this.isExtensionCommandPrompt(session, body.prompt);
       const sessionBusy = sessionLock.wasActive || this.cachedSessionInUse(session);
       if (extensionCommand && sessionBusy) {
@@ -328,12 +341,36 @@ export class PiBridge {
         reportPreflight(false, error);
         throw error;
       }
+      releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
+      const extensionErrorCountBefore = extensionCommand ? this.extensionErrorCount(session) : 0;
       const lifecycle = { started: false, finished: false };
+      const ensureCommandBusyStarted = () => {
+        clearCommandBusyTimer();
+        if (!lifecycle.started && !commandBusyStarted && this.extensionErrorCount(session) === extensionErrorCountBefore) {
+          commandBusyStarted = true;
+          this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
+        }
+        reportPreflight(true);
+      };
       subscription = queuedStreamingPrompt ? undefined : this.subscribeSessionEvents(session, key, body.sessionId, {
         mirrorLifecycle: extensionCommand,
         lifecycle,
-        onActivityStart: extensionCommand ? () => reportPreflight(true) : undefined,
+        onActivityStart: extensionCommand ? ensureCommandBusyStarted : undefined,
+        syntheticStartActive: () => commandBusyStarted,
       });
+      if (extensionCommand) {
+        commandBusyTimer = setTimeout(() => {
+          commandBusyTimer = undefined;
+          if (preflightReported) return;
+          if (lifecycle.started || this.extensionErrorCount(session) !== extensionErrorCountBefore) {
+            reportPreflight(true);
+            return;
+          }
+          ensureCommandBusyStarted();
+        }, EXTENSION_COMMAND_BUSY_DELAY_MS);
+        commandBusyTimer.unref();
+      }
+      await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       const useSyntheticStart = (options.startEvent ?? true) && !extensionCommand && !queuedStreamingPrompt;
       if (useSyntheticStart) this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
 
@@ -369,21 +406,25 @@ export class PiBridge {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
       }
 
+      clearCommandBusyTimer();
       if (extensionCommand) {
         // Some extension commands only update extension state/UI (for example `/xplan steps` without a task).
         // Hold the HTTP preflight response until we know whether real agent activity started; otherwise
         // a status refresh can observe this temporary bridge lock as a running agent and leave the web UI busy.
-        await this.waitForCommandActivity(session, lifecycle, () => reportPreflight(true));
+        if (!lifecycle.started && !commandBusyStarted && this.cachedSessionInUse(session)) ensureCommandBusyStarted();
+        await this.waitForCommandActivity(session, lifecycle, ensureCommandBusyStarted);
         reportPreflight(true);
       }
       subscription?.();
       subscription = undefined;
-      const needsSyntheticFinish = !queuedStreamingPrompt && (!extensionCommand || (!lifecycle.started && options.startEvent === false));
+      const commandReportedError = extensionCommand && this.extensionErrorCount(session) !== extensionErrorCountBefore;
+      const needsSyntheticFinish = !queuedStreamingPrompt && !commandReportedError && (!extensionCommand || (commandBusyStarted && !lifecycle.finished) || (!lifecycle.started && options.startEvent === false));
       if (needsSyntheticFinish) this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
-      else if (lifecycle.started && !lifecycle.finished && !this.cachedSessionInUse(session)) {
+      else if (!commandReportedError && lifecycle.started && !lifecycle.finished && !this.cachedSessionInUse(session)) {
         this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
       }
     } catch (error) {
+      clearCommandBusyTimer();
       subscription?.();
       if (!preflightReported) reportPreflight(false, error);
       const message = error instanceof Error ? error.message : 'Agent failed';
@@ -392,7 +433,9 @@ export class PiBridge {
         : { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
+      clearCommandBusyTimer();
       if (!queuedStreamingPrompt) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      releaseStreamKeyLock?.();
       markSessionIdle();
     }
   }
@@ -426,12 +469,14 @@ export class PiBridge {
   async navigateTree(projectPath: string, body: NavigateTreeBody, key: string | string[], options: { finishEvent?: boolean } = {}) {
     if (!body.targetId) throw new Error('Missing tree target');
     let markSessionIdle: () => void = () => undefined;
+    let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
     try {
       const sessionLock = await this.markSessionActiveWithState(projectPath, body.sessionId);
       markSessionIdle = sessionLock.release;
       const session = await this.getSession(projectPath, body.sessionId);
       if (sessionLock.wasActive || this.cachedSessionInUse(session)) throw new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
+      releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
       this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
       await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       subscription = typeof session?.subscribe === 'function'
@@ -456,6 +501,7 @@ export class PiBridge {
       throw error;
     } finally {
       this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      releaseStreamKeyLock?.();
       markSessionIdle();
     }
   }
@@ -513,10 +559,12 @@ export class PiBridge {
   async compact(projectPath: string, body: CompactBody, key: string | string[]) {
     if (!body.sessionId) throw new Error('Missing session');
     let markSessionIdle: () => void = () => undefined;
+    let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
     try {
       markSessionIdle = await this.markSessionActive(projectPath, body.sessionId);
       const session = await this.getSession(projectPath, body.sessionId);
+      releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
       if (typeof session?.compact !== 'function') throw new Error('Loaded pi SDK session does not expose compact()');
       await this.bindWebExtensions(session, projectPath, body.sessionId, key);
 
@@ -534,6 +582,7 @@ export class PiBridge {
       throw error;
     } finally {
       this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      releaseStreamKeyLock?.();
       markSessionIdle();
     }
   }
@@ -543,10 +592,12 @@ export class PiBridge {
     if (!body.sessionId) throw new Error('Missing session');
     if (!command) throw new Error('Missing command');
     let markSessionIdle: () => void = () => undefined;
+    let releaseStreamKeyLock: (() => void) | undefined;
 
     try {
       markSessionIdle = await this.markSessionActive(projectPath, body.sessionId);
       const session = await this.getSession(projectPath, body.sessionId);
+      releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
       await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       if (session?.isBashRunning) throw new Error('A shell command is already running');
       if (typeof session?.executeBash !== 'function') throw new Error('Loaded pi SDK session does not expose executeBash()');
@@ -572,6 +623,7 @@ export class PiBridge {
       throw error;
     } finally {
       this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      releaseStreamKeyLock?.();
       markSessionIdle();
     }
   }
@@ -602,14 +654,14 @@ export class PiBridge {
     return pending.request;
   }
 
-  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void } = {}) {
+  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void; syntheticStartActive?: () => boolean } = {}) {
     if (typeof session?.subscribe !== 'function') return undefined;
     return session.subscribe((event: unknown) => {
       const type = agentEventType(event);
       if (options.mirrorLifecycle && isCommandActivityStartEvent(type) && !options.lifecycle?.started) {
         if (options.lifecycle) options.lifecycle.started = true;
         options.onActivityStart?.();
-        this.broadcast(key, { type: 'agent:start', sessionId });
+        if (!options.syntheticStartActive?.()) this.broadcast(key, { type: 'agent:start', sessionId });
       }
       this.broadcast(key, { type: 'agent:event', sessionId, data: event });
       if (options.mirrorLifecycle && type === 'agent_end' && !agentEventWillRetry(event)) {
@@ -652,9 +704,66 @@ export class PiBridge {
     }
   }
 
+  private bindSessionStreamKeys(session: object, key: string | string[]) {
+    this.sessionStreamKeys.set(session, this.sessionStreamKeyLocks.get(session)?.key ?? key);
+  }
+
+  private lockSessionStreamKeys(session: object, key: string | string[]) {
+    const existing = this.sessionStreamKeyLocks.get(session);
+    if (existing) {
+      this.sessionStreamKeys.set(session, existing.key);
+      return () => undefined;
+    }
+    const token = Symbol('stream-key-lock');
+    this.sessionStreamKeyLocks.set(session, { key, token });
+    this.sessionStreamKeys.set(session, key);
+    return () => {
+      const current = this.sessionStreamKeyLocks.get(session);
+      if (current?.token !== token) return;
+      this.sessionStreamKeyLocks.delete(session);
+      this.sessionStreamKeys.set(session, primaryStreamKey(key));
+    };
+  }
+
+  private wrapExtensionAsyncSessionMethods(session: any) {
+    if (!session || typeof session !== 'object' || this.extensionAsyncWrappedSessions.has(session)) return;
+    this.extensionAsyncWrappedSessions.add(session);
+    for (const method of ['sendCustomMessage', 'sendUserMessage'] as const) {
+      if (typeof session[method] !== 'function') continue;
+      const original = session[method];
+      session[method] = (...args: unknown[]) => {
+        const result = original.apply(session, args);
+        if (isPromiseLike(result)) this.trackExtensionAsyncTask(session, result);
+        return result;
+      };
+    }
+  }
+
+  private trackExtensionAsyncTask(session: object, task: PromiseLike<unknown>) {
+    const tracked = Promise.resolve(task);
+    const tasks = this.extensionAsyncTasks.get(session) ?? new Set<Promise<unknown>>();
+    tasks.add(tracked);
+    this.extensionAsyncTasks.set(session, tasks);
+    void tracked.finally(() => {
+      const current = this.extensionAsyncTasks.get(session);
+      if (!current) return;
+      current.delete(tracked);
+      if (!current.size) this.extensionAsyncTasks.delete(session);
+    }).catch(() => undefined);
+  }
+
+  private extensionErrorCount(session: object) {
+    return this.extensionErrorCounts.get(session) ?? 0;
+  }
+
+  private incrementExtensionErrorCount(session: object) {
+    this.extensionErrorCounts.set(session, this.extensionErrorCount(session) + 1);
+  }
+
   private async bindWebExtensions(session: any, projectPath: string, sessionId: string | undefined, key: string | string[]) {
     if (!session || typeof session !== 'object') return;
-    this.sessionStreamKeys.set(session, key);
+    this.bindSessionStreamKeys(session, key);
+    this.wrapExtensionAsyncSessionMethods(session);
     if (this.boundSessions.has(session) || typeof session.bindExtensions !== 'function') return;
     this.boundSessions.add(session);
     await session.bindExtensions({
@@ -681,6 +790,7 @@ export class PiBridge {
         },
       },
       onError: (error: { extensionPath?: string; event?: string; error?: string }) => {
+        this.incrementExtensionErrorCount(session);
         this.broadcast(this.sessionStreamKeys.get(session) ?? key, {
           type: 'agent:error',
           sessionId,
@@ -1215,7 +1325,7 @@ export class PiBridge {
       if (!candidate || typeof candidate !== 'object') return false;
       try {
         const value = candidate as { isStreaming?: unknown; isBashRunning?: unknown; isCompacting?: unknown; isRetrying?: unknown; state?: { isStreaming?: unknown }; agent?: { state?: { isStreaming?: unknown } } };
-        return Boolean(value.isStreaming || value.isBashRunning || value.isCompacting || value.isRetrying || value.state?.isStreaming || value.agent?.state?.isStreaming);
+        return Boolean(this.extensionAsyncTasks.get(candidate)?.size || value.isStreaming || value.isBashRunning || value.isCompacting || value.isRetrying || value.state?.isStreaming || value.agent?.state?.isStreaming);
       } catch {
         return false;
       }
@@ -1492,6 +1602,14 @@ function sendWebSocketJson(socket: WebSocket, message: Record<string, unknown>) 
 
 function streamKey(projectId: string, sessionId?: string) {
   return `${projectId}:${sessionId ?? 'active'}`;
+}
+
+function primaryStreamKey(key: string | string[]) {
+  return Array.isArray(key) ? key[0] ?? '' : key;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return Boolean(value && (typeof value === 'object' || typeof value === 'function') && typeof (value as { then?: unknown }).then === 'function');
 }
 
 function slashCommandName(prompt: string) {

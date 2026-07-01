@@ -1024,6 +1024,10 @@ function Shell() {
     queryClient.setQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId], (current) => current ? { status: { ...current.status, statuses: nextStatuses } } : current);
   }
 
+  function updateAgentRunningCache(projectId: string, eventSessionId: string, running: boolean) {
+    queryClient.setQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId], (current) => current ? { status: { ...current.status, running } } : current);
+  }
+
   function updateWorkspaceNotifications(workspaceId: string, updater: (state: WorkspaceNotificationState) => WorkspaceNotificationState) {
     setWorkspaceNotificationStore((current) => {
       const next = { ...current, [workspaceId]: pruneWorkspaceNotificationState(updater(workspaceNotificationState(current[workspaceId]))) };
@@ -1677,8 +1681,11 @@ function Shell() {
           const id = readExtensionUiResponseId(parsed.data);
           if (id) removeExtensionUiRequest(id);
         }
+        const agentEndWillRetry = dataType === 'agent_end' && agentEventDataWillRetry(parsed.data);
+        if (eventSessionId && (parsed.type === 'agent:start' || parsed.type === 'bash:start' || dataType === 'agent_start' || agentEndWillRetry)) updateAgentRunningCache(project.id, eventSessionId, true);
         if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
-        if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || dataType === 'agent_end') && eventSessionId) {
+        if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || (dataType === 'agent_end' && !agentEndWillRetry)) && eventSessionId) {
+          updateAgentRunningCache(project.id, eventSessionId, false);
           removeSessionExtensionUiRequests(eventSessionId);
           queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
           queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
@@ -5042,7 +5049,17 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     const sessionId = props.sessionId ?? commandSessionId();
     return props.extensionUiRequests.filter((request) => sessionId ? request.sessionId === sessionId : !request.sessionId);
   });
-  const busy = createMemo(() => liveActivity().running || Boolean(runningCommand()) || visibleExtensionUiRequests().length > 0);
+  const liveBusy = createMemo(() => liveActivity().running || Boolean(runningCommand()) || visibleExtensionUiRequests().length > 0);
+  const agentStatus = createQuery(() => {
+    const sessionId = props.sessionId ?? commandSessionId();
+    const pollFast = liveBusy();
+    return {
+      queryKey: ['agent-status', props.project.id, sessionId ?? 'active'],
+      queryFn: ({ signal }) => api<{ status: AgentStatusInfo }>(`/api/projects/${props.project.id}/agent/status${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`, { signal }),
+      refetchInterval: (query) => pollFast || query.state.data?.status.running ? 1500 : 5000,
+    };
+  });
+  const busy = createMemo(() => liveBusy() || Boolean(agentStatus.data?.status.running));
   const canSteerAgent = createMemo(() => liveActivity().streaming && !runningCommand() && !liveShellActivity().running && visibleExtensionUiRequests().length === 0);
   const voiceSupported = createMemo(() => Boolean(browserSpeechRecognitionConstructor()));
   const voiceButtonTitle = createMemo(() => {
@@ -5060,14 +5077,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   });
   const showEmptySessionPrompt = createMemo(() => Boolean(props.sessionId && !session.isLoading && !session.error && visibleTranscriptEntries().length === 0 && !busy() && !pendingUserMessageVisible()));
   const centerTranscript = createMemo(() => (!props.sessionId && !pendingUserMessageVisible()) || showEmptySessionPrompt());
-  const agentStatus = createQuery(() => {
-    const sessionId = props.sessionId;
-    return {
-      queryKey: ['agent-status', props.project.id, sessionId ?? 'active'],
-      queryFn: ({ signal }) => api<{ status: AgentStatusInfo }>(`/api/projects/${props.project.id}/agent/status${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`, { signal }),
-      refetchInterval: busy() ? 1500 : 5000,
-    };
-  });
 
   createEffect(() => {
     const requestId = visibleExtensionUiRequests()[0]?.id;
@@ -9413,6 +9422,10 @@ function agentEventDataType(data: unknown) {
   return data && typeof data === 'object' && typeof (data as { type?: unknown }).type === 'string' ? (data as { type: string }).type : undefined;
 }
 
+function agentEventDataWillRetry(data: unknown) {
+  return Boolean(data && typeof data === 'object' && (data as { willRetry?: unknown }).willRetry === true);
+}
+
 function readExtensionUiRequest(data: unknown, fallbackSessionId?: string): ExtensionUiRequest | undefined {
   if (!data || typeof data !== 'object') return undefined;
   const record = data as Record<string, unknown>;
@@ -10104,6 +10117,7 @@ function relativeTime(timestamp: number) {
 function agentStatusParts(status?: AgentStatusInfo): AgentStatusPart[] {
   if (!status) return [];
   const parts: AgentStatusPart[] = [];
+  if (status.running) parts.push({ text: 'agent running', title: 'Pi is processing this session' });
   if (status.branch) parts.push({ text: `branch ${status.branch}`, title: 'Git branch' });
   if (status.sessionName) parts.push({ text: `session ${status.sessionName}`, title: 'Session name' });
 
