@@ -11151,7 +11151,7 @@ function readBrowserTabName() {
 }
 
 function readContrastUserMessages() {
-  return localStorage.getItem(CONTRAST_USER_MESSAGES_KEY) !== 'false';
+  return localStorage.getItem(CONTRAST_USER_MESSAGES_KEY) === 'true';
 }
 
 function readSystemThemeMode(): ResolvedThemeMode {
