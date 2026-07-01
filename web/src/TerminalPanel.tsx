@@ -237,6 +237,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         xterm.loadAddon(fitAddon);
         xterm.open(terminalElement);
         terminal = xterm;
+        let pingTerminalSocket: (() => void) | undefined;
 
         const sendTerminalMetadata = (metadata: { cwd?: string; title?: string }) => {
           if (sendTerminalClientMessage(socket, { type: 'metadata', ...metadata })) return;
@@ -256,7 +257,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         };
         const sendTerminalInput = (data: string) => {
           props.onFilesystemActivity?.();
-          if (sendTerminalClientMessage(socket, { type: 'input', data })) return;
+          if (sendTerminalClientMessage(socket, { type: 'input', data })) {
+            pingTerminalSocket?.();
+            return;
+          }
           if (socket?.readyState === WebSocket.CONNECTING) pendingInput = trimTerminalQueuedInput(pendingInput + data);
         };
         const writeTerminalData = (data: string, replay = false) => {
@@ -391,6 +395,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           sendTerminalHeartbeat();
           heartbeatTimer = window.setInterval(sendTerminalHeartbeat, TERMINAL_HEARTBEAT_MS);
         };
+        pingTerminalSocket = sendTerminalHeartbeat;
 
         socket = new WebSocket(appWebSocketUrl(`/ws/projects/${projectId}/terminal?${params}`));
         terminalSocket = socket;
