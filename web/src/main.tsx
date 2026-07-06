@@ -1682,9 +1682,19 @@ function Shell() {
           if (id) removeExtensionUiRequest(id);
         }
         const agentEndWillRetry = dataType === 'agent_end' && agentEventDataWillRetry(parsed.data);
-        if (eventSessionId && (parsed.type === 'agent:start' || parsed.type === 'bash:start' || dataType === 'agent_start' || agentEndWillRetry)) updateAgentRunningCache(project.id, eventSessionId, true);
+        const startsRunning = parsed.type === 'agent:start'
+          || parsed.type === 'bash:start'
+          || dataType === 'agent_start'
+          || dataType === 'compaction_start'
+          || agentEndWillRetry;
+        const stopsRunning = parsed.type === 'agent:finish'
+          || parsed.type === 'agent:error'
+          || parsed.type === 'bash:finish'
+          || parsed.type === 'bash:error'
+          || (dataType === 'agent_end' && !agentEndWillRetry);
+        if (eventSessionId && startsRunning) updateAgentRunningCache(project.id, eventSessionId, true);
         if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
-        if ((parsed.type === 'agent:finish' || parsed.type === 'agent:error' || parsed.type === 'bash:finish' || parsed.type === 'bash:error' || (dataType === 'agent_end' && !agentEndWillRetry)) && eventSessionId) {
+        if (stopsRunning && eventSessionId) {
           updateAgentRunningCache(project.id, eventSessionId, false);
           removeSessionExtensionUiRequests(eventSessionId);
           queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
@@ -9568,7 +9578,16 @@ function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEve
     return { ...activity, retry: undefined, notices: [...activity.notices, data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`], running: failed ? false : activity.running, streaming: failed ? false : activity.streaming };
   }
   if (type === 'compaction_start') return { ...activity, running: true, notices: [...activity.notices, 'compacting context'] };
-  if (type === 'compaction_end') return { ...activity, notices: [...activity.notices, data.aborted ? 'compaction aborted' : 'compaction finished'] };
+  if (type === 'compaction_end') {
+    const running = data.willRetry === true;
+    return {
+      ...activity,
+      running,
+      streaming: running ? activity.streaming : false,
+      retry: running ? activity.retry : undefined,
+      notices: [...activity.notices, data.aborted ? 'compaction aborted' : 'compaction finished'],
+    };
+  }
   return activity;
 }
 
