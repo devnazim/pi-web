@@ -11843,10 +11843,9 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
     });
     current.addEventListener('message', (event) => {
       if (disposed || socket !== current) return;
-      if (options.heartbeat) {
-        const pong = isWebSocketPongMessage(event.data);
+      if (options.heartbeat && isWebSocketPongMessage(event.data)) {
         clearHeartbeatTimeout();
-        if (pong) return;
+        return;
       }
       options.onMessage(event);
     });

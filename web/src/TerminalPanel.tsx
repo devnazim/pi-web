@@ -442,8 +442,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           } catch {
             return;
           }
-          clearHeartbeatTimeout();
-          if (message.type === 'pong') return;
+          if (message.type === 'pong') {
+            clearHeartbeatTimeout();
+            return;
+          }
 
           if (message.type === 'ready') {
             if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
