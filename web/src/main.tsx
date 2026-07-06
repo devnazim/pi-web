@@ -219,6 +219,9 @@ type ToolCallInfo = { id?: string; name: string; args: Record<string, unknown> }
 type AgentToolActivity = { id: string; name: string; status: 'running' | 'done' | 'error'; summary?: string };
 type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
 type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
+type LiveTranscriptSnapshot = { userMessageCount: number; assistantAfterLastUserId?: string; assistantAfterLastUserText?: string };
+type AssistantEntryPreview = { text: string; thinking: string; error: string };
+type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: number; latestAssistantId?: string };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
 type AgentServerEvent = { type?: string; message?: string; data?: unknown };
 type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; heartbeat?: boolean };
@@ -4918,6 +4921,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let activeComposerDraftTreeSelection: TreeSelection | undefined;
   let restoringComposerDraftTreeSelection: TreeSelection | undefined;
   let runningCommandToken: symbol | undefined;
+  let liveTurnActivityActive = false;
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
   let transcriptScrollFrame: number | undefined;
@@ -4944,6 +4948,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [runningCommand, setRunningCommand] = createSignal<string>();
   const [commandSessionId, setCommandSessionId] = createSignal<string>();
   const [pendingUserMessage, setPendingUserMessage] = createSignal<{ sessionId: string; text: string; attachments: UploadAsset[]; userMessageCount: number }>();
+  const [liveTurnTranscriptSnapshot, setLiveTurnTranscriptSnapshot] = createSignal<LiveTranscriptSnapshot>();
+  const [liveTurnRetired, setLiveTurnRetired] = createSignal(false);
   const [mobileStatusOpen, setMobileStatusOpen] = createSignal(false);
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
@@ -5029,6 +5035,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (props.treeSelection) return branchForEntry(detail.entries, props.treeSelection.branchFromId);
     return detail.branch;
   });
+  const liveTurnTranscriptEntries = createMemo(() => session.data?.branch ?? transcriptEntries());
   const pendingUserMessageVisible = createMemo(() => {
     const pending = pendingUserMessage();
     if (!pending) return false;
@@ -5055,6 +5062,13 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const commandCompletionOptions = createMemo(() => commandCompletions.data?.completions ?? []);
   const liveActivity = () => props.liveActivity;
   const liveShellActivity = () => props.liveShellActivity;
+  const displayedLiveActivity = createMemo(() => displayLiveAgentActivity(
+    liveActivity(),
+    liveTurnTranscriptEntries(),
+    { hideThinking: hideThinking(), toolOutputMode: toolOutputMode() },
+    liveTurnTranscriptSnapshot(),
+    liveTurnRetired(),
+  ));
   const visibleExtensionUiRequests = createMemo(() => {
     const sessionId = props.sessionId ?? commandSessionId();
     return props.extensionUiRequests.filter((request) => sessionId ? request.sessionId === sessionId : !request.sessionId);
@@ -5109,6 +5123,25 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     uploads().length;
     runningCommand();
     if (stickToBottom()) scrollTranscriptToBottom();
+  });
+
+  createEffect(() => {
+    const activity = liveActivity();
+    const active = activity.running || activity.streaming;
+    const options = { hideThinking: hideThinking(), toolOutputMode: toolOutputMode() };
+    if (active && !liveTurnActivityActive) {
+      setLiveTurnTranscriptSnapshot(liveTranscriptSnapshot(untrack(liveTurnTranscriptEntries), options));
+      setLiveTurnRetired(false);
+    }
+    if (!active && !activity.error && !activity.notices.length) {
+      if (liveAgentActivityHasPreviewText(activity, options)) {
+        if (transcriptHasCaughtUpToLiveActivity(liveTurnTranscriptEntries(), options, liveTurnTranscriptSnapshot(), activity)) setLiveTurnRetired(true);
+      } else if (!liveAgentActivityHasDisplayContent(activity, options)) {
+        setLiveTurnTranscriptSnapshot(undefined);
+        setLiveTurnRetired(false);
+      }
+    }
+    liveTurnActivityActive = active;
   });
 
   createEffect(() => {
@@ -6221,7 +6254,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
             <Show when={pendingUserMessageVisible() ? pendingUserMessage() : undefined}>
               {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending().text }]} attachments={pending().attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
             </Show>
-            <LiveAgentActivity activity={liveActivity()} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
+            <LiveAgentActivity activity={displayedLiveActivity()} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
             <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
           </div>
         </div>
@@ -9305,6 +9338,7 @@ function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; synt
 
 function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
   const error = createMemo(() => props.activity.error === 'Operation aborted' ? undefined : props.activity.error);
+  const contentVisible = createMemo(() => liveAgentActivityHasDisplayContent(props.activity, { hideThinking: props.hideThinking, toolOutputMode: props.toolOutputMode }));
   const statusText = createMemo(() => {
     const retry = props.activity.retry;
     if (!retry) return props.activity.running ? 'working' : 'pi';
@@ -9312,7 +9346,7 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
     return `retrying${attempt}`;
   });
   return (
-    <Show when={props.activity.running || error() || props.activity.notices.length}>
+    <Show when={props.activity.running || error() || props.activity.notices.length || contentVisible()}>
       <div class="live-agent">
         <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
         <Show when={props.activity.text.trim()}><LiveAgentText text={props.activity.text} running={props.activity.streaming} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>
@@ -9615,6 +9649,109 @@ function isUserMessageEntry(entry: SessionEntry) {
 
 function userMessageCount(entries: SessionEntry[]) {
   return entries.filter(isUserMessageEntry).length;
+}
+
+function liveTranscriptSnapshot(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): LiveTranscriptSnapshot {
+  const preview = assistantAggregatePreviewAfterLastUser(entries, options);
+  return { userMessageCount: preview.userMessageCount, assistantAfterLastUserId: preview.latestAssistantId, assistantAfterLastUserText: assistantPreviewText(preview) };
+}
+
+function displayLiveAgentActivity(activity: AgentActivity, entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined, retired: boolean): AgentActivity {
+  if (activity.running || activity.streaming) return activity;
+  if (activity.error === 'Operation aborted') return emptyAgentActivity();
+  if (activity.error) return activity;
+  if (activity.notices.length) return activity;
+  if (retired) return emptyAgentActivity();
+  if (!liveAgentActivityHasDisplayContent(activity, options)) return activity;
+  if (!liveAgentActivityHasPreviewText(activity, options)) return emptyAgentActivity();
+  return transcriptHasCaughtUpToLiveActivity(entries, options, snapshot, activity) ? emptyAgentActivity() : holdCompletedLiveAgentActivity(activity);
+}
+
+function holdCompletedLiveAgentActivity(activity: AgentActivity): AgentActivity {
+  return activity.streaming ? activity : { ...activity, streaming: true };
+}
+
+function liveAgentActivityHasDisplayContent(activity: AgentActivity, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }) {
+  return Boolean(liveAgentActivityHasPreviewText(activity, options) || (options.toolOutputMode !== 'hidden' && activity.tools.length));
+}
+
+function liveAgentActivityHasPreviewText(activity: AgentActivity, options: { hideThinking: boolean }) {
+  return Boolean(activity.text.trim() || (!options.hideThinking && activity.thinking.trim()));
+}
+
+function transcriptHasCaughtUpToLiveActivity(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined, activity: AgentActivity) {
+  const preview = assistantAggregatePreviewAfterLastUser(entries, options);
+  if (!preview.latestAssistantId) return false;
+  const previewText = assistantPreviewText(preview);
+  if (snapshot) {
+    const snapshotText = comparablePreviewText(snapshot.assistantAfterLastUserText ?? '');
+    const currentText = comparablePreviewText(previewText);
+    const sameAssistant = preview.latestAssistantId === snapshot.assistantAfterLastUserId;
+    if (preview.userMessageCount < snapshot.userMessageCount) return false;
+    if (preview.userMessageCount === snapshot.userMessageCount && snapshot.assistantAfterLastUserId && !sameAssistant && (!snapshotText || !currentText.includes(snapshotText))) return false;
+    if (sameAssistant && currentText === snapshotText) return false;
+  }
+  return liveActivityMatchesAssistantPreview(activity, preview, options);
+}
+
+function assistantAggregatePreviewAfterLastUser(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): AssistantAggregatePreview {
+  let userCount = 0;
+  let lastUserIndex = -1;
+  for (let index = 0; index < entries.length; index += 1) {
+    if (isUserMessageEntry(entries[index])) {
+      userCount += 1;
+      lastUserIndex = index;
+    }
+  }
+
+  const preview: AssistantAggregatePreview = { userMessageCount: userCount, text: '', thinking: '', error: '' };
+  if (lastUserIndex === -1) return preview;
+  for (let index = lastUserIndex + 1; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.type !== 'message' || entry.message?.role !== 'assistant' || !shouldDisplayTranscriptEntry(entry, options)) continue;
+    const entryPreview = assistantEntryPreview(entry, options);
+    preview.text = joinPreviewSegments(preview.text, entryPreview.text);
+    preview.thinking = joinPreviewSegments(preview.thinking, entryPreview.thinking);
+    preview.error = joinPreviewSegments(preview.error, entryPreview.error);
+    preview.latestAssistantId = entry.id;
+  }
+  return preview;
+}
+
+function liveActivityMatchesAssistantPreview(activity: AgentActivity, preview: AssistantEntryPreview, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }) {
+  const textMatches = !activity.text.trim() || textContainsPreview(preview.text, activity.text);
+  const thinkingMatches = options.hideThinking || !activity.thinking.trim() || textContainsPreview(preview.thinking, activity.thinking);
+  return textMatches && thinkingMatches;
+}
+
+function assistantEntryPreview(entry: SessionEntry, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): AssistantEntryPreview {
+  const parts = entryContentParts(entry, options);
+  return {
+    text: parts.filter((part) => part.type === 'text').map((part) => part.text).join('\n'),
+    thinking: parts.filter((part) => part.type === 'thinking').map((part) => part.text).join('\n'),
+    error: parts.filter((part) => part.type === 'error').map((part) => part.text).join('\n'),
+  };
+}
+
+function joinPreviewSegments(current: string, next: string) {
+  return [current, next].filter(Boolean).join('\n');
+}
+
+function assistantPreviewText(preview: AssistantEntryPreview) {
+  return [preview.text, preview.thinking, preview.error].filter(Boolean).join('\n');
+}
+
+function textContainsPreview(fullText: string, previewText: string) {
+  const full = comparablePreviewText(fullText);
+  const preview = comparablePreviewText(previewText);
+  if (!full || !preview) return false;
+  if (full === preview || full.includes(preview)) return true;
+  const sampleLength = Math.min(1000, preview.length);
+  return sampleLength >= 80 && full.includes(preview.slice(preview.length - sampleLength));
+}
+
+function comparablePreviewText(value: string) {
+  return value.replace(/^…\s*/, '').replace(/\s+/g, ' ').trim();
 }
 
 function chatDisplayEntries(entries: SessionEntry[]) {
