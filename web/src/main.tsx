@@ -219,8 +219,14 @@ type PiSettingsResponse = { global: PiSettings; project: PiSettings; effective: 
 type ChatContentPart = { type: 'text' | 'thinking' | 'tool' | 'image' | 'error'; text: string };
 type ToolCallInfo = { id?: string; name: string; args: Record<string, unknown> };
 type AgentToolActivity = { id: string; name: string; status: 'running' | 'done' | 'error'; summary?: string };
+type AgentActivityTextKind = 'text' | 'thinking';
+type AgentActivityTextItem = { type: 'text'; text: string };
+type AgentActivityThinkingItem = { type: 'thinking'; text: string };
+type AgentActivityContentItem = AgentActivityTextItem | AgentActivityThinkingItem;
+type AgentActivityToolItem = { type: 'tool'; tool: AgentToolActivity };
+type AgentActivityItem = AgentActivityContentItem | AgentActivityToolItem;
 type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
-type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; notices: string[]; retry?: AgentRetryActivity };
+type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; items: AgentActivityItem[]; notices: string[]; retry?: AgentRetryActivity };
 type LiveTranscriptSnapshot = { userMessageCount: number; assistantAfterLastUserId?: string; assistantAfterLastUserText?: string };
 type AssistantEntryPreview = { text: string; thinking: string; error: string };
 type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: number; latestAssistantId?: string };
@@ -827,8 +833,7 @@ function Shell() {
   let pendingStoredEventsFrame: number | undefined;
   let liveAgentActivityValue = emptyAgentActivity();
   let liveShellActivityValue = emptyBashActivity();
-  let pendingLiveTextChunks: string[] = [];
-  let pendingLiveThinkingChunks: string[] = [];
+  let pendingLiveActivitySegments: AgentActivityContentItem[] = [];
   let liveActivityDirty = false;
   let liveActivityPublishTimer: number | undefined;
   let liveActivityPublishFrame: number | undefined;
@@ -868,20 +873,19 @@ function Shell() {
   }
 
   function flushPendingLiveActivityDeltas() {
-    if (!pendingLiveTextChunks.length && !pendingLiveThinkingChunks.length) return;
-    liveAgentActivityValue = {
-      ...liveAgentActivityValue,
-      text: pendingLiveTextChunks.length ? appendLivePreviewText(liveAgentActivityValue.text, pendingLiveTextChunks.join(''), LIVE_ACTIVITY_TEXT_MAX_LENGTH) : liveAgentActivityValue.text,
-      thinking: pendingLiveThinkingChunks.length ? appendLivePreviewText(liveAgentActivityValue.thinking, pendingLiveThinkingChunks.join(''), LIVE_ACTIVITY_TEXT_MAX_LENGTH) : liveAgentActivityValue.thinking,
-    };
-    pendingLiveTextChunks = [];
-    pendingLiveThinkingChunks = [];
+    if (!pendingLiveActivitySegments.length) return;
+    let activity = liveAgentActivityValue;
+    for (const segment of pendingLiveActivitySegments) activity = appendLiveActivityTextSegment(activity, segment.type, segment.text);
+    liveAgentActivityValue = activity;
+    pendingLiveActivitySegments = [];
     liveActivityDirty = true;
   }
 
-  function queueLiveActivityDelta(delta: { text?: string; thinking?: string }) {
-    if (delta.text) pendingLiveTextChunks.push(delta.text);
-    if (delta.thinking) pendingLiveThinkingChunks.push(delta.thinking);
+  function queueLiveActivityDelta(delta: AgentActivityContentItem) {
+    if (!delta.text) return;
+    const previous = pendingLiveActivitySegments[pendingLiveActivitySegments.length - 1];
+    if (previous?.type === delta.type) previous.text += delta.text;
+    else pendingLiveActivitySegments.push({ ...delta });
     if (!liveAgentActivityValue.running || !liveAgentActivityValue.streaming) liveAgentActivityValue = { ...liveAgentActivityValue, running: true, streaming: true };
     liveActivityDirty = true;
   }
@@ -913,8 +917,7 @@ function Shell() {
   }
 
   function replaceLiveActivity(agentActivity: AgentActivity, shellActivity = liveShellActivityValue) {
-    pendingLiveTextChunks = [];
-    pendingLiveThinkingChunks = [];
+    pendingLiveActivitySegments = [];
     liveAgentActivityValue = agentActivity;
     liveShellActivityValue = shellActivity;
     liveActivityDirty = true;
@@ -931,8 +934,7 @@ function Shell() {
       const event = parseAgentServerEvent(payload);
       return !event || shouldStoreAgentEvent(event);
     }));
-    pendingLiveTextChunks = [];
-    pendingLiveThinkingChunks = [];
+    pendingLiveActivitySegments = [];
     liveAgentActivityValue = emptyAgentActivity();
     liveShellActivityValue = emptyBashActivity();
     liveActivityDirty = true;
@@ -9510,6 +9512,7 @@ function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; synt
 function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
   const error = createMemo(() => props.activity.error === 'Operation aborted' ? undefined : props.activity.error);
   const contentVisible = createMemo(() => liveAgentActivityHasDisplayContent(props.activity, { hideThinking: props.hideThinking, toolOutputMode: props.toolOutputMode }));
+  const orderedItems = createMemo(() => liveAgentActivityRenderItems(props.activity));
   const statusText = createMemo(() => {
     const retry = props.activity.retry;
     if (!retry) return props.activity.running ? 'working' : 'pi';
@@ -9520,19 +9523,22 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
     <Show when={props.activity.running || error() || props.activity.notices.length || contentVisible()}>
       <div class="live-agent">
         <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
-        <Show when={props.activity.text.trim()}><LiveAgentText text={props.activity.text} running={props.activity.streaming} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>
-        <Show when={!props.hideThinking && props.activity.thinking.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{props.activity.thinking}</div></Collapsible></Show>
-        <Show when={(props.toolOutputMode !== 'hidden' && props.activity.tools.length) || props.activity.notices.length}>
+        <For each={orderedItems()}>{(item) => <LiveAgentActivityItem item={item} hideThinking={props.hideThinking} optimizeStreamingRender={props.optimizeStreamingRender} toolOutputMode={props.toolOutputMode} syntaxTheme={props.syntaxTheme} running={props.activity.streaming} />}</For>
+        <Show when={props.activity.notices.length}>
           <div class="live-agent-tools">
-            <Show when={props.toolOutputMode !== 'hidden'}>
-              <For each={props.activity.tools}>{(tool) => <LiveToolLine tool={tool} />}</For>
-            </Show>
             <For each={props.activity.notices}>{(notice) => <div class="chat-meta"><span>agent</span><span>{notice}</span></div>}</For>
           </div>
         </Show>
       </div>
     </Show>
   );
+}
+
+function LiveAgentActivityItem(props: { item: AgentActivityItem; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme; running: boolean }) {
+  const item = props.item;
+  if (item.type === 'text') return <Show when={item.text.trim()}><LiveAgentText text={item.text} running={props.running} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>;
+  if (item.type === 'thinking') return <Show when={!props.hideThinking && item.text.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{item.text}</div></Collapsible></Show>;
+  return <Show when={props.toolOutputMode !== 'hidden'}><LiveToolLine tool={item.tool} /></Show>;
 }
 
 function LiveAgentText(props: { text: string; running: boolean; optimizeStreamingRender: boolean; syntaxTheme: ShikiSyntaxTheme }) {
@@ -9675,7 +9681,7 @@ function emptyBashActivity(): BashActivity {
 }
 
 function emptyAgentActivity(): AgentActivity {
-  return { running: false, streaming: false, text: '', thinking: '', tools: [], notices: [] };
+  return { running: false, streaming: false, text: '', thinking: '', tools: [], items: [], notices: [] };
 }
 
 function parseAgentServerEvent(raw: string): AgentServerEvent | undefined {
@@ -9697,6 +9703,31 @@ function livePreviewText(value: string, maxLength: number) {
   return `…\n${value.slice(Math.max(0, value.length - maxLength))}`;
 }
 
+function appendLiveActivityTextSegment(activity: AgentActivity, type: AgentActivityTextKind, text: string): AgentActivity {
+  if (!text) return activity;
+  return {
+    ...activity,
+    text: type === 'text' ? appendLivePreviewText(activity.text, text, LIVE_ACTIVITY_TEXT_MAX_LENGTH) : activity.text,
+    thinking: type === 'thinking' ? appendLivePreviewText(activity.thinking, text, LIVE_ACTIVITY_TEXT_MAX_LENGTH) : activity.thinking,
+    items: appendLiveActivityTextItem(activity.items, type, text),
+  };
+}
+
+function appendLiveActivityTextItem(items: AgentActivityItem[], type: AgentActivityTextKind, text: string): AgentActivityItem[] {
+  const previous = items[items.length - 1];
+  const nextText = previous?.type === type ? appendLivePreviewText(previous.text, text, LIVE_ACTIVITY_TEXT_MAX_LENGTH) : livePreviewText(text, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
+  const nextItem: AgentActivityContentItem = type === 'text' ? { type: 'text', text: nextText } : { type: 'thinking', text: nextText };
+  return previous?.type === type ? [...items.slice(0, -1), nextItem] : [...items, nextItem];
+}
+
+function upsertLiveActivityToolItem(items: AgentActivityItem[], tool: AgentToolActivity): AgentActivityItem[] {
+  const index = items.findIndex((item) => item.type === 'tool' && item.tool.id === tool.id);
+  if (index === -1) return [...items, { type: 'tool', tool }];
+  const next = [...items];
+  next[index] = { type: 'tool', tool };
+  return next;
+}
+
 function shouldPublishLiveActivityImmediately(event: AgentServerEvent) {
   if (event.type === 'bash:update') return false;
   if (event.type !== 'agent:event') return true;
@@ -9709,13 +9740,13 @@ function shouldPublishLiveActivityImmediately(event: AgentServerEvent) {
   return messageEvent.type === 'text_end' || messageEvent.type === 'thinking_end';
 }
 
-function agentActivityMessageDelta(event: AgentServerEvent): { text?: string; thinking?: string } | undefined {
+function agentActivityMessageDelta(event: AgentServerEvent): AgentActivityContentItem | undefined {
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return undefined;
   const data = event.data as Record<string, unknown>;
   if (data.type !== 'message_update') return undefined;
   const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
-  if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { text: messageEvent.delta };
-  if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { thinking: messageEvent.delta };
+  if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { type: 'text', text: messageEvent.delta };
+  if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { type: 'thinking', text: messageEvent.delta };
   return undefined;
 }
 
@@ -9747,26 +9778,26 @@ function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEve
   }
   if (type === 'message_update') {
     const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
-    let text = activity.text;
-    let thinking = activity.thinking;
-    if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') text = appendLivePreviewText(text, messageEvent.delta, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
-    if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string') thinking = appendLivePreviewText(thinking, messageEvent.delta, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
-    if (messageEvent.type === 'text_end' && !text && typeof messageEvent.content === 'string') text = livePreviewText(messageEvent.content, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
-    if (messageEvent.type === 'thinking_end' && !thinking && typeof messageEvent.content === 'string') thinking = livePreviewText(messageEvent.content, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
-    return { ...activity, running: true, streaming: true, text, thinking };
+    let next = activity;
+    if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') next = appendLiveActivityTextSegment(next, 'text', messageEvent.delta);
+    if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string') next = appendLiveActivityTextSegment(next, 'thinking', messageEvent.delta);
+    if (messageEvent.type === 'text_end' && !next.text && typeof messageEvent.content === 'string') next = appendLiveActivityTextSegment(next, 'text', messageEvent.content);
+    if (messageEvent.type === 'thinking_end' && !next.thinking && typeof messageEvent.content === 'string') next = appendLiveActivityTextSegment(next, 'thinking', messageEvent.content);
+    return { ...next, running: true, streaming: true };
   }
   if (type === 'tool_execution_start' || type === 'tool_execution_update' || type === 'tool_execution_end') {
     const tools = new Map(activity.tools.map((tool) => [tool.id, tool]));
     const id = String(data.toolCallId ?? data.toolName ?? tools.size);
     const name = String(data.toolName ?? 'tool');
     const existing = tools.get(id);
-    tools.set(id, {
+    const tool: AgentToolActivity = {
       id,
       name,
       status: type === 'tool_execution_end' ? (data.isError ? 'error' : 'done') : 'running',
       summary: toolActivitySummary(data) ?? existing?.summary,
-    });
-    return { ...activity, running: true, streaming: true, tools: [...tools.values()] };
+    };
+    tools.set(id, tool);
+    return { ...activity, running: true, streaming: true, tools: [...tools.values()], items: upsertLiveActivityToolItem(activity.items, tool) };
   }
   if (type === 'notice') return { ...activity, notices: [...activity.notices, String(data.message ?? 'notice')] };
   if (type === 'auto_retry_start') {
@@ -9840,6 +9871,15 @@ function displayLiveAgentActivity(activity: AgentActivity, entries: SessionEntry
 
 function holdCompletedLiveAgentActivity(activity: AgentActivity): AgentActivity {
   return activity.streaming ? activity : { ...activity, streaming: true };
+}
+
+function liveAgentActivityRenderItems(activity: AgentActivity): AgentActivityItem[] {
+  if (activity.items.length) return activity.items;
+  const items: AgentActivityItem[] = [];
+  if (activity.text.trim()) items.push({ type: 'text', text: activity.text });
+  if (activity.thinking.trim()) items.push({ type: 'thinking', text: activity.thinking });
+  for (const tool of activity.tools) items.push({ type: 'tool', tool });
+  return items;
 }
 
 function liveAgentActivityHasDisplayContent(activity: AgentActivity, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }) {
