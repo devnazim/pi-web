@@ -1332,13 +1332,34 @@ body {
   }
 
   .composer-toolbar {
-    @apply overflow-hidden;
+    @apply flex h-12 min-w-0 items-center gap-1.5 overflow-hidden border-t border-border px-3 text-sm;
   }
 
+  .composer-toolbar-leading,
+  .composer-toolbar-actions,
+  .composer-toolbar-controls {
+    @apply flex min-w-0 items-center gap-1.5;
+  }
+
+  .composer-toolbar-leading,
+  .composer-toolbar-actions {
+    @apply shrink-0;
+  }
+
+  .composer-toolbar-spacer {
+    @apply min-w-0 flex-1;
+  }
+
+  .composer-agent-select,
   .composer-model-select,
   .composer-thinking-select {
     @apply min-w-0;
     flex: 0 1 auto;
+  }
+
+  .composer-agent-select {
+    min-width: 5.25rem;
+    max-width: min(14rem, calc(100vw - 9rem));
   }
 
   .composer-model-select {
@@ -1349,6 +1370,10 @@ body {
   .composer-thinking-select {
     min-width: 5.25rem;
     max-width: min(10rem, calc(100vw - 9rem));
+  }
+
+  .composer-agent-select .select {
+    min-width: 5.25rem;
   }
 
   .composer-model-select .select {
@@ -1365,7 +1390,55 @@ body {
     }
 
     .composer-toolbar {
-      @apply h-auto flex-nowrap gap-1.5 py-2;
+      @apply h-auto py-2;
+    }
+  }
+
+  @media (max-width: 720px) {
+    .composer-toolbar {
+      @apply grid gap-x-1.5 gap-y-2 py-2;
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        'leading actions'
+        'controls controls';
+    }
+
+    .composer-toolbar-leading {
+      grid-area: leading;
+    }
+
+    .composer-toolbar-actions {
+      @apply justify-end;
+      grid-area: actions;
+    }
+
+    .composer-toolbar-controls {
+      @apply w-full pt-2;
+      grid-area: controls;
+      box-shadow: 0 -14px 22px -24px oklch(0 0 0 / 0.34);
+    }
+
+    .dark .composer-toolbar-controls {
+      box-shadow: 0 -16px 24px -24px oklch(0 0 0 / 0.72);
+    }
+
+    .composer-toolbar-spacer {
+      @apply hidden;
+    }
+
+    .composer-agent-select,
+    .composer-model-select,
+    .composer-thinking-select {
+      flex: 1 1 0;
+      max-width: none;
+      min-width: 0;
+    }
+
+    .composer-agent-select .select,
+    .composer-model-select .select,
+    .composer-thinking-select .select {
+      min-width: 0;
+      width: 100%;
     }
   }
 

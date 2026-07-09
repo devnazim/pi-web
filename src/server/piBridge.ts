@@ -1,8 +1,9 @@
-import { AuthStorage, ModelRegistry, resizeImage } from '@earendil-works/pi-coding-agent';
+import { AuthStorage, getAgentDir, ModelRegistry, parseFrontmatter, resizeImage } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
-import { randomUUID } from 'node:crypto';
-import { constants, type Stats } from 'node:fs';
-import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants, type Dirent, type Stats } from 'node:fs';
+import { open, readdir, readFile, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { clearProjectFileCaches } from './files.js';
 import { getGitBranch } from './git.js';
@@ -29,11 +30,13 @@ interface PromptBody {
   treeSummary?: TreeSummaryOptions;
   branchFromId?: string | null;
   prompt: string;
+  agent?: string;
   model?: string;
   thinking?: string;
   attachments?: string[];
   mirrorActiveStream?: boolean;
   streamingBehavior?: StreamingBehavior;
+  awaitCompletion?: boolean;
 }
 
 interface NavigateTreeBody {
@@ -72,6 +75,10 @@ type CommandInfo = {
 };
 
 type CommandCompletion = { value: string; label?: string; description?: string };
+type AgentProfileSource = 'suite' | 'legacy';
+type AgentProfileType = 'main' | 'subagent' | 'both';
+type AgentListItem = { value: string; id: string; label: string; description?: string; type: AgentProfileType; source: AgentProfileSource; model?: string; thinking?: string; tools?: string[]; agents?: string[] };
+type AgentListResponse = { supported: boolean; active: string | null; agents: AgentListItem[] };
 
 type ExtensionUiRequestMethod = 'select' | 'confirm' | 'input' | 'editor';
 type ExtensionUiRequest = {
@@ -385,6 +392,9 @@ export class PiBridge {
       }
       else if ('branchFromId' in body) this.branchSession(session, body.branchFromId);
 
+      if (this.shouldApplySuiteAgentSelection(body, extensionCommand, queuedStreamingPrompt, requestedStreamingBehavior)) {
+        await this.applySuiteAgentSelection(session, body.agent);
+      }
       await this.applySessionControls(session, body);
 
       const { prompt, images } = await this.preparePromptAttachments(projectPath, body.prompt, body.attachments);
@@ -520,11 +530,23 @@ export class PiBridge {
       .sort((a, b) => a.label.localeCompare(b.label));
   }
 
+  async agents(projectPath: string, sessionId?: string): Promise<AgentListResponse> {
+    const session = await this.getCommandSession(projectPath, sessionId);
+    if (!this.hasAgentExtensionCommand(session)) return { supported: false, active: null, agents: [] };
+    const location = await this.agentProfileLocation();
+    return {
+      supported: true,
+      active: await this.activeAgentId(projectPath, location),
+      agents: await this.loadAgentProfilesFromDir(location.agentsDir, location.source),
+    };
+  }
+
   async commands(projectPath: string, sessionId?: string): Promise<CommandInfo[]> {
     const session = await this.getCommandSession(projectPath, sessionId);
+    const hasAgentCommand = this.hasAgentExtensionCommand(session);
     return [
-      ...(sessionId ? this.builtinCommands() : []),
-      ...this.extensionCommands(session),
+      ...this.builtinCommands(Boolean(sessionId)),
+      ...this.extensionCommands(session, hasAgentCommand),
       ...this.promptTemplateCommands(session),
       ...this.skillCommands(session),
     ];
@@ -533,6 +555,7 @@ export class PiBridge {
   async commandCompletions(projectPath: string, query: CommandCompletionQuery): Promise<CommandCompletion[]> {
     if (!query.command) return [];
     const session = await this.getCommandSession(projectPath, query.sessionId);
+    if (query.command === 'agent' && this.hasAgentExtensionCommand(session)) return this.agentCommandCompletions(projectPath, query.prefix ?? '');
     const command = typeof session?.extensionRunner?.getCommand === 'function'
       ? session.extensionRunner.getCommand(query.command)
       : undefined;
@@ -1020,24 +1043,29 @@ export class PiBridge {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
   }
 
-  private builtinCommands(): CommandInfo[] {
-    return [{
-      name: 'compact',
-      description: 'Manually compact the session context',
-      source: 'builtin',
-      argumentHint: 'custom instructions',
-    }];
+  private builtinCommands(includeSessionCommands: boolean): CommandInfo[] {
+    return includeSessionCommands
+      ? [{
+        name: 'compact',
+        description: 'Manually compact the session context',
+        source: 'builtin',
+        argumentHint: 'custom instructions',
+      }]
+      : [];
   }
 
-  private extensionCommands(session: any): CommandInfo[] {
+  private extensionCommands(session: any, hasAgentCommand: boolean): CommandInfo[] {
     const commands = typeof session?.extensionRunner?.getRegisteredCommands === 'function'
       ? session.extensionRunner.getRegisteredCommands()
       : [];
     return commands
       .filter((command: any) => !WEB_BUILTIN_COMMAND_NAMES.has(String(command.invocationName ?? command.name)))
-      .map((command: any) => this.commandInfo(command.invocationName ?? command.name, command.description, 'extension', command.sourceInfo, {
-        hasArgumentCompletions: typeof command.getArgumentCompletions === 'function',
-      }));
+      .map((command: any) => {
+        const name = command.invocationName ?? command.name;
+        return this.commandInfo(name, command.description, 'extension', command.sourceInfo, {
+          hasArgumentCompletions: typeof command.getArgumentCompletions === 'function' || (hasAgentCommand && String(name) === 'agent'),
+        });
+      });
   }
 
   private promptTemplateCommands(session: any): CommandInfo[] {
@@ -1080,6 +1108,165 @@ export class PiBridge {
       label: typeof record.label === 'string' ? record.label : undefined,
       description: typeof record.description === 'string' ? record.description : undefined,
     };
+  }
+
+  private async agentCommandCompletions(projectPath: string, prefix: string): Promise<CommandCompletion[]> {
+    const normalized = prefix.trim().toLowerCase();
+    const location = await this.agentProfileLocation();
+    const completions: CommandCompletion[] = [
+      { value: 'none', label: 'No agent', description: 'Clear selected main agent' },
+      ...(await this.loadAgentProfilesFromDir(location.agentsDir, location.source)).map((agent) => ({
+        value: agent.id,
+        label: `${agent.id} · ${agent.source}`,
+        description: agent.description,
+      })),
+    ];
+    if (!normalized) return completions.slice(0, 25);
+    return completions.filter((completion) => [completion.value, completion.label, completion.description]
+      .filter((item): item is string => Boolean(item))
+      .some((item) => item.toLowerCase().includes(normalized))).slice(0, 25);
+  }
+
+  private async agentProfileLocation(): Promise<{ agentsDir: string; stateDir: string; source: AgentProfileSource }> {
+    const suiteDir = process.env.PI_AGENT_SUITE_DIR
+      ? path.resolve(this.expandHomePath(process.env.PI_AGENT_SUITE_DIR))
+      : path.join(getAgentDir(), 'agent-suite');
+    const suiteAgentsDir = path.join(suiteDir, 'agent-selection', 'agents');
+    if (await this.isDirectory(suiteAgentsDir)) {
+      return {
+        agentsDir: suiteAgentsDir,
+        stateDir: path.join(suiteDir, 'agent-selection', 'state'),
+        source: 'suite',
+      };
+    }
+    return {
+      agentsDir: path.join(getAgentDir(), 'agents'),
+      stateDir: path.join(getAgentDir(), 'agent-selection', 'state'),
+      source: 'legacy',
+    };
+  }
+
+  private async activeAgentId(projectPath: string, location: { stateDir: string }): Promise<string | null> {
+    try {
+      const statePath = path.join(location.stateDir, `${createHash('sha256').update(path.resolve(projectPath)).digest('hex')}.json`);
+      const state = JSON.parse(await readFile(statePath, 'utf8')) as { cwd?: unknown; activeAgentId?: unknown };
+      if (typeof state.cwd === 'string' && path.resolve(state.cwd) !== path.resolve(projectPath)) return null;
+      return typeof state.activeAgentId === 'string' ? state.activeAgentId : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async loadAgentProfilesFromDir(dir: string, source: AgentProfileSource): Promise<AgentListItem[]> {
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const agents = await Promise.all(entries
+      .filter((entry) => entry.name.endsWith('.md') && (entry.isFile() || entry.isSymbolicLink()))
+      .map((entry) => this.agentProfileFromFile(path.join(dir, entry.name), source)));
+    return agents
+      .filter((agent): agent is AgentListItem => Boolean(agent))
+      .sort((a, b) => a.label.localeCompare(b.label) || a.id.localeCompare(b.id));
+  }
+
+  private async agentProfileFromFile(filePath: string, source: AgentProfileSource): Promise<AgentListItem | undefined> {
+    try {
+      const id = path.basename(filePath, '.md').trim();
+      if (!id) return undefined;
+      const { frontmatter } = parseFrontmatter<Record<string, unknown>>(await readFile(filePath, 'utf8'));
+      const type = this.agentProfileType(frontmatter.type);
+      if (type === 'subagent') return undefined;
+      const description = this.frontmatterString(frontmatter.description);
+      const model = this.frontmatterModel(frontmatter.model);
+      const tools = this.frontmatterStringArray(frontmatter.tools);
+      const agents = this.frontmatterStringArray(frontmatter.agents);
+      return {
+        value: id,
+        id,
+        label: id,
+        ...(description ? { description } : {}),
+        type,
+        source,
+        ...(model.id ? { model: model.id } : {}),
+        ...(model.thinking ? { thinking: model.thinking } : {}),
+        ...(tools?.length ? { tools } : {}),
+        ...(agents?.length ? { agents } : {}),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private agentProfileType(value: unknown): AgentProfileType {
+    if (value === undefined || value === null) return 'main';
+    if (typeof value !== 'string') throw new Error('Invalid agent type');
+    const type = value.trim();
+    if (type === 'main' || type === 'subagent' || type === 'both') return type;
+    throw new Error('Invalid agent type');
+  }
+
+  private async isDirectory(filePath: string) {
+    try {
+      return (await stat(filePath)).isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  private frontmatterString(value: unknown) {
+    return typeof value === 'string' ? value.trim() || undefined : undefined;
+  }
+
+  private frontmatterStringArray(value: unknown) {
+    const values = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[\n,]/) : [];
+    const strings = values.map((item) => typeof item === 'string' ? item.trim() : '').filter(Boolean);
+    return strings.length ? [...new Set(strings)] : undefined;
+  }
+
+  private frontmatterModel(value: unknown): { id?: string; thinking?: string } {
+    if (typeof value === 'string') return this.frontmatterString(value) ? { id: this.frontmatterString(value) } : {};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    const model = value as { id?: unknown; thinking?: unknown };
+    const id = this.frontmatterString(model.id);
+    const thinking = this.frontmatterString(model.thinking);
+    return {
+      ...(id ? { id } : {}),
+      ...(thinking ? { thinking } : {}),
+    };
+  }
+
+  private expandHomePath(filePath: string) {
+    return filePath === '~' || filePath.startsWith(`~${path.sep}`) || filePath.startsWith('~/')
+      ? path.join(homedir(), filePath.slice(2))
+      : filePath;
+  }
+
+  private hasAgentExtensionCommand(session: any) {
+    if (typeof session?.extensionRunner?.getCommand === 'function' && session.extensionRunner.getCommand('agent')) return true;
+    const commands = typeof session?.extensionRunner?.getRegisteredCommands === 'function'
+      ? session.extensionRunner.getRegisteredCommands()
+      : [];
+    return commands.some((command: any) => String(command.invocationName ?? command.name) === 'agent');
+  }
+
+  private shouldApplySuiteAgentSelection(body: PromptBody, extensionCommand: boolean, queuedStreamingPrompt: boolean, requestedStreamingBehavior: StreamingBehavior | undefined) {
+    return Object.prototype.hasOwnProperty.call(body, 'agent') && !extensionCommand && !queuedStreamingPrompt && !requestedStreamingBehavior;
+  }
+
+  private async applySuiteAgentSelection(session: any, value: string | undefined) {
+    if (!this.hasAgentExtensionCommand(session)) return;
+    if (typeof session?.prompt !== 'function') throw new Error('Loaded pi SDK session does not expose prompt()');
+    await session.prompt(`/agent ${this.agentCommandArgument(value)}`, { source: 'rpc' });
+  }
+
+  private agentCommandArgument(value: string | undefined) {
+    const requested = value?.trim() ?? '';
+    if (!requested || ['none', 'default', 'reset', 'off'].includes(requested.toLowerCase())) return 'none';
+    if (/[\r\n]/.test(requested)) throw new Error('Invalid agent id');
+    return requested;
   }
 
   private branchSession(session: any, branchFromId: string | null | undefined) {
@@ -1445,6 +1632,15 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
     }
   });
 
+  app.get<{ Params: { projectId: string }; Querystring: { sessionId?: string } }>('/api/projects/:projectId/agent/agents', async (request, reply) => {
+    try {
+      const project = registry.get(request.params.projectId);
+      return await bridge.agents(project.path, request.query.sessionId);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not load agents' });
+    }
+  });
+
   app.get<{ Params: { projectId: string }; Querystring: { sessionId?: string } }>('/api/projects/:projectId/agent/commands', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
@@ -1527,6 +1723,11 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
       const promptTask = bridge.prompt(project.path, promptBody, streamTarget, { startEvent: !request.body.treeTargetId, preflightResult: settlePreflight })
         .finally(() => clearProjectFileCaches(project.id));
       promptTask.catch((error) => settlePreflight(false, error));
+      if (request.body.awaitCompletion) {
+        void preflight.catch(() => undefined);
+        await promptTask;
+        return { ok: true };
+      }
       await preflight;
       return { ok: true };
     } catch (error) {

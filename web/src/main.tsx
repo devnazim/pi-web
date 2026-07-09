@@ -159,6 +159,8 @@ type ExtensionUiRequest = { id: string; sessionId?: string; method: ExtensionUiR
 type ExtensionUiReply = { value?: string; confirmed?: boolean; cancelled?: boolean; sessionId?: string };
 type AgentStatusPart = { text: string; title?: string; tone?: 'warning' | 'danger' };
 type ModelListItem = { value: string; label: string; provider: string; id: string; reasoning: boolean; thinkingLevels?: ThinkingLevel[] };
+type AgentListItem = { value: string; id: string; label: string; description?: string; type: 'main' | 'subagent' | 'both'; source: 'suite' | 'legacy'; model?: string; thinking?: string; tools?: string[]; agents?: string[] };
+type AgentListResponse = { supported: boolean; active?: string | null; agents: AgentListItem[] };
 type RichTextPart = { text: string; kind?: 'code' | 'file' | 'strong' };
 type MarkdownTableCell = { text?: string; tokens?: Token[]; align?: 'center' | 'left' | 'right' | null };
 type MarkdownListItemToken = { tokens?: Token[]; text?: string; task?: boolean; checked?: boolean };
@@ -226,8 +228,8 @@ type BashActivity = { running: boolean; error?: string; command?: string; output
 type AgentServerEvent = { type?: string; message?: string; data?: unknown };
 type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; heartbeat?: boolean };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
-type SessionComposerControls = { model?: string; thinking?: ThinkingLevel | '' };
-type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; model?: string; thinking?: ThinkingLevel | '' };
+type SessionComposerControls = { agent?: string; model?: string; thinking?: ThinkingLevel | '' };
+type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; agent?: string; agentExplicit?: boolean; model?: string; modelExplicit?: boolean; thinking?: ThinkingLevel | ''; thinkingExplicit?: boolean };
 type ChatSearchState = { activeIndex: number; total: number };
 type ChatSearchRequest = { seq: number; direction: 1 | -1 };
 type WorkspaceNotificationLevel = 'info' | 'success' | 'warning' | 'error';
@@ -4921,6 +4923,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let activeComposerDraftTreeSelection: TreeSelection | undefined;
   let restoringComposerDraftTreeSelection: TreeSelection | undefined;
   let runningCommandToken: symbol | undefined;
+  let pendingAgentSelectionApply: { sessionId: string; promise: Promise<void> } | undefined;
   let liveTurnActivityActive = false;
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
@@ -4936,8 +4939,12 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [stickToBottom, setStickToBottom] = createSignal(true);
   const [uploads, setUploads] = createSignal<UploadAsset[]>([]);
   const [previewPath, setPreviewPath] = createSignal<string>();
+  const [agent, setAgent] = createSignal('');
+  const [agentExplicit, setAgentExplicit] = createSignal(false);
   const [model, setModel] = createSignal('');
+  const [modelExplicit, setModelExplicit] = createSignal(false);
   const [thinkingLevel, setThinkingLevel] = createSignal<ThinkingLevel | ''>('');
+  const [thinkingExplicit, setThinkingExplicit] = createSignal(false);
   const [fileMention, setFileMention] = createSignal<FileMention>();
   const [fileMentionSearchQuery, setFileMentionSearchQuery] = createSignal<string>();
   const [slashCommandMention, setSlashCommandMention] = createSignal<SlashCommandMention>();
@@ -5022,11 +5029,23 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     queryFn: ({ signal }) => api<{ models: ModelListItem[] }>(`/api/projects/${props.project.id}/agent/models`, { signal }),
     staleTime: 5 * 60_000,
   }));
+  const agents = createQuery(() => ({
+    queryKey: ['agents', props.project.id, autocompleteSessionId()],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams();
+      const sessionId = autocompleteSessionId();
+      if (sessionId) params.set('sessionId', sessionId);
+      return api<AgentListResponse>(`/api/projects/${props.project.id}/agent/agents${params.size ? `?${params}` : ''}`, { signal });
+    },
+    staleTime: 60_000,
+  }));
   const effectiveSettings = createMemo(() => settings.data?.effective);
   const hideThinking = createMemo(() => Boolean(effectiveSettings()?.hideThinkingBlock));
   const optimizeStreamingRender = createMemo(() => Boolean(effectiveSettings()?.optimizeStreamingRender));
   const toolOutputMode = createMemo(() => chatToolOutputMode(effectiveSettings()));
   const syntaxTheme = createMemo(() => shikiSyntaxTheme(props.themeMode, effectiveSettings()));
+  const agentOptions = createMemo(() => composerAgentOptions(agents.data?.agents ?? [], agent()));
+  const showAgentSelect = createMemo(() => Boolean(agents.data?.supported && (agentExplicit() || agent() || agents.data.agents.length > 0)));
   const modelOptions = createMemo(() => composerModelOptions(effectiveSettings(), models.data?.models ?? [], model()));
   const thinkingLevelOptions = createMemo(() => composerThinkingLevelOptions(effectiveSettings(), models.data?.models ?? [], model()));
   const transcriptEntries = createMemo(() => {
@@ -5094,6 +5113,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const composerCanSubmit = createMemo(() => {
     const prompt = text().trim();
     if (!prompt || attachBusy()) return false;
+    if (parseAgentComposerCommand(prompt)) return !busy();
     if (!busy()) return true;
     const commandName = composerSlashCommandName(prompt);
     const extensionCommand = commandName ? slashCommands.data?.commands.find((command) => command.name === commandName)?.source === 'extension' : false;
@@ -5236,8 +5256,18 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setPendingUserMessage((pending) => pending && props.sessionId && pending.sessionId === props.sessionId ? pending : undefined);
     const controlsSessionId = props.sessionId ?? draft.commandSessionId;
     const storedControls = controlsSessionId ? readSessionComposerControls(props.project.id, controlsSessionId) : undefined;
-    setModel(storedControls && 'model' in storedControls ? storedControls.model ?? '' : draft.model ?? '');
-    setThinkingLevel(storedControls && 'thinking' in storedControls ? storedControls.thinking ?? '' : draft.thinking ?? '');
+    const hasStoredAgent = Boolean(storedControls && 'agent' in storedControls);
+    const hasDraftAgent = draft.agentExplicit === true || (draft.agentExplicit === undefined && Boolean(draft.agent));
+    const hasStoredModel = Boolean(storedControls && 'model' in storedControls);
+    const hasDraftModel = draft.modelExplicit === true || (draft.modelExplicit === undefined && !controlsSessionId && Boolean(draft.model));
+    const hasStoredThinking = Boolean(storedControls && 'thinking' in storedControls);
+    const hasDraftThinking = draft.thinkingExplicit === true || (draft.thinkingExplicit === undefined && !controlsSessionId && Boolean(draft.thinking));
+    setAgent(hasStoredAgent ? storedControls?.agent ?? '' : hasDraftAgent ? draft.agent ?? '' : '');
+    setAgentExplicit(hasStoredAgent || hasDraftAgent);
+    setModel(hasStoredModel ? storedControls?.model ?? '' : hasDraftModel ? draft.model ?? '' : '');
+    setModelExplicit(hasStoredModel || hasDraftModel);
+    setThinkingLevel(hasStoredThinking ? storedControls?.thinking ?? '' : hasDraftThinking ? draft.thinking ?? '' : '');
+    setThinkingExplicit(hasStoredThinking || hasDraftThinking);
     setSessionControlsHydratedKey(undefined);
     setCommandSessionId(props.sessionId ? undefined : draft.commandSessionId);
     runningCommandToken = undefined;
@@ -5277,9 +5307,34 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     const key = `${props.project.id}:${props.sessionId}:${detail.leafId ?? ''}:${detail.branch.length}`;
     if (sessionControlsHydratedKey() === key) return;
     const stored = readSessionComposerControls(props.project.id, props.sessionId);
-    setModel(stored && 'model' in stored ? stored.model ?? '' : sessionModelReference(detail) ?? '');
-    setThinkingLevel(stored && 'thinking' in stored ? stored.thinking ?? '' : sessionThinkingLevel(detail) ?? '');
+    const hasStoredAgent = Boolean(stored && 'agent' in stored);
+    const hasStoredModel = Boolean(stored && 'model' in stored);
+    const hasStoredThinking = Boolean(stored && 'thinking' in stored);
+    setAgent(hasStoredAgent ? stored?.agent ?? '' : '');
+    setAgentExplicit(hasStoredAgent);
+    setModel(hasStoredModel ? stored?.model ?? '' : sessionModelReference(detail) ?? '');
+    setModelExplicit(hasStoredModel);
+    setThinkingLevel(hasStoredThinking ? stored?.thinking ?? '' : sessionThinkingLevel(detail) ?? '');
+    setThinkingExplicit(hasStoredThinking);
     setSessionControlsHydratedKey(key);
+  });
+
+  createEffect(() => {
+    const data = agents.data;
+    if (!data) return;
+    if (!data.supported) {
+      setAgent('');
+      setAgentExplicit(false);
+      return;
+    }
+    if (agentExplicit()) return;
+    const active = data.active;
+    if (typeof active === 'string') {
+      setAgent(active);
+      setAgentExplicit(true);
+      return;
+    }
+    setAgent('');
   });
 
   createEffect(() => {
@@ -5344,8 +5399,12 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       uploads: cloneUploadAssets(untrack(uploads)),
       commandSessionId: untrack(commandSessionId),
       treeSelection: activeComposerDraftTreeSelection,
-      model: untrack(model),
-      thinking: untrack(thinkingLevel),
+      agent: untrack(agentExplicit) ? untrack(agent) : undefined,
+      agentExplicit: untrack(agentExplicit),
+      model: untrack(modelExplicit) ? untrack(model) : undefined,
+      modelExplicit: untrack(modelExplicit),
+      thinking: untrack(thinkingExplicit) ? untrack(thinkingLevel) : undefined,
+      thinkingExplicit: untrack(thinkingExplicit),
     };
     if (clearedComposerDraftKeys.has(key)) {
       clearedComposerDraftKeys.delete(key);
@@ -5978,27 +6037,101 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     return result.commands.find((command) => command.name === commandName)?.source === 'extension';
   }
 
+  function handleAgentChange(value: string) {
+    if (activeComposerDraftKey) clearedComposerDraftKeys.delete(activeComposerDraftKey);
+    setAgent(value);
+    setAgentExplicit(true);
+    saveComposerControls(composerControlsForAgent(value));
+    const sessionId = props.sessionId ?? commandSessionId();
+    if (!sessionId) return;
+    const previous = pendingAgentSelectionApply?.sessionId === sessionId ? pendingAgentSelectionApply.promise : undefined;
+    const promise = (previous ?? Promise.resolve()).then(() => applyAgentSelection(sessionId, value));
+    pendingAgentSelectionApply = { sessionId, promise };
+    void promise.finally(() => {
+      if (pendingAgentSelectionApply?.promise === promise) pendingAgentSelectionApply = undefined;
+    });
+  }
+
   function handleModelChange(value: string) {
     if (activeComposerDraftKey) clearedComposerDraftKeys.delete(activeComposerDraftKey);
     setModel(value);
-    saveComposerControls({ model: value, thinking: thinkingLevel() });
+    setModelExplicit(true);
+    saveComposerControls({ ...currentAgentControl(), model: value, ...(thinkingExplicit() ? { thinking: thinkingLevel() } : {}) });
   }
 
   function handleThinkingLevelChange(value: ThinkingLevel | '') {
     if (activeComposerDraftKey) clearedComposerDraftKeys.delete(activeComposerDraftKey);
     setThinkingLevel(value);
-    saveComposerControls({ model: model(), thinking: value });
+    setThinkingExplicit(true);
+    saveComposerControls({ ...currentAgentControl(), ...(modelExplicit() ? { model: model() } : {}), thinking: value });
   }
 
-  function saveComposerControls(controls: { model: string; thinking: ThinkingLevel | '' }) {
+  function currentAgentControl(): SessionComposerControls {
+    return agentExplicit() && agents.data?.supported ? { agent: agent() } : {};
+  }
+
+  function currentStoredComposerControls() {
+    const sessionId = props.sessionId ?? commandSessionId();
+    return sessionId ? readSessionComposerControls(props.project.id, sessionId) : undefined;
+  }
+
+  function composerControlsForAgent(value: string): SessionComposerControls {
+    const stored = currentStoredComposerControls();
+    return {
+      agent: value,
+      ...(modelExplicit() ? { model: model() } : stored && 'model' in stored ? { model: stored.model ?? '' } : {}),
+      ...(thinkingExplicit() ? { thinking: thinkingLevel() } : stored && 'thinking' in stored ? { thinking: stored.thinking ?? '' } : {}),
+    };
+  }
+
+  function saveComposerControls(controls: SessionComposerControls) {
     const sessionId = props.sessionId ?? commandSessionId();
     if (sessionId) writeSessionComposerControls(props.project.id, sessionId, controls);
+  }
+
+  async function currentAgentList() {
+    if (agents.data) return agents.data;
+    const sessionId = autocompleteSessionId();
+    const params = new URLSearchParams();
+    if (sessionId) params.set('sessionId', sessionId);
+    return queryClient.fetchQuery({
+      queryKey: ['agents', props.project.id, sessionId],
+      queryFn: () => api<AgentListResponse>(`/api/projects/${props.project.id}/agent/agents${params.size ? `?${params}` : ''}`),
+      staleTime: 60_000,
+    });
+  }
+
+  async function applyAgentSelection(sessionId: string, value: string) {
+    try {
+      if (!(await currentAgentList()).supported) return;
+      await api(`/api/projects/${props.project.id}/agent/prompt`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, prompt: agentSelectionPrompt(value), mirrorActiveStream: !props.sessionId, awaitCompletion: true }),
+      });
+    } catch (error) {
+      console.warn('Could not apply agent selection', error);
+    }
   }
 
   function promptThinkingOverride(selectedThinkingLevel: ThinkingLevel | '', sessionId: string, projectId: string, defaultThinkingLevel: ThinkingLevel | undefined): ThinkingLevel | undefined {
     if (selectedThinkingLevel) return selectedThinkingLevel;
     const stored = readSessionComposerControls(projectId, sessionId);
     return stored && 'thinking' in stored ? defaultThinkingLevel ?? 'medium' : undefined;
+  }
+
+  async function handleComposerAgentCommand(argument: string) {
+    const requested = argument.trim();
+    if (!requested) return false;
+    const list = await currentAgentList().catch(() => undefined);
+    if (!list?.supported) return false;
+    const reset = ['default', 'reset', 'none', 'off'].includes(requested.toLowerCase());
+    const nextAgent = reset
+      ? ''
+      : list.agents.find((item) => [item.value, item.id, item.label].some((candidate) => candidate.toLowerCase() === requested.toLowerCase()))?.value;
+    if (nextAgent === undefined) return false;
+    handleAgentChange(nextAgent);
+    return true;
   }
 
   function handleComposerKeyDown(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
@@ -6098,15 +6231,37 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     const uploadAssets = composerUploadAssets(uploads());
     const shellCommand = parseShellComposerCommand(prompt);
     const compactCommand = parseCompactComposerCommand(prompt);
-    const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined;
+    const agentCommand = parseAgentComposerCommand(prompt);
+    const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined && !agentCommand;
     if (!prompt || attachBusy() || (busy() && !steeringSubmit)) return;
     stopVoiceRecognition(true);
+    if (agentCommand && await handleComposerAgentCommand(agentCommand.argument)) {
+      resetComposerHistory();
+      setText('');
+      setFileMention(undefined);
+      setSlashCommandMention(undefined);
+      setCommandArgumentMention(undefined);
+      syncComposerLayout();
+      if (activeComposerDraftKey) saveActiveComposerDraft(activeComposerDraftKey);
+      return;
+    }
+    const activeAgentApply = pendingAgentSelectionApply;
+    const activeSessionId = props.sessionId ?? commandSessionId();
+    if (activeAgentApply && activeSessionId && activeAgentApply.sessionId === activeSessionId) await activeAgentApply.promise;
     const projectId = props.project.id;
     const routeSessionId = props.sessionId;
     const submittedDraftKey = activeComposerDraftKey;
     const submittedTreeSelection = props.treeSelection ?? activeComposerDraftTreeSelection;
+    const submittedAgent = agent();
+    const submittedAgentList = agentExplicit() && !agents.data ? await currentAgentList().catch(() => undefined) : agents.data;
+    const submittedAgentExplicit = Boolean(agentExplicit() && submittedAgentList?.supported);
+    const submittedAgentProfile = submittedAgent ? submittedAgentList?.agents.find((item) => item.value === submittedAgent) : undefined;
+    const shouldUseAgentModel = Boolean(submittedAgentExplicit && submittedAgent && (!submittedAgentProfile || submittedAgentProfile.model));
+    const shouldUseAgentThinking = Boolean(submittedAgentExplicit && submittedAgent && (!submittedAgentProfile || submittedAgentProfile.thinking));
     const submittedModel = model();
+    const submittedModelExplicit = modelExplicit();
     const submittedThinkingLevel = thinkingLevel();
+    const submittedThinkingExplicit = thinkingExplicit();
     const submittedDefaultModel = defaultModelReference(effectiveSettings());
     const submittedDefaultThinkingLevel = effectiveSettings()?.defaultThinkingLevel;
     let submittedCommandSessionId = commandSessionId();
@@ -6124,7 +6279,13 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     }
     const submittedSessionId = sessionId;
     if (mirrorActiveStream) submittedCommandSessionId = submittedSessionId;
-    if (submittedModel || submittedThinkingLevel) writeSessionComposerControls(projectId, submittedSessionId, { model: submittedModel, thinking: submittedThinkingLevel });
+    const storedSubmittedControls = readSessionComposerControls(projectId, submittedSessionId);
+    const submittedControls: SessionComposerControls = {
+      ...(submittedAgentExplicit ? { agent: submittedAgent } : {}),
+      ...(submittedModelExplicit ? { model: submittedModel } : storedSubmittedControls && 'model' in storedSubmittedControls ? { model: storedSubmittedControls.model ?? '' } : {}),
+      ...(submittedThinkingExplicit ? { thinking: submittedThinkingLevel } : storedSubmittedControls && 'thinking' in storedSubmittedControls ? { thinking: storedSubmittedControls.thinking ?? '' } : {}),
+    };
+    if (Object.keys(submittedControls).length) writeSessionComposerControls(projectId, submittedSessionId, submittedControls);
     const extensionCommand = !shellCommand && compactCommand === undefined
       ? await isExtensionComposerCommand(projectId, submittedSessionId, prompt).catch(() => false)
       : false;
@@ -6185,8 +6346,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           prompt,
           attachments,
           mirrorActiveStream,
-          model: submittedModel || submittedDefaultModel,
-          thinking: promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel),
+          agent: submittedAgentExplicit && !steeringSubmit && !extensionCommand ? submittedAgent : undefined,
+          model: submittedModelExplicit ? submittedModel || submittedDefaultModel : shouldUseAgentModel ? undefined : submittedModel || submittedDefaultModel,
+          thinking: submittedThinkingExplicit || !shouldUseAgentThinking ? promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel) : undefined,
           streamingBehavior: steeringSubmit && !extensionCommand ? 'steer' : undefined,
         }),
       });
@@ -6203,7 +6365,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
         setUploads(uploadAssets);
         syncComposerLayout();
       } else if (submittedDraftKey && !composerDrafts.has(submittedDraftKey)) {
-        saveComposerDraft(submittedDraftKey, { text: prompt, uploads: uploadAssets, commandSessionId: submittedCommandSessionId, treeSelection: submittedTreeSelection, model: submittedModel, thinking: submittedThinkingLevel });
+        saveComposerDraft(submittedDraftKey, { text: prompt, uploads: uploadAssets, commandSessionId: submittedCommandSessionId, treeSelection: submittedTreeSelection, agent: submittedAgentExplicit ? submittedAgent : undefined, agentExplicit: submittedAgentExplicit, model: submittedModelExplicit ? submittedModel : undefined, modelExplicit: submittedModelExplicit, thinking: submittedThinkingExplicit ? submittedThinkingLevel : undefined, thinkingExplicit: submittedThinkingExplicit });
       }
       console.error('Could not send chat message', error);
     }
@@ -6381,36 +6543,45 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
             />
           </div>
           <AgentStatusBar status={agentStatus.data?.status} loading={agentStatus.isLoading || agentStatus.isFetching} error={agentStatus.error} mobileOpen={mobileStatusOpen()} />
-          <div class="composer-toolbar flex h-12 min-w-0 flex-nowrap items-center gap-1.5 border-t border-border px-3 text-sm max-xl:h-auto max-xl:py-2 max-md:gap-y-2">
-            <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files" aria-disabled={attachBusy()}><Plus class="size-4" /><input class="hidden" type="file" multiple disabled={attachBusy()} accept="image/*,video/*,.txt,.md,.pdf,.json,.jsonc,application/json" onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files); }} /></label>
-            <button class={`ghost h-8 w-8 px-0 md:hidden ${mobileStatusOpen() ? 'bg-muted text-foreground' : ''}`} type="button" title={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-label={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-expanded={mobileStatusOpen()} onClick={() => setMobileStatusOpen((open) => !open)}><Activity class="size-4" /></button>
-            <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} options={modelOptions()} ariaLabel="Model" />
-            <UiSelect
-              compact
-              class="composer-thinking-select"
-              contentWidth="content"
-              triggerWidth="content"
-              value={thinkingLevel()}
-              onChange={(value) => handleThinkingLevelChange(value as ThinkingLevel | '')}
-              options={thinkingLevelOptions()}
-              ariaLabel="Thinking level"
-            />
-            <div class="composer-toolbar-spacer flex-1" />
-            <button
-              class={`ghost h-8 w-8 px-0 ${voiceListening() ? 'composer-voice-button-active' : ''}`}
-              type="button"
-              title={voiceButtonTitle()}
-              aria-label={voiceButtonLabel()}
-              aria-pressed={voiceListening()}
-              disabled={!voiceSupported()}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={toggleVoiceRecognition}
-            >
-              <Show when={voiceListening()} fallback={<Mic class="size-4" />}><MicOff class="size-4" /></Show>
-            </button>
-            <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={busy() && composerCanSubmit() ? 'Send steering message' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><ArrowUp class="size-4" /></button>}>
-              <button class="button-danger h-8 w-8 px-0" type="button" title="Interrupt agent (Esc, or double Esc anywhere)" onClick={() => void interruptAgent()} disabled={aborting()}><Square class="size-3.5 fill-current" /></button>
-            </Show>
+          <div class="composer-toolbar">
+            <div class="composer-toolbar-leading">
+              <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files" aria-disabled={attachBusy()}><Plus class="size-4" /><input class="hidden" type="file" multiple disabled={attachBusy()} accept="image/*,video/*,.txt,.md,.pdf,.json,.jsonc,application/json" onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files); }} /></label>
+              <button class={`ghost h-8 w-8 px-0 md:hidden ${mobileStatusOpen() ? 'bg-muted text-foreground' : ''}`} type="button" title={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-label={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-expanded={mobileStatusOpen()} onClick={() => setMobileStatusOpen((open) => !open)}><Activity class="size-4" /></button>
+            </div>
+            <div class="composer-toolbar-controls">
+              <Show when={showAgentSelect()}>
+                <UiSelect searchable compact class="composer-agent-select" contentWidth="content" triggerWidth="content" value={agent()} onChange={handleAgentChange} options={agentOptions()} ariaLabel="Agent" />
+              </Show>
+              <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} options={modelOptions()} ariaLabel="Model" />
+              <UiSelect
+                compact
+                class="composer-thinking-select"
+                contentWidth="content"
+                triggerWidth="content"
+                value={thinkingLevel()}
+                onChange={(value) => handleThinkingLevelChange(value as ThinkingLevel | '')}
+                options={thinkingLevelOptions()}
+                ariaLabel="Thinking level"
+              />
+            </div>
+            <div class="composer-toolbar-spacer" />
+            <div class="composer-toolbar-actions">
+              <button
+                class={`ghost h-8 w-8 px-0 ${voiceListening() ? 'composer-voice-button-active' : ''}`}
+                type="button"
+                title={voiceButtonTitle()}
+                aria-label={voiceButtonLabel()}
+                aria-pressed={voiceListening()}
+                disabled={!voiceSupported()}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={toggleVoiceRecognition}
+              >
+                <Show when={voiceListening()} fallback={<Mic class="size-4" />}><MicOff class="size-4" /></Show>
+              </button>
+              <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={busy() && composerCanSubmit() ? 'Send steering message' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><ArrowUp class="size-4" /></button>}>
+                <button class="button-danger h-8 w-8 px-0" type="button" title="Interrupt agent (Esc, or double Esc anywhere)" onClick={() => void interruptAgent()} disabled={aborting()}><Square class="size-3.5 fill-current" /></button>
+              </Show>
+            </div>
           </div>
         </div>
       </form>
@@ -10788,6 +10959,15 @@ function parseCompactComposerCommand(prompt: string) {
   return match ? match[1]?.trim() || '' : undefined;
 }
 
+function parseAgentComposerCommand(prompt: string): { argument: string } | undefined {
+  const match = prompt.match(/^\/agent(?:\s+([\s\S]*))?$/);
+  return match ? { argument: match[1]?.trim() ?? '' } : undefined;
+}
+
+function agentSelectionPrompt(value: string) {
+  return `/agent ${value.trim() || 'none'}`;
+}
+
 function textareaActivePosition(target: HTMLTextAreaElement) {
   return target.selectionDirection === 'backward' ? target.selectionStart : target.selectionEnd;
 }
@@ -10839,6 +11019,20 @@ function sessionThinkingLevel(detail: SessionDetail): ThinkingLevel | undefined 
     if (entry.type === 'thinking_level_change' && typeof entry.thinkingLevel === 'string' && isThinkingLevel(entry.thinkingLevel)) return entry.thinkingLevel;
   }
   return undefined;
+}
+
+function composerAgentOptions(agents: AgentListItem[] = [], selectedAgent?: string): SelectOption[] {
+  const labels = new Map(agents.map((agent) => [agent.value, `${agent.id} · ${agent.source}`]));
+  const descriptions = new Map(agents.map((agent) => [agent.value, agent.description]));
+  const references = uniqueStrings([...agents.map((item) => item.value), selectedAgent]);
+  return [
+    { value: '', label: 'No agent', searchText: 'none no agent reset clear' },
+    ...references.map((reference) => ({
+      value: reference,
+      label: labels.get(reference) ?? `Extra: ${reference}`,
+      searchText: [reference, labels.get(reference), descriptions.get(reference)].filter(Boolean).join(' '),
+    })),
+  ];
 }
 
 function composerModelOptions(settings?: PiSettings, models: ModelListItem[] = [], selectedReference?: string): SelectOption[] {
@@ -11027,16 +11221,16 @@ function composerDraftKey(projectId: string, sessionId?: string) {
 
 function readComposerDraft(key: string): ComposerDraft {
   const draft = composerDrafts.get(key);
-  return draft ? { text: draft.text, uploads: composerUploadAssets(draft.uploads), commandSessionId: draft.commandSessionId, treeSelection: draft.treeSelection, model: draft.model, thinking: draft.thinking } : { text: '', uploads: [] };
+  return draft ? { text: draft.text, uploads: composerUploadAssets(draft.uploads), commandSessionId: draft.commandSessionId, treeSelection: draft.treeSelection, agent: draft.agent, agentExplicit: draft.agentExplicit, model: draft.model, modelExplicit: draft.modelExplicit, thinking: draft.thinking, thinkingExplicit: draft.thinkingExplicit } : { text: '', uploads: [] };
 }
 
 function saveComposerDraft(key: string, draft: ComposerDraft) {
   const uploads = composerUploadAssets(draft.uploads);
-  if (!draft.text && !uploads.length && !draft.treeSelection && !draft.model && !draft.thinking) {
+  if (!draft.text && !uploads.length && !draft.treeSelection && !draft.agentExplicit && !draft.agent && !draft.modelExplicit && !draft.model && !draft.thinkingExplicit && !draft.thinking) {
     composerDrafts.delete(key);
     return;
   }
-  composerDrafts.set(key, { text: draft.text, uploads, commandSessionId: draft.commandSessionId, treeSelection: draft.treeSelection, model: draft.model, thinking: draft.thinking });
+  composerDrafts.set(key, { text: draft.text, uploads, commandSessionId: draft.commandSessionId, treeSelection: draft.treeSelection, agent: draft.agent, agentExplicit: draft.agentExplicit, model: draft.model, modelExplicit: draft.modelExplicit, thinking: draft.thinking, thinkingExplicit: draft.thinkingExplicit });
 }
 
 function uploadAssetLabel(asset: UploadAsset) {
@@ -11272,9 +11466,10 @@ async function restoreOpenProjects(projectPaths: string[], currentPaths: string[
 function readSessionComposerControls(projectId: string, sessionId: string): SessionComposerControls | undefined {
   const controls = readSessionComposerControlsMap()[sessionComposerControlsKey(projectId, sessionId)];
   if (!controls || typeof controls !== 'object' || Array.isArray(controls)) return undefined;
+  const agent = typeof controls.agent === 'string' ? controls.agent : undefined;
   const model = typeof controls.model === 'string' ? controls.model : undefined;
   const thinking = typeof controls.thinking === 'string' && (controls.thinking === '' || isThinkingLevel(controls.thinking)) ? controls.thinking : undefined;
-  return { ...('model' in controls ? { model: model ?? '' } : {}), ...('thinking' in controls ? { thinking: thinking ?? '' } : {}) };
+  return { ...('agent' in controls ? { agent: agent ?? '' } : {}), ...('model' in controls ? { model: model ?? '' } : {}), ...('thinking' in controls ? { thinking: thinking ?? '' } : {}) };
 }
 
 function writeSessionComposerControls(projectId: string, sessionId: string, controls: SessionComposerControls) {
