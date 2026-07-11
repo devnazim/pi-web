@@ -24,7 +24,7 @@
     "build:web": "vite build",
     "build:server": "tsc -p tsconfig.server.json",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.server.json",
-    "test": "node --import tsx --test \"web/src/**/*.test.ts\"",
+    "test": "node --import tsx --test \"web/src/**/*.test.ts\" \"tests/server/**/*.test.ts\"",
     "start": "node dist/server/cli.js"
   },
   "keywords": [
@@ -36,7 +36,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@earendil-works/pi-coding-agent": "^0.80.6",
     "@fastify/cookie": "^11.0.0",
     "@fastify/multipart": "^10.0.0",
     "@fastify/static": "^9.1.3",

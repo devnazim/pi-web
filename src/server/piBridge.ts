@@ -1,4 +1,4 @@
-import { AuthStorage, getAgentDir, ModelRegistry, parseFrontmatter, resizeImage } from '@earendil-works/pi-coding-agent';
+import { getAgentDir, parseFrontmatter, resizeImage } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, type Dirent, type Stats } from 'node:fs';
@@ -20,7 +20,7 @@ type WebSocket = {
 };
 
 type TreeSummaryOptions = { mode?: 'none' | 'summary' | 'custom'; instructions?: string; replace?: boolean };
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 type StreamingBehavior = 'steer' | 'followUp';
 type ImageContent = { type: 'image'; mimeType: string; data: string };
 
@@ -516,10 +516,13 @@ export class PiBridge {
     }
   }
 
-  models(_projectPath: string): ModelInfo[] {
-    const registry = ModelRegistry.create(AuthStorage.create());
-    return registry.getAvailable()
-      .map((model) => ({
+  async models(projectPath: string, sessionId?: string): Promise<ModelInfo[]> {
+    const session = await this.getCommandSession(projectPath, sessionId);
+    const registry = session?.modelRegistry;
+    if (!registry || typeof registry.getAvailable !== 'function') throw new Error('Loaded pi SDK session does not expose a model registry');
+    if (typeof registry.refresh === 'function') registry.refresh();
+    return (await registry.getAvailable() as any[])
+      .map((model): ModelInfo => ({
         value: `${model.provider}/${model.id}`,
         label: [model.name || model.id, registry.getProviderDisplayName(model.provider)].filter(Boolean).join(' · '),
         provider: model.provider,
@@ -1343,7 +1346,7 @@ export class PiBridge {
   private stripThinkingSuffix(reference: string) {
     const colonIndex = reference.lastIndexOf(':');
     if (colonIndex === -1) return reference;
-    return ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(reference.slice(colonIndex + 1)) ? reference.slice(0, colonIndex) : reference;
+    return isThinkingLevel(reference.slice(colonIndex + 1)) ? reference.slice(0, colonIndex) : reference;
   }
 
   private normalizedSessionName(name: string | undefined) {
@@ -1623,10 +1626,10 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
     });
   });
 
-  app.get<{ Params: { projectId: string } }>('/api/projects/:projectId/agent/models', async (request, reply) => {
+  app.get<{ Params: { projectId: string }; Querystring: { sessionId?: string } }>('/api/projects/:projectId/agent/models', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
-      return { models: bridge.models(project.path) };
+      return { models: await bridge.models(project.path, request.query.sessionId) };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not load models' });
     }
@@ -1987,7 +1990,7 @@ function isWorkspaceNotificationEvent(event: AgentEvent) {
     || /approval|permission|confirm|input|select|notify|review/i.test(type);
 }
 
-const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 function isThinkingLevel(value: string): value is ThinkingLevel {
   return (THINKING_LEVELS as string[]).includes(value);
@@ -1998,7 +2001,7 @@ function supportedThinkingLevels(model: any): ThinkingLevel[] {
   return THINKING_LEVELS.filter((level) => {
     const mapped = model.thinkingLevelMap?.[level];
     if (mapped === null) return false;
-    if (level === 'xhigh') return mapped !== undefined;
+    if (level === 'xhigh' || level === 'max') return mapped !== undefined;
     return true;
   });
 }

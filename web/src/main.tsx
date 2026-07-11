@@ -185,7 +185,7 @@ type MonacoApi = typeof import('monaco-editor');
 type CatppuccinPalette = { base: string; mantle: string; surface0: string; overlay0: string; text: string; subtext0: string; blue: string; lavender: string; sapphire: string; teal: string; green: string; yellow: string; peach: string; red: string; mauve: string; pink: string };
 type FlatTreeNode = { node: TreeViewNode; indent: number; showConnector: boolean; isLast: boolean; gutters: Array<{ position: number; show: boolean }>; isVirtualRootChild: boolean };
 type TreeFilterMode = 'default' | 'no-tools' | 'user-only' | 'labeled-only' | 'all';
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 type ChatToolOutputMode = 'compact' | 'expanded' | 'hidden';
 type ResolvedThemeMode = 'light' | 'dark';
 type ThemeMode = 'system' | ResolvedThemeMode;
@@ -266,7 +266,7 @@ type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
 type WorkspaceNotificationServerEvent = { type?: string; projectId?: string; sessionId?: string; message?: string; data?: unknown };
 type FaviconStatus = 'idle' | 'unread' | 'running' | 'error';
 
-const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const THINKING_LEVEL_VALUE_OPTIONS: SelectOption[] = [
   { value: 'off', label: 'Off' },
   { value: 'minimal', label: 'Minimal' },
@@ -274,6 +274,7 @@ const THINKING_LEVEL_VALUE_OPTIONS: SelectOption[] = [
   { value: 'medium', label: 'Medium' },
   { value: 'high', label: 'High' },
   { value: 'xhigh', label: 'Xhigh' },
+  { value: 'max', label: 'Max' },
 ];
 const COMPOSER_MIN_LINES = 2;
 const COMPOSER_MAX_LINES = 7;
@@ -3005,7 +3006,7 @@ function SettingsModal(props: {
                     <button type="button" class={`settings-tab ${scope() === 'project' ? 'settings-tab-active' : ''}`} onClick={() => setScope('project')}>Project override</button>
                   </div>
                   <SettingsSection title="AI and Model">
-                    <div class="settings-field"><span>Default model</span><UiSelect class="w-full" value={settingsModelValue()} onChange={updateDefaultModel} options={settingsModelOptions()} ariaLabel="Default model" disabled={models.isLoading && !models.data} /></div>
+                    <div class="settings-field"><span>Default model</span><UiSelect class="w-full" value={settingsModelValue()} onChange={updateDefaultModel} onOpen={async () => !(await models.refetch()).isError} options={settingsModelOptions()} ariaLabel="Default model" disabled={models.isLoading && !models.data} /></div>
                     <div class="settings-field"><span>Thinking level</span><UiSelect class="w-full" value={form().defaultThinkingLevel ?? ''} onChange={(value) => update('defaultThinkingLevel', (value || undefined) as ThinkingLevel | undefined)} options={settingsThinkingOptions()} ariaLabel="Thinking level" /></div>
                   </SettingsSection>
 
@@ -3983,14 +3984,17 @@ function NotificationVolumeControl(props: { value: number; onChange: (volume: nu
   );
 }
 
-function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean; searchable?: boolean }) {
+function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; onOpen?: () => Promise<boolean> | void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean; searchable?: boolean }) {
   const [open, setOpen] = createSignal(false);
+  const [refreshing, setRefreshing] = createSignal(false);
+  const [refreshFailed, setRefreshFailed] = createSignal(false);
   const [search, setSearch] = createSignal('');
   const [activeIndex, setActiveIndex] = createSignal(0);
   const [position, setPosition] = createSignal({ left: 0, top: 0, width: 0, maxHeight: 260, placement: 'bottom' as 'top' | 'bottom' });
   let triggerRef: HTMLButtonElement | undefined;
   let contentRef: HTMLDivElement | undefined;
   let searchRef: HTMLInputElement | undefined;
+  let refreshSequence = 0;
 
   const selected = createMemo(() => props.options.find((option) => option.value === props.value));
   const filteredOptions = createMemo(() => {
@@ -4058,6 +4062,19 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
   }
 
   function openMenu() {
+    const refresh = props.onOpen?.();
+    if (refresh) {
+      const sequence = ++refreshSequence;
+      setRefreshing(true);
+      setRefreshFailed(false);
+      void refresh.then((success) => {
+        if (sequence === refreshSequence) setRefreshFailed(!success);
+      }, () => {
+        if (sequence === refreshSequence) setRefreshFailed(true);
+      }).finally(() => {
+        if (sequence === refreshSequence) setRefreshing(false);
+      });
+    }
     setSearch('');
     setActiveIndex(selectedIndex());
     setOpen(true);
@@ -4072,7 +4089,7 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
   }
 
   function chooseOption(option: SelectOption) {
-    if (option.disabled) return;
+    if (refreshing() || refreshFailed() || option.disabled) return;
     props.onChange(option.value);
     closeMenu(true);
   }
@@ -4227,25 +4244,29 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
                 </Show>
               </div>
             </Show>
-            <div role="listbox">
-              <Show when={filteredOptions().length > 0} fallback={<div class="select-empty">No matching options</div>}>
-                <For each={filteredOptions()}>
-                  {(option, index) => (
-                    <button
-                      type="button"
-                      role="option"
-                      aria-selected={option.value === props.value}
-                      disabled={option.disabled}
-                      class={`select-item ${activeIndex() === index() ? 'select-item-active' : ''} ${option.value === props.value ? 'select-item-selected' : ''}`}
-                      onMouseEnter={() => !option.disabled && setActiveIndex(index())}
-                      onMouseDown={(event) => event.preventDefault()}
-                      onClick={() => chooseOption(option)}
-                    >
-                      <span class="min-w-0 flex-1 truncate">{option.label}</span>
-                      <Show when={option.value === props.value}><Check class="size-4" /></Show>
-                    </button>
-                  )}
-                </For>
+            <div role="listbox" aria-busy={refreshing()}>
+              <Show when={!refreshing()} fallback={<div class="select-empty">Refreshing options…</div>}>
+                <Show when={!refreshFailed()} fallback={<div class="select-empty">Could not refresh options</div>}>
+                  <Show when={filteredOptions().length > 0} fallback={<div class="select-empty">No matching options</div>}>
+                    <For each={filteredOptions()}>
+                      {(option, index) => (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={option.value === props.value}
+                          disabled={option.disabled}
+                          class={`select-item ${activeIndex() === index() ? 'select-item-active' : ''} ${option.value === props.value ? 'select-item-selected' : ''}`}
+                          onMouseEnter={() => !option.disabled && setActiveIndex(index())}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => chooseOption(option)}
+                        >
+                          <span class="min-w-0 flex-1 truncate">{option.label}</span>
+                          <Show when={option.value === props.value}><Check class="size-4" /></Show>
+                        </button>
+                      )}
+                    </For>
+                  </Show>
+                </Show>
               </Show>
             </div>
           </div>
@@ -5027,8 +5048,13 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     staleTime: SETTINGS_CACHE_STALE_TIME_MS,
   }));
   const models = createQuery(() => ({
-    queryKey: ['models', props.project.id],
-    queryFn: ({ signal }) => api<{ models: ModelListItem[] }>(`/api/projects/${props.project.id}/agent/models`, { signal }),
+    queryKey: ['models', props.project.id, autocompleteSessionId()],
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams();
+      const sessionId = autocompleteSessionId();
+      if (sessionId) params.set('sessionId', sessionId);
+      return api<{ models: ModelListItem[] }>(`/api/projects/${props.project.id}/agent/models${params.size ? `?${params}` : ''}`, { signal });
+    },
     staleTime: 5 * 60_000,
   }));
   const agents = createQuery(() => ({
@@ -6554,7 +6580,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
               <Show when={showAgentSelect()}>
                 <UiSelect searchable compact class="composer-agent-select" contentWidth="content" triggerWidth="content" value={agent()} onChange={handleAgentChange} options={agentOptions()} ariaLabel="Agent" />
               </Show>
-              <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} options={modelOptions()} ariaLabel="Model" />
+              <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} onOpen={async () => !(await models.refetch()).isError} options={modelOptions()} ariaLabel="Model" />
               <UiSelect
                 compact
                 class="composer-thinking-select"
@@ -11159,7 +11185,8 @@ function thinkingLevelLabel(level: ThinkingLevel) {
   if (level === 'low') return 'Low';
   if (level === 'medium') return 'Medium';
   if (level === 'high') return 'High';
-  return 'Xhigh';
+  if (level === 'xhigh') return 'Xhigh';
+  return 'Max';
 }
 
 function parseModelReference(reference: string) {
@@ -11192,7 +11219,7 @@ function modelReferenceLabel(reference?: string) {
 }
 
 function isThinkingLevel(value: string): value is ThinkingLevel {
-  return ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value);
+  return (THINKING_LEVELS as string[]).includes(value);
 }
 
 function chatToolOutputMode(settings?: PiSettings): ChatToolOutputMode {
