@@ -2,6 +2,17 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { PiBridge } from '../../src/server/piBridge.js';
 
+test('binds browser extension UI in RPC mode', async () => {
+  const bridge = new PiBridge();
+  let bindings: Record<string, unknown> | undefined;
+
+  await (bridge as any).bindWebExtensions({
+    bindExtensions: async (next: Record<string, unknown>) => { bindings = next; },
+  }, '/workspace', 'session-1', 'project-1:session-1');
+
+  assert.equal(bindings?.mode, 'rpc');
+});
+
 test('lists refreshed models from the session registry', async () => {
   let refreshes = 0;
   const calls: Array<[string, string | undefined]> = [];

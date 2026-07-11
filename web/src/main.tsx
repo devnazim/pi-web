@@ -86,6 +86,18 @@ import {
   type UploadAsset,
 } from './composerHistory';
 import { appUrl, appWebSocketUrl } from './appUrl';
+import {
+  appendLiveActivityDelta,
+  appendLivePreviewText,
+  emptyAgentActivity,
+  reduceAgentActivityEvent,
+  shouldUseOptimizedStreamingRender,
+  type AgentActivity,
+  type AgentActivityDelta,
+  type AgentActivityItem,
+  type AgentServerEvent,
+  type AgentToolActivity,
+} from './liveActivity';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -218,20 +230,10 @@ type PiSettings = {
 type PiSettingsResponse = { global: PiSettings; project: PiSettings; effective: PiSettings };
 type ChatContentPart = { type: 'text' | 'thinking' | 'tool' | 'image' | 'error'; text: string };
 type ToolCallInfo = { id?: string; name: string; args: Record<string, unknown> };
-type AgentToolActivity = { id: string; name: string; status: 'running' | 'done' | 'error'; summary?: string };
-type AgentActivityTextKind = 'text' | 'thinking';
-type AgentActivityTextItem = { type: 'text'; text: string };
-type AgentActivityThinkingItem = { type: 'thinking'; text: string };
-type AgentActivityContentItem = AgentActivityTextItem | AgentActivityThinkingItem;
-type AgentActivityToolItem = { type: 'tool'; tool: AgentToolActivity };
-type AgentActivityItem = AgentActivityContentItem | AgentActivityToolItem;
-type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
-type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; items: AgentActivityItem[]; notices: string[]; retry?: AgentRetryActivity };
 type LiveTranscriptSnapshot = { userMessageCount: number; assistantAfterLastUserId?: string; assistantAfterLastUserText?: string };
 type AssistantEntryPreview = { text: string; thinking: string; error: string };
 type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: number; latestAssistantId?: string };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
-type AgentServerEvent = { type?: string; message?: string; data?: unknown };
 type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; heartbeat?: boolean };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
 type SessionComposerControls = { agent?: string; model?: string; thinking?: ThinkingLevel | '' };
@@ -289,7 +291,6 @@ const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
 const AGENT_SOCKET_EVENT_BATCH_BUDGET_MS = 8;
 const AGENT_SOCKET_EVENT_BATCH_MAX = 100;
 const LIVE_ACTIVITY_PUBLISH_INTERVAL_MS = 80;
-const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 8_000;
 const LIVE_SHELL_OUTPUT_MAX_LENGTH = 8_000;
 const CHAT_CODE_HIGHLIGHT_MAX_LENGTH = 200_000;
 const CHAT_TOOL_OUTPUT_OPTIONS: SelectOption[] = [
@@ -834,7 +835,7 @@ function Shell() {
   let pendingStoredEventsFrame: number | undefined;
   let liveAgentActivityValue = emptyAgentActivity();
   let liveShellActivityValue = emptyBashActivity();
-  let pendingLiveActivitySegments: AgentActivityContentItem[] = [];
+  let pendingLiveActivitySegments: AgentActivityDelta[] = [];
   let liveActivityDirty = false;
   let liveActivityPublishTimer: number | undefined;
   let liveActivityPublishFrame: number | undefined;
@@ -876,16 +877,16 @@ function Shell() {
   function flushPendingLiveActivityDeltas() {
     if (!pendingLiveActivitySegments.length) return;
     let activity = liveAgentActivityValue;
-    for (const segment of pendingLiveActivitySegments) activity = appendLiveActivityTextSegment(activity, segment.type, segment.text);
+    for (const segment of pendingLiveActivitySegments) activity = appendLiveActivityDelta(activity, segment);
     liveAgentActivityValue = activity;
     pendingLiveActivitySegments = [];
     liveActivityDirty = true;
   }
 
-  function queueLiveActivityDelta(delta: AgentActivityContentItem) {
+  function queueLiveActivityDelta(delta: AgentActivityDelta) {
     if (!delta.text) return;
     const previous = pendingLiveActivitySegments[pendingLiveActivitySegments.length - 1];
-    if (previous?.type === delta.type) previous.text += delta.text;
+    if (previous?.type === delta.type && previous.contentIndex === delta.contentIndex) previous.text += delta.text;
     else pendingLiveActivitySegments.push({ ...delta });
     if (!liveAgentActivityValue.running || !liveAgentActivityValue.streaming) liveAgentActivityValue = { ...liveAgentActivityValue, running: true, streaming: true };
     liveActivityDirty = true;
@@ -9549,7 +9550,7 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
     <Show when={props.activity.running || error() || props.activity.notices.length || contentVisible()}>
       <div class="live-agent">
         <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
-        <For each={orderedItems()}>{(item) => <LiveAgentActivityItem item={item} hideThinking={props.hideThinking} optimizeStreamingRender={props.optimizeStreamingRender} toolOutputMode={props.toolOutputMode} syntaxTheme={props.syntaxTheme} running={props.activity.streaming} />}</For>
+        <For each={orderedItems()}>{(item) => <LiveAgentActivityItem item={item} hideThinking={props.hideThinking} optimizeStreamingRender={shouldUseOptimizedStreamingRender(props.activity, props.optimizeStreamingRender)} toolOutputMode={props.toolOutputMode} syntaxTheme={props.syntaxTheme} />}</For>
         <Show when={props.activity.notices.length}>
           <div class="live-agent-tools">
             <For each={props.activity.notices}>{(notice) => <div class="chat-meta"><span>agent</span><span>{notice}</span></div>}</For>
@@ -9560,17 +9561,17 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
   );
 }
 
-function LiveAgentActivityItem(props: { item: AgentActivityItem; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme; running: boolean }) {
+function LiveAgentActivityItem(props: { item: AgentActivityItem; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
   const item = props.item;
-  if (item.type === 'text') return <Show when={item.text.trim()}><LiveAgentText text={item.text} running={props.running} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>;
+  if (item.type === 'text') return <Show when={item.text.trim()}><LiveAgentText text={item.text} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>;
   if (item.type === 'thinking') return <Show when={!props.hideThinking && item.text.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{item.text}</div></Collapsible></Show>;
   return <Show when={props.toolOutputMode !== 'hidden'}><LiveToolLine tool={item.tool} /></Show>;
 }
 
-function LiveAgentText(props: { text: string; running: boolean; optimizeStreamingRender: boolean; syntaxTheme: ShikiSyntaxTheme }) {
+function LiveAgentText(props: { text: string; optimizeStreamingRender: boolean; syntaxTheme: ShikiSyntaxTheme }) {
   return (
     <div class="assistant-message assistant-message-live">
-      <Show when={props.running && props.optimizeStreamingRender} fallback={<MarkdownContent text={props.text} syntaxTheme={props.syntaxTheme} />}>
+      <Show when={props.optimizeStreamingRender} fallback={<MarkdownContent text={props.text} syntaxTheme={props.syntaxTheme} />}>
         <div class="whitespace-pre-wrap break-words">{props.text}</div>
       </Show>
     </div>
@@ -9624,7 +9625,7 @@ function shouldShowAgentEvent(payload: string) {
 function shouldHandleAgentEvent(event: AgentServerEvent) {
   if (event.type !== 'agent:event') return ['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'bash:start', 'bash:update', 'bash:finish', 'bash:error', 'error'].includes(event.type ?? '');
   const dataType = agentEventDataType(event.data);
-  return ['agent_start', 'agent_end', 'message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
+  return ['agent_start', 'agent_end', 'message_start', 'message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
 }
 
 function shouldStoreAgentEvent(event: AgentServerEvent) {
@@ -9706,52 +9707,12 @@ function emptyBashActivity(): BashActivity {
   return { running: false, output: '' };
 }
 
-function emptyAgentActivity(): AgentActivity {
-  return { running: false, streaming: false, text: '', thinking: '', tools: [], items: [], notices: [] };
-}
-
 function parseAgentServerEvent(raw: string): AgentServerEvent | undefined {
   try {
     return JSON.parse(raw) as AgentServerEvent;
   } catch {
     return undefined;
   }
-}
-
-function appendLivePreviewText(current: string, delta: string, maxLength: number) {
-  const next = `${current}${delta}`;
-  if (next.length <= maxLength) return next;
-  return `…\n${next.slice(Math.max(0, next.length - maxLength))}`;
-}
-
-function livePreviewText(value: string, maxLength: number) {
-  if (value.length <= maxLength) return value;
-  return `…\n${value.slice(Math.max(0, value.length - maxLength))}`;
-}
-
-function appendLiveActivityTextSegment(activity: AgentActivity, type: AgentActivityTextKind, text: string): AgentActivity {
-  if (!text) return activity;
-  return {
-    ...activity,
-    text: type === 'text' ? appendLivePreviewText(activity.text, text, LIVE_ACTIVITY_TEXT_MAX_LENGTH) : activity.text,
-    thinking: type === 'thinking' ? appendLivePreviewText(activity.thinking, text, LIVE_ACTIVITY_TEXT_MAX_LENGTH) : activity.thinking,
-    items: appendLiveActivityTextItem(activity.items, type, text),
-  };
-}
-
-function appendLiveActivityTextItem(items: AgentActivityItem[], type: AgentActivityTextKind, text: string): AgentActivityItem[] {
-  const previous = items[items.length - 1];
-  const nextText = previous?.type === type ? appendLivePreviewText(previous.text, text, LIVE_ACTIVITY_TEXT_MAX_LENGTH) : livePreviewText(text, LIVE_ACTIVITY_TEXT_MAX_LENGTH);
-  const nextItem: AgentActivityContentItem = type === 'text' ? { type: 'text', text: nextText } : { type: 'thinking', text: nextText };
-  return previous?.type === type ? [...items.slice(0, -1), nextItem] : [...items, nextItem];
-}
-
-function upsertLiveActivityToolItem(items: AgentActivityItem[], tool: AgentToolActivity): AgentActivityItem[] {
-  const index = items.findIndex((item) => item.type === 'tool' && item.tool.id === tool.id);
-  if (index === -1) return [...items, { type: 'tool', tool }];
-  const next = [...items];
-  next[index] = { type: 'tool', tool };
-  return next;
 }
 
 function shouldPublishLiveActivityImmediately(event: AgentServerEvent) {
@@ -9766,13 +9727,14 @@ function shouldPublishLiveActivityImmediately(event: AgentServerEvent) {
   return messageEvent.type === 'text_end' || messageEvent.type === 'thinking_end';
 }
 
-function agentActivityMessageDelta(event: AgentServerEvent): AgentActivityContentItem | undefined {
+function agentActivityMessageDelta(event: AgentServerEvent): AgentActivityDelta | undefined {
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return undefined;
   const data = event.data as Record<string, unknown>;
   if (data.type !== 'message_update') return undefined;
   const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
-  if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { type: 'text', text: messageEvent.delta };
-  if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { type: 'thinking', text: messageEvent.delta };
+  const contentIndex = typeof messageEvent.contentIndex === 'number' ? messageEvent.contentIndex : undefined;
+  if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { type: 'text', text: messageEvent.delta, contentIndex };
+  if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string' && messageEvent.delta) return { type: 'thinking', text: messageEvent.delta, contentIndex };
   return undefined;
 }
 
@@ -9782,84 +9744,6 @@ function reduceBashActivityEvent(activity: BashActivity, event: AgentServerEvent
   if (event.type === 'bash:finish') return { ...activity, running: false, command: event.message ?? activity.command };
   if (event.type === 'bash:error') return { ...activity, running: false, error: event.message ?? 'Shell command failed' };
   return activity;
-}
-
-function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEvent): AgentActivity {
-  if (event.type === 'agent:start') return { ...emptyAgentActivity(), running: true };
-  if (event.type === 'agent:finish') return { ...activity, running: false, streaming: false, retry: undefined };
-  if (event.type === 'agent:error' || event.type === 'error') {
-    const message = event.message ?? 'Agent failed';
-    if (/already processing/i.test(message) && activity.running) return { ...activity, notices: [...activity.notices, message] };
-    return { ...activity, running: false, streaming: false, retry: undefined, error: message === 'Request was aborted' ? 'Operation aborted' : message };
-  }
-  if (event.type === 'agent:notice') return { ...activity, notices: [...activity.notices, event.message ?? 'notice'] };
-  if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return activity;
-
-  const data = event.data as Record<string, unknown>;
-  const type = typeof data.type === 'string' ? data.type : '';
-  if (type === 'agent_start') return { ...emptyAgentActivity(), running: true, streaming: true };
-  if (type === 'agent_end') {
-    const running = data.willRetry === true;
-    return { ...activity, running, streaming: false, error: running ? undefined : activity.error, retry: running ? activity.retry : undefined };
-  }
-  if (type === 'message_update') {
-    const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
-    let next = activity;
-    if (messageEvent.type === 'text_delta' && typeof messageEvent.delta === 'string') next = appendLiveActivityTextSegment(next, 'text', messageEvent.delta);
-    if (messageEvent.type === 'thinking_delta' && typeof messageEvent.delta === 'string') next = appendLiveActivityTextSegment(next, 'thinking', messageEvent.delta);
-    if (messageEvent.type === 'text_end' && !next.text && typeof messageEvent.content === 'string') next = appendLiveActivityTextSegment(next, 'text', messageEvent.content);
-    if (messageEvent.type === 'thinking_end' && !next.thinking && typeof messageEvent.content === 'string') next = appendLiveActivityTextSegment(next, 'thinking', messageEvent.content);
-    return { ...next, running: true, streaming: true };
-  }
-  if (type === 'tool_execution_start' || type === 'tool_execution_update' || type === 'tool_execution_end') {
-    const tools = new Map(activity.tools.map((tool) => [tool.id, tool]));
-    const id = String(data.toolCallId ?? data.toolName ?? tools.size);
-    const name = String(data.toolName ?? 'tool');
-    const existing = tools.get(id);
-    const tool: AgentToolActivity = {
-      id,
-      name,
-      status: type === 'tool_execution_end' ? (data.isError ? 'error' : 'done') : 'running',
-      summary: toolActivitySummary(data) ?? existing?.summary,
-    };
-    tools.set(id, tool);
-    return { ...activity, running: true, streaming: true, tools: [...tools.values()], items: upsertLiveActivityToolItem(activity.items, tool) };
-  }
-  if (type === 'notice') return { ...activity, notices: [...activity.notices, String(data.message ?? 'notice')] };
-  if (type === 'auto_retry_start') {
-    const attempt = typeof data.attempt === 'number' && Number.isFinite(data.attempt) ? data.attempt : undefined;
-    const maxAttempts = typeof data.maxAttempts === 'number' && Number.isFinite(data.maxAttempts) ? data.maxAttempts : undefined;
-    const delayMs = typeof data.delayMs === 'number' && Number.isFinite(data.delayMs) ? data.delayMs : undefined;
-    const errorMessage = String(data.errorMessage ?? 'provider error');
-    const attemptText = attempt && maxAttempts ? ` (${attempt}/${maxAttempts})` : attempt ? ` (${attempt})` : '';
-    const delayText = delayMs ? ` in ${Math.ceil(delayMs / 1000)}s` : '';
-    return { ...activity, running: true, retry: { attempt, maxAttempts, delayMs, errorMessage }, notices: [...activity.notices, `retrying${attemptText}${delayText} after ${errorMessage}`] };
-  }
-  if (type === 'auto_retry_end') {
-    const failed = data.success !== true;
-    return { ...activity, retry: undefined, notices: [...activity.notices, data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`], running: failed ? false : activity.running, streaming: failed ? false : activity.streaming };
-  }
-  if (type === 'compaction_start') return { ...activity, running: true, notices: [...activity.notices, 'compacting context'] };
-  if (type === 'compaction_end') {
-    const running = data.willRetry === true;
-    return {
-      ...activity,
-      running,
-      streaming: running ? activity.streaming : false,
-      retry: running ? activity.retry : undefined,
-      notices: [...activity.notices, data.aborted ? 'compaction aborted' : 'compaction finished'],
-    };
-  }
-  return activity;
-}
-
-function toolActivitySummary(data: Record<string, unknown>) {
-  const args = data.args && typeof data.args === 'object' ? data.args : undefined;
-  if (args && 'command' in args && typeof (args as { command?: unknown }).command === 'string') return (args as { command: string }).command;
-  if (args && 'path' in args && typeof (args as { path?: unknown }).path === 'string') return (args as { path: string }).path;
-  if (args && 'file_path' in args && typeof (args as { file_path?: unknown }).file_path === 'string') return (args as { file_path: string }).file_path;
-  if (args) return JSON.stringify(args).slice(0, 160);
-  return undefined;
 }
 
 function formatLiveToolAction(tool: AgentToolActivity) {
@@ -9892,11 +9776,7 @@ function displayLiveAgentActivity(activity: AgentActivity, entries: SessionEntry
   if (retired) return emptyAgentActivity();
   if (!liveAgentActivityHasDisplayContent(activity, options)) return activity;
   if (!liveAgentActivityHasPreviewText(activity, options)) return emptyAgentActivity();
-  return transcriptHasCaughtUpToLiveActivity(entries, options, snapshot, activity) ? emptyAgentActivity() : holdCompletedLiveAgentActivity(activity);
-}
-
-function holdCompletedLiveAgentActivity(activity: AgentActivity): AgentActivity {
-  return activity.streaming ? activity : { ...activity, streaming: true };
+  return transcriptHasCaughtUpToLiveActivity(entries, options, snapshot, activity) ? emptyAgentActivity() : activity;
 }
 
 function liveAgentActivityRenderItems(activity: AgentActivity): AgentActivityItem[] {
@@ -9964,18 +9844,18 @@ function liveActivityMatchesAssistantPreview(activity: AgentActivity, preview: A
 function assistantEntryPreview(entry: SessionEntry, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): AssistantEntryPreview {
   const parts = entryContentParts(entry, options);
   return {
-    text: parts.filter((part) => part.type === 'text').map((part) => part.text).join('\n'),
-    thinking: parts.filter((part) => part.type === 'thinking').map((part) => part.text).join('\n'),
-    error: parts.filter((part) => part.type === 'error').map((part) => part.text).join('\n'),
+    text: parts.filter((part) => part.type === 'text').map((part) => part.text).join(''),
+    thinking: parts.filter((part) => part.type === 'thinking').map((part) => part.text).join(''),
+    error: parts.filter((part) => part.type === 'error').map((part) => part.text).join(''),
   };
 }
 
 function joinPreviewSegments(current: string, next: string) {
-  return [current, next].filter(Boolean).join('\n');
+  return `${current}${next}`;
 }
 
 function assistantPreviewText(preview: AssistantEntryPreview) {
-  return [preview.text, preview.thinking, preview.error].filter(Boolean).join('\n');
+  return `${preview.text}${preview.thinking}${preview.error}`;
 }
 
 function textContainsPreview(fullText: string, previewText: string) {

@@ -794,6 +794,7 @@ export class PiBridge {
     this.boundSessions.add(session);
     await session.bindExtensions({
       uiContext: this.webUiContext(session, projectPath, sessionId),
+      mode: 'rpc',
       abortHandler: () => {
         if (typeof session?.clearQueue === 'function') session.clearQueue();
         if (typeof session?.abortBranchSummary === 'function') session.abortBranchSummary();
