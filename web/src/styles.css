@@ -520,7 +520,9 @@ body {
   }
 
   .confirm-modal {
-    @apply w-full min-w-0 max-w-md rounded-4xl p-6;
+    @apply w-full min-w-0 max-w-md overflow-y-auto rounded-4xl p-6;
+    max-height: calc(100vh - 3rem);
+    max-height: calc(100dvh - 3rem);
     overflow-wrap: anywhere;
   }
 
@@ -1264,7 +1266,9 @@ body {
   }
 
   .extension-ui-dock {
-    @apply mx-auto flex w-full max-w-5xl flex-col gap-3 rounded-2xl border border-yellow-500/30 bg-card p-4 text-sm shadow-floating ring-1 ring-yellow-500/10;
+    @apply mx-auto flex w-full max-w-5xl flex-col gap-3 overflow-y-auto rounded-2xl border border-yellow-500/30 bg-card p-4 text-sm shadow-floating ring-1 ring-yellow-500/10;
+    max-height: min(50vh, 32rem);
+    max-height: min(50dvh, 32rem);
   }
 
   .extension-ui-header {
@@ -1320,7 +1324,7 @@ body {
   }
 
   .extension-ui-actions {
-    @apply flex flex-wrap justify-end gap-2;
+    @apply sticky bottom-0 z-10 flex flex-wrap justify-end gap-2 bg-card pt-1;
   }
 
   .composer-form {
