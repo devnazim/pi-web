@@ -51,6 +51,16 @@ export class ProjectRegistry {
     return project;
   }
 
+  getOrAdd(id: string, projectPath?: string, options?: { hidden?: boolean }) {
+    const project = this.projects.get(id);
+    if (project) return project;
+    if (!projectPath) throw new Error(`Unknown project: ${id}`);
+
+    const resolved = assertDirectory(projectPath);
+    if (projectId(resolved) !== id) throw new Error(`Unknown project: ${id}`);
+    return this.add(resolved, options);
+  }
+
   async update(id: string, update: ProjectMetadataUpdate) {
     const project = this.get(id);
     const nextProject = { ...project };

@@ -106,11 +106,11 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
     }
   });
 
-  app.get<{ Params: { projectId: string }; Querystring: { cwd?: string; cols?: string; rows?: string; terminalId?: string } }>('/ws/projects/:projectId/terminal', { websocket: true }, (connection: any, request) => {
+  app.get<{ Params: { projectId: string }; Querystring: { projectPath?: string; cwd?: string; cols?: string; rows?: string; terminalId?: string } }>('/ws/projects/:projectId/terminal', { websocket: true }, (connection: any, request) => {
     const socket: WebSocket = connection.socket ?? connection;
 
     try {
-      const project = registry.get(request.params.projectId);
+      const project = registry.getOrAdd(request.params.projectId, request.query.projectPath, { hidden: true });
       const cwd = resolveWithin(project.path, request.query.cwd ?? '.');
       const shell = resolveShell();
       const terminalId = normalizeTerminalId(request.query.terminalId);

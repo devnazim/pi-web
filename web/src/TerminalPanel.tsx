@@ -356,7 +356,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         resizeTerminal();
         lastSentCols = xterm.cols;
         lastSentRows = xterm.rows;
-        const params = new URLSearchParams({ cols: String(xterm.cols), rows: String(xterm.rows), terminalId: 'main' });
+        const params = new URLSearchParams({ projectPath, cols: String(xterm.cols), rows: String(xterm.rows), terminalId: 'main' });
         const clearHeartbeatTimeout = () => {
           if (heartbeatTimeoutTimer === undefined) return;
           window.clearTimeout(heartbeatTimeoutTimer);
