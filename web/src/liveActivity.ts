@@ -16,6 +16,15 @@ export function emptyAgentActivity(): AgentActivity {
   return { running: false, streaming: false, text: '', thinking: '', tools: [], items: [], notices: [], deltaContentKeys: [] };
 }
 
+export function retireAgentActivityPreview(activity: AgentActivity): AgentActivity {
+  return {
+    ...emptyAgentActivity(),
+    running: activity.running,
+    notices: activity.notices,
+    ...(activity.retry ? { retry: activity.retry } : {}),
+  };
+}
+
 export function appendLivePreviewText(current: string, delta: string, maxLength: number) {
   const next = `${current}${delta}`;
   if (next.length <= maxLength) return next;
@@ -45,7 +54,8 @@ function appendLiveActivityTextSegment(activity: AgentActivity, type: AgentActiv
 }
 
 function liveActivityContentKey(type: AgentActivityTextKind, contentIndex: unknown) {
-  return typeof contentIndex === 'number' && Number.isInteger(contentIndex) && contentIndex >= 0 ? `${type}:${contentIndex}` : undefined;
+  if (typeof contentIndex === 'number' && Number.isInteger(contentIndex) && contentIndex >= 0) return `${type}:${contentIndex}`;
+  return contentIndex === undefined ? `${type}:unindexed` : undefined;
 }
 
 export function appendLiveActivityDelta(activity: AgentActivity, delta: AgentActivityDelta): AgentActivity {
@@ -56,7 +66,9 @@ export function appendLiveActivityDelta(activity: AgentActivity, delta: AgentAct
 
 function liveActivityHasDelta(activity: AgentActivity, type: AgentActivityTextKind, contentIndex: unknown) {
   const key = liveActivityContentKey(type, contentIndex);
-  return Boolean(key && activity.deltaContentKeys.includes(key));
+  if (key && activity.deltaContentKeys.includes(key)) return true;
+  if (contentIndex === undefined) return activity.deltaContentKeys.some((item) => item.startsWith(`${type}:`));
+  return activity.deltaContentKeys.includes(`${type}:unindexed`);
 }
 
 function upsertLiveActivityToolItem(items: AgentActivityItem[], tool: AgentToolActivity): AgentActivityItem[] {

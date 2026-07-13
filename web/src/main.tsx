@@ -91,6 +91,7 @@ import {
   appendLivePreviewText,
   emptyAgentActivity,
   reduceAgentActivityEvent,
+  retireAgentActivityPreview,
   shouldUseOptimizedStreamingRender,
   type AgentActivity,
   type AgentActivityDelta,
@@ -5182,7 +5183,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       setLiveTurnTranscriptSnapshot(liveTranscriptSnapshot(untrack(liveTurnTranscriptEntries), options));
       setLiveTurnRetired(false);
     }
-    if (!active && !activity.error && !activity.notices.length) {
+    if (!active && !activity.error) {
       if (liveAgentActivityHasPreviewText(activity, options)) {
         if (transcriptHasCaughtUpToLiveActivity(liveTurnTranscriptEntries(), options, liveTurnTranscriptSnapshot(), activity)) setLiveTurnRetired(true);
       } else if (!liveAgentActivityHasDisplayContent(activity, options)) {
@@ -9769,14 +9770,13 @@ function liveTranscriptSnapshot(entries: SessionEntry[], options: { hideThinking
 }
 
 function displayLiveAgentActivity(activity: AgentActivity, entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined, retired: boolean): AgentActivity {
-  if (activity.running || activity.streaming) return activity;
+  if (activity.streaming) return activity;
   if (activity.error === 'Operation aborted') return emptyAgentActivity();
   if (activity.error) return activity;
-  if (activity.notices.length) return activity;
-  if (retired) return emptyAgentActivity();
+  if (retired) return retireAgentActivityPreview(activity);
   if (!liveAgentActivityHasDisplayContent(activity, options)) return activity;
-  if (!liveAgentActivityHasPreviewText(activity, options)) return emptyAgentActivity();
-  return transcriptHasCaughtUpToLiveActivity(entries, options, snapshot, activity) ? emptyAgentActivity() : activity;
+  if (!liveAgentActivityHasPreviewText(activity, options)) return retireAgentActivityPreview(activity);
+  return transcriptHasCaughtUpToLiveActivity(entries, options, snapshot, activity) ? retireAgentActivityPreview(activity) : activity;
 }
 
 function liveAgentActivityRenderItems(activity: AgentActivity): AgentActivityItem[] {

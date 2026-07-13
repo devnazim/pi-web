@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 import {
   emptyAgentActivity,
   reduceAgentActivityEvent,
+  retireAgentActivityPreview,
   shouldUseOptimizedStreamingRender,
   type AgentActivity,
   type AgentServerEvent,
@@ -65,5 +66,38 @@ describe('live agent activity', () => {
       { type: 'tool', tool: { id: 'tool-1', name: 'read', status: 'running', summary: undefined } },
     ]);
     assert.equal(activity.text, 'After tool.');
+  });
+
+  test('does not duplicate text when a provider omits content indexes', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Hello' }));
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_end', content: 'Hello' }));
+
+    assert.deepEqual(activity.items, [{ type: 'text', text: 'Hello' }]);
+  });
+
+  test('retires persisted response content while preserving completion notices', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Final answer', contentIndex: 0 }));
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'auto_retry_end', success: true, attempt: 1 } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'agent_end', willRetry: false } });
+
+    assert.deepEqual(retireAgentActivityPreview(activity), {
+      ...emptyAgentActivity(),
+      notices: ['retry succeeded'],
+    });
+  });
+
+  test('keeps post-response compaction active after retiring persisted content', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Final answer', contentIndex: 0 }));
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'agent_end', willRetry: false } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'compaction_start' } });
+
+    assert.deepEqual(retireAgentActivityPreview(activity), {
+      ...emptyAgentActivity(),
+      running: true,
+      notices: ['compacting context'],
+    });
   });
 });
