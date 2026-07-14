@@ -163,6 +163,7 @@ type AgentStatusInfo = {
   branch?: string;
   running: boolean;
   sessionName?: string;
+  recovery?: { id: string; message: string; at: number };
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number; cost: number; subscription: boolean };
   context?: { tokens: number | null; contextWindow: number; percent: number | null; autoCompact: boolean };
   statuses: Array<{ key: string; text: string }>;
@@ -235,7 +236,7 @@ type LiveTranscriptSnapshot = { userMessageCount: number; assistantAfterLastUser
 type AssistantEntryPreview = { text: string; thinking: string; error: string };
 type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: number; latestAssistantId?: string };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
-type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; heartbeat?: boolean };
+type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; onDisconnect?: () => void; heartbeat?: boolean };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
 type SessionComposerControls = { agent?: string; model?: string; thinking?: ThinkingLevel | '' };
 type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; agent?: string; agentExplicit?: boolean; model?: string; modelExplicit?: boolean; thinking?: ThinkingLevel | ''; thinkingExplicit?: boolean };
@@ -843,6 +844,7 @@ function Shell() {
   let lastLiveActivityPublishAt = 0;
   let agentSocketEventGeneration = 0;
   let agentStatusRefreshGeneration = 0;
+  let agentConnectionGeneration = 0;
 
   function queueStoredAgentEvent(payload: string) {
     pendingStoredEventPayloads.push(payload);
@@ -974,9 +976,15 @@ function Shell() {
     setExtensionUiRequests((current) => ({ ...current, [request.id]: request }));
   }
 
-  function mergeExtensionUiRequests(requests: ExtensionUiRequest[]) {
+  function replaceAllExtensionUiRequests(requests: ExtensionUiRequest[]) {
+    setExtensionUiRequests(Object.fromEntries(requests
+      .filter((request) => !settledExtensionUiRequestIds.has(request.id))
+      .map((request) => [request.id, request])));
+  }
+
+  function replaceSessionExtensionUiRequests(sessionId: string, requests: ExtensionUiRequest[]) {
     setExtensionUiRequests((current) => {
-      const next = { ...current };
+      const next = Object.fromEntries(Object.entries(current).filter(([, request]) => request.sessionId !== sessionId));
       for (const request of requests) {
         if (!settledExtensionUiRequestIds.has(request.id)) next[request.id] = request;
       }
@@ -1035,7 +1043,9 @@ function Shell() {
   }
 
   function updateAgentRunningCache(projectId: string, eventSessionId: string, running: boolean) {
-    queryClient.setQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId], (current) => current ? { status: { ...current.status, running } } : current);
+    queryClient.setQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId], (current) => current
+      ? { status: { ...current.status, running, recovery: running ? undefined : current.status.recovery } }
+      : current);
   }
 
   function updateWorkspaceNotifications(workspaceId: string, updater: (state: WorkspaceNotificationState) => WorkspaceNotificationState) {
@@ -1614,63 +1624,79 @@ function Shell() {
   });
 
   createEffect(() => {
-    const project = workspaceProject();
+    workspaceProject();
     setExtensionUiRequests({});
-    if (!project) return;
-    const controller = new AbortController();
-    void api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests`, { signal: controller.signal })
-      .then(({ requests }) => {
-        if (workspaceProject()?.id !== project.id) return;
-        mergeExtensionUiRequests(requests);
-      })
-      .catch((error) => {
-        if (controller.signal.aborted) return;
-        console.warn('Could not load extension UI requests', error);
-      });
-    onCleanup(() => controller.abort());
   });
 
   createEffect(() => {
     const project = workspaceProject();
     const currentActiveSessionId = activeSessionId();
     if (!project) return;
+    const connectionGeneration = ++agentConnectionGeneration;
     const refreshAgentQueries = () => {
       queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
-      if (currentActiveSessionId) {
-        queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
-        queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, currentActiveSessionId] });
-        const statusEventGeneration = agentSocketEventGeneration;
-        const statusRefreshGeneration = ++agentStatusRefreshGeneration;
-        void api<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
-          .then(({ status }) => {
+      if (!currentActiveSessionId) {
+        const socketGeneration = agentSocketEventGeneration;
+        const refreshGeneration = ++agentStatusRefreshGeneration;
+        void api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests`)
+          .then(({ requests }) => {
             if (
-              workspaceProject()?.id !== project.id
-              || activeSessionId() !== currentActiveSessionId
-              || statusEventGeneration !== agentSocketEventGeneration
-              || statusRefreshGeneration !== agentStatusRefreshGeneration
-            ) return;
-            queryClient.setQueryData(['agent-status', project.id, currentActiveSessionId], { status });
-            updateWorkspaceNotifications(project.id, (state) => ({
-              ...state,
-              runningSessionIds: status.running
-                ? uniqueStrings([...state.runningSessionIds, currentActiveSessionId])
-                : state.runningSessionIds.filter((id) => id !== currentActiveSessionId),
-            }));
-            if (status.running) {
-              if (!liveAgentActivityValue.running) replaceLiveActivity({ ...emptyAgentActivity(), running: true });
-              return;
-            }
-            replaceLiveActivity(emptyAgentActivity(), emptyBashActivity());
-            removeSessionExtensionUiRequests(currentActiveSessionId);
+              workspaceProject()?.id === project.id
+              && activeSessionId() === undefined
+              && socketGeneration === agentSocketEventGeneration
+              && refreshGeneration === agentStatusRefreshGeneration
+              && connectionGeneration === agentConnectionGeneration
+            ) replaceAllExtensionUiRequests(requests);
           })
-          .catch((error) => console.warn('Could not refresh agent status', error));
+          .catch((error) => console.warn('Could not load extension UI requests', error));
+        return;
       }
-      const query = currentActiveSessionId ? `?sessionId=${encodeURIComponent(currentActiveSessionId)}` : '';
-      void api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests${query}`)
-        .then(({ requests }) => {
-          if (workspaceProject()?.id === project.id) mergeExtensionUiRequests(requests);
-        })
-        .catch((error) => console.warn('Could not load extension UI requests', error));
+
+      queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
+      queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, currentActiveSessionId] });
+      const statusEventGeneration = agentSocketEventGeneration;
+      const statusRefreshGeneration = ++agentStatusRefreshGeneration;
+      void Promise.allSettled([
+        api<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`),
+        api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests?sessionId=${encodeURIComponent(currentActiveSessionId)}`),
+      ]).then(([statusResult, requestsResult]) => {
+        if (
+          workspaceProject()?.id !== project.id
+          || activeSessionId() !== currentActiveSessionId
+          || statusEventGeneration !== agentSocketEventGeneration
+          || statusRefreshGeneration !== agentStatusRefreshGeneration
+          || connectionGeneration !== agentConnectionGeneration
+        ) return;
+
+        const status = statusResult.status === 'fulfilled' ? statusResult.value.status : undefined;
+        if (status) {
+          queryClient.setQueryData(['agent-status', project.id, currentActiveSessionId], { status });
+          updateWorkspaceNotifications(project.id, (state) => ({
+            ...state,
+            runningSessionIds: status.running
+              ? uniqueStrings([...state.runningSessionIds, currentActiveSessionId])
+              : state.runningSessionIds.filter((id) => id !== currentActiveSessionId),
+          }));
+          if (status.running) {
+            if (!liveAgentActivityValue.running) replaceLiveActivity({ ...emptyAgentActivity(), running: true });
+          } else {
+            replaceLiveActivity(status.recovery
+              ? reduceAgentActivityEvent(liveAgentActivityValue, { type: 'agent:error', message: status.recovery.message })
+              : emptyAgentActivity(), emptyBashActivity());
+            removeSessionExtensionUiRequests(currentActiveSessionId);
+          }
+        } else if (statusResult.status === 'rejected') {
+          console.warn('Could not refresh agent status', statusResult.reason);
+        }
+
+        if (requestsResult.status === 'rejected') {
+          console.warn('Could not load extension UI requests', requestsResult.reason);
+        } else if (status?.recovery) {
+          removeSessionExtensionUiRequests(currentActiveSessionId);
+        } else {
+          replaceSessionExtensionUiRequests(currentActiveSessionId, requestsResult.value.requests);
+        }
+      });
     };
     let pendingAgentSocketPayloads: string[] = [];
     let pendingAgentSocketOffset = 0;
@@ -1746,9 +1772,26 @@ function Shell() {
       });
     };
 
+    const flushPendingAgentSocketPayloads = () => {
+      if (pendingAgentSocketFrame !== undefined) {
+        window.cancelAnimationFrame(pendingAgentSocketFrame);
+        pendingAgentSocketFrame = undefined;
+      }
+      while (pendingAgentSocketOffset < pendingAgentSocketPayloads.length) {
+        processAgentSocketPayload(pendingAgentSocketPayloads[pendingAgentSocketOffset]);
+        pendingAgentSocketOffset += 1;
+      }
+      pendingAgentSocketPayloads = [];
+      pendingAgentSocketOffset = 0;
+    };
+
     const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentActiveSessionId ? `?sessionId=${encodeURIComponent(currentActiveSessionId)}` : ''}`), {
       heartbeat: true,
       onOpen: refreshAgentQueries,
+      onDisconnect: () => {
+        flushPendingAgentSocketPayloads();
+        refreshAgentQueries();
+      },
       onMessage: (event) => {
         agentSocketEventGeneration += 1;
         pendingAgentSocketPayloads.push(typeof event.data === 'string' ? event.data : String(event.data));
@@ -1756,14 +1799,9 @@ function Shell() {
       },
     });
     onCleanup(() => {
+      if (agentConnectionGeneration === connectionGeneration) agentConnectionGeneration += 1;
       cleanup();
-      if (pendingAgentSocketFrame !== undefined) window.cancelAnimationFrame(pendingAgentSocketFrame);
-      while (pendingAgentSocketOffset < pendingAgentSocketPayloads.length) {
-        processAgentSocketPayload(pendingAgentSocketPayloads[pendingAgentSocketOffset]);
-        pendingAgentSocketOffset += 1;
-      }
-      pendingAgentSocketPayloads = [];
-      pendingAgentSocketOffset = 0;
+      flushPendingAgentSocketPayloads();
     });
   });
 
@@ -11956,7 +11994,10 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
   };
   const scheduleReconnect = (current?: WebSocket) => {
     if (disposed || (current && socket !== current)) return;
-    if (current && socket === current) socket = undefined;
+    if (current && socket === current) {
+      socket = undefined;
+      options.onDisconnect?.();
+    }
     clearHeartbeatTimers();
     if (reconnectTimer !== undefined) return;
     const delay = Math.min(WEBSOCKET_RECONNECT_MAX_DELAY_MS, WEBSOCKET_RECONNECT_MIN_DELAY_MS * 2 ** Math.min(reconnectAttempt, 5));

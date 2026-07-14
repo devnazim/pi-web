@@ -95,6 +95,7 @@ type ExtensionUiRequest = {
 };
 type ExtensionUiResponse = { value?: string; confirmed?: boolean; cancelled?: boolean };
 type PendingExtensionUiRequest<T = unknown> = {
+  session: object;
   projectPath: string;
   streamKey: string | string[];
   request: ExtensionUiRequest;
@@ -110,10 +111,12 @@ interface ExtensionUiReplyBody extends ExtensionUiResponse {
 
 type ModelInfo = { value: string; label: string; provider: string; id: string; reasoning: boolean; thinkingLevels: ThinkingLevel[] };
 
+type AgentRecovery = { id: string; message: string; at: number };
 type AgentStatus = {
   branch?: string;
   running: boolean;
   sessionName?: string;
+  recovery?: AgentRecovery;
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number; cost: number; subscription: boolean };
   context?: { tokens: number | null; contextWindow: number; percent: number | null; autoCompact: boolean };
   statuses: Array<{ key: string; text: string }>;
@@ -121,13 +124,41 @@ type AgentStatus = {
 
 type CachedSession = { promise: Promise<unknown>; expiresAt: number; timer?: NodeJS.Timeout };
 type RuntimeSessionLock = { release: () => void; wasActive: boolean };
+type RuntimeOperation = { session?: object; recover: (message: string) => boolean };
+type RuntimeWatchOptions = { session: object; accepted: () => boolean; settled: () => boolean; acceptedIsActivity?: boolean; requireSettled?: boolean };
+type RuntimeSetupSupervisor = {
+  operation: RuntimeOperation;
+  wait: <T>(task: Promise<T>) => Promise<T>;
+  watch: <T>(task: Promise<T>, options: RuntimeWatchOptions) => Promise<T>;
+  release: () => void;
+};
 type StreamKeyLock = { key: string | string[]; token: symbol };
 type PromptRunOptions = { startEvent?: boolean; preflightResult?: (success: boolean, error?: unknown) => void };
+type PiBridgeOptions = {
+  runtimeSettledGraceMs?: number;
+  runtimeIdleGraceMs?: number;
+  runtimeWatchIntervalMs?: number;
+  abortGraceMs?: number;
+  sessionCreateTimeoutMs?: number;
+};
+
+class AgentRuntimeRecoveryError extends Error {
+  constructor(message: string, readonly report = true) {
+    super(message);
+  }
+}
 
 const WEB_BUILTIN_COMMAND_NAMES = new Set(['compact']);
 const AGENT_ALREADY_PROCESSING_MESSAGE = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+const AGENT_RUNTIME_RECOVERY_MESSAGE = 'Agent stopped responding or crashed. Its session runtime was reset. You can retry or continue.';
+const AGENT_ABORT_RECOVERY_MESSAGE = 'Agent did not stop after abort and its session runtime was reset. You can retry or continue.';
 const SESSION_CACHE_TTL_MS = 30 * 60_000;
 const SESSION_CACHE_BUSY_RETRY_MS = 60_000;
+const SESSION_CREATE_TIMEOUT_MS = 60_000;
+const RUNTIME_SETTLED_GRACE_MS = 2_000;
+const RUNTIME_IDLE_GRACE_MS = 30_000;
+const RUNTIME_WATCH_INTERVAL_MS = 250;
+const ABORT_GRACE_MS = 5_000;
 const EXTENSION_COMMAND_BUSY_DELAY_MS = 300;
 const IMAGE_TYPE_SNIFF_BYTES = 4100;
 const MAX_PROMPT_ATTACHMENT_PATHS = 100;
@@ -143,6 +174,11 @@ export class PiBridge {
   private readonly notificationSockets = new Map<string, Set<WebSocket>>();
   private readonly runtimeSessions = new Map<string, CachedSession>();
   private readonly commandSessions = new Map<string, CachedSession>();
+  private readonly runtimeOperations = new Map<string, Set<RuntimeOperation>>();
+  private readonly runtimeRecoveries = new Map<string, AgentRecovery>();
+  private readonly runtimeSessionEntries = new WeakMap<object, CachedSession>();
+  private readonly recoveringSessions = new WeakSet<object>();
+  private readonly sessionDisposals = new WeakMap<object, Promise<void>>();
   private readonly boundSessions = new WeakSet<object>();
   private readonly sessionStreamKeys = new WeakMap<object, string | string[]>();
   private readonly sessionStreamKeyLocks = new WeakMap<object, StreamKeyLock>();
@@ -152,8 +188,22 @@ export class PiBridge {
   private readonly extensionStatuses = new WeakMap<object, Map<string, string>>();
   private readonly pendingExtensionUiRequests = new Map<string, PendingExtensionUiRequest<any>>();
   private readonly activeRuntimeSessions = new Map<string, number>();
+  private readonly abortingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessionFiles = new Set<string>();
+  private readonly runtimeSettledGraceMs: number;
+  private readonly runtimeIdleGraceMs: number;
+  private readonly runtimeWatchIntervalMs: number;
+  private readonly abortGraceMs: number;
+  private readonly sessionCreateTimeoutMs: number;
+
+  constructor(options: PiBridgeOptions = {}) {
+    this.runtimeSettledGraceMs = options.runtimeSettledGraceMs ?? RUNTIME_SETTLED_GRACE_MS;
+    this.runtimeIdleGraceMs = options.runtimeIdleGraceMs ?? RUNTIME_IDLE_GRACE_MS;
+    this.runtimeWatchIntervalMs = options.runtimeWatchIntervalMs ?? RUNTIME_WATCH_INTERVAL_MS;
+    this.abortGraceMs = options.abortGraceMs ?? ABORT_GRACE_MS;
+    this.sessionCreateTimeoutMs = options.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
+  }
 
   async loadSdk() {
     return import('@earendil-works/pi-coding-agent') as Promise<Record<string, any>>;
@@ -261,6 +311,7 @@ export class PiBridge {
   }
 
   async disposeSession(projectPath: string, sessionId: string, filePath?: string) {
+    this.clearRuntimeRecovery(projectPath, sessionId);
     const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, filePath);
     const entries: Array<[string, CachedSession]> = [];
     for (const key of keys) {
@@ -302,6 +353,10 @@ export class PiBridge {
     let commandBusyTimer: NodeJS.Timeout | undefined;
     let commandBusyStarted = false;
     let preflightReported = false;
+    let preflightAccepted = false;
+    let agentSettled = false;
+    let runtimeSession: object | undefined;
+    let setupSupervisor: RuntimeSetupSupervisor | undefined;
     const clearCommandBusyTimer = () => {
       if (!commandBusyTimer) return;
       clearTimeout(commandBusyTimer);
@@ -310,12 +365,18 @@ export class PiBridge {
     const reportPreflight = (success: boolean, error?: unknown) => {
       if (preflightReported) return;
       preflightReported = true;
+      preflightAccepted = success;
       options.preflightResult?.(success, error);
     };
     try {
       const sessionLock = await this.markSessionActiveWithState(projectPath, body.sessionId);
       markSessionIdle = sessionLock.release;
-      const session = await this.getSession(projectPath, body.sessionId);
+      setupSupervisor = this.superviseRuntimeSetup(projectPath, body.sessionId);
+      const session = await setupSupervisor.wait(this.getSession(projectPath, body.sessionId));
+      if (session && typeof session === 'object') {
+        runtimeSession = session;
+        setupSupervisor.operation.session = session;
+      }
       const extensionCommand = this.isExtensionCommandPrompt(session, body.prompt);
       const sessionBusy = sessionLock.wasActive || this.cachedSessionInUse(session);
       if (extensionCommand && sessionBusy) {
@@ -348,6 +409,7 @@ export class PiBridge {
         reportPreflight(false, error);
         throw error;
       }
+      this.clearRuntimeRecovery(projectPath, body.sessionId);
       releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
       const extensionErrorCountBefore = extensionCommand ? this.extensionErrorCount(session) : 0;
       const lifecycle = { started: false, finished: false };
@@ -363,6 +425,7 @@ export class PiBridge {
         mirrorLifecycle: extensionCommand,
         lifecycle,
         onActivityStart: extensionCommand ? ensureCommandBusyStarted : undefined,
+        onEvent: (type) => { if (type === 'agent_settled') agentSettled = true; },
         syntheticStartActive: () => commandBusyStarted,
       });
       if (extensionCommand) {
@@ -377,40 +440,53 @@ export class PiBridge {
         }, EXTENSION_COMMAND_BUSY_DELAY_MS);
         commandBusyTimer.unref();
       }
-      await this.bindWebExtensions(session, projectPath, body.sessionId, key);
+      await setupSupervisor.wait(this.bindWebExtensions(session, projectPath, body.sessionId, key));
       const useSyntheticStart = (options.startEvent ?? true) && !extensionCommand && !queuedStreamingPrompt;
       if (useSyntheticStart) this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
 
       if (body.treeTargetId) {
         if (typeof session?.navigateTree !== 'function') throw new Error('Loaded pi SDK session does not expose navigateTree()');
-        const result = await session.navigateTree(body.treeTargetId, {
+        const result: any = await setupSupervisor.wait(session.navigateTree(body.treeTargetId, {
           summarize: body.treeSummary?.mode === 'summary' || body.treeSummary?.mode === 'custom',
           customInstructions: body.treeSummary?.mode === 'custom' ? body.treeSummary.instructions : undefined,
           replaceInstructions: body.treeSummary?.mode === 'custom' ? body.treeSummary.replace : undefined,
-        });
+        }));
         if (result?.cancelled) throw new Error(result.aborted ? 'Tree navigation aborted' : 'Tree navigation cancelled');
       }
       else if ('branchFromId' in body) this.branchSession(session, body.branchFromId);
 
       if (this.shouldApplySuiteAgentSelection(body, extensionCommand, queuedStreamingPrompt, requestedStreamingBehavior)) {
-        await this.applySuiteAgentSelection(session, body.agent);
+        await setupSupervisor.wait(this.applySuiteAgentSelection(session, body.agent));
       }
-      await this.applySessionControls(session, body);
+      await setupSupervisor.wait(this.applySessionControls(session, body));
 
-      const { prompt, images } = await this.preparePromptAttachments(projectPath, body.prompt, body.attachments);
+      const { prompt, images } = await setupSupervisor.wait(this.preparePromptAttachments(projectPath, body.prompt, body.attachments));
+      agentSettled = false;
 
       if (typeof session?.prompt === 'function') {
-        await session.prompt(prompt, {
+        const promptTask = Promise.resolve().then(() => session.prompt(prompt, {
           source: 'rpc',
           streamingBehavior,
           images: images.length ? images : undefined,
           preflightResult: (success: boolean) => {
             if (success && !extensionCommand) reportPreflight(true);
           },
+        }));
+        await setupSupervisor.watch(promptTask, {
+          session,
+          accepted: () => preflightAccepted,
+          settled: () => agentSettled,
+          acceptedIsActivity: !extensionCommand,
+          requireSettled: extensionCommand,
         });
         if (!extensionCommand) reportPreflight(true);
       } else if (typeof session?.followUp === 'function') {
-        await session.followUp(prompt, images.length ? images : undefined);
+        await setupSupervisor.watch(Promise.resolve().then(() => session.followUp(prompt, images.length ? images : undefined)), {
+          session,
+          accepted: () => true,
+          settled: () => agentSettled,
+          acceptedIsActivity: true,
+        });
         reportPreflight(true);
       } else {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
@@ -422,7 +498,12 @@ export class PiBridge {
         // Hold the HTTP preflight response until we know whether real agent activity started; otherwise
         // a status refresh can observe this temporary bridge lock as a running agent and leave the web UI busy.
         if (!lifecycle.started && !commandBusyStarted && this.cachedSessionInUse(session)) ensureCommandBusyStarted();
-        await this.waitForCommandActivity(session, lifecycle, ensureCommandBusyStarted);
+        await setupSupervisor.watch(this.waitForCommandActivity(session, lifecycle, ensureCommandBusyStarted), {
+          session,
+          accepted: () => preflightAccepted,
+          settled: () => agentSettled,
+          requireSettled: true,
+        });
         reportPreflight(true);
       }
       subscription?.();
@@ -437,14 +518,17 @@ export class PiBridge {
       clearCommandBusyTimer();
       subscription?.();
       if (!preflightReported) reportPreflight(false, error);
+      if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
       const message = error instanceof Error ? error.message : 'Agent failed';
-      this.broadcast(key, isAgentAlreadyProcessingMessage(message) || queuedStreamingPrompt
+      const warning = !(error instanceof AgentRuntimeRecoveryError) && (isAgentAlreadyProcessingMessage(message) || queuedStreamingPrompt);
+      this.broadcast(key, warning
         ? { type: 'agent:notice', sessionId: body.sessionId, message, data: { level: 'warning' } }
         : { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
       clearCommandBusyTimer();
-      if (!queuedStreamingPrompt) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      setupSupervisor?.release();
+      if (!queuedStreamingPrompt && runtimeSession) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false, session: runtimeSession });
       releaseStreamKeyLock?.();
       markSessionIdle();
     }
@@ -481,22 +565,36 @@ export class PiBridge {
     let markSessionIdle: () => void = () => undefined;
     let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
+    let agentSettled = false;
+    let runtimeSession: object | undefined;
+    let setupSupervisor: RuntimeSetupSupervisor | undefined;
     try {
       const sessionLock = await this.markSessionActiveWithState(projectPath, body.sessionId);
       markSessionIdle = sessionLock.release;
-      const session = await this.getSession(projectPath, body.sessionId);
+      setupSupervisor = this.superviseRuntimeSetup(projectPath, body.sessionId);
+      const session = await setupSupervisor.wait(this.getSession(projectPath, body.sessionId));
+      if (session && typeof session === 'object') {
+        runtimeSession = session;
+        setupSupervisor.operation.session = session;
+      }
       if (sessionLock.wasActive || this.cachedSessionInUse(session)) throw new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
       releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
+      this.clearRuntimeRecovery(projectPath, body.sessionId);
       this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
-      await this.bindWebExtensions(session, projectPath, body.sessionId, key);
-      subscription = typeof session?.subscribe === 'function'
-        ? session.subscribe((event: unknown) => this.broadcast(key, { type: 'agent:event', sessionId: body.sessionId, data: event }))
-        : undefined;
+      await setupSupervisor.wait(this.bindWebExtensions(session, projectPath, body.sessionId, key));
+      subscription = this.subscribeSessionEvents(session, key, body.sessionId, {
+        onEvent: (type) => { if (type === 'agent_settled') agentSettled = true; },
+      });
       if (typeof session?.navigateTree !== 'function') throw new Error('Loaded pi SDK session does not expose navigateTree()');
-      const result = await session.navigateTree(body.targetId, {
+      const result = await setupSupervisor.watch(Promise.resolve().then(() => session.navigateTree(body.targetId, {
         summarize: body.treeSummary?.mode === 'summary' || body.treeSummary?.mode === 'custom',
         customInstructions: body.treeSummary?.mode === 'custom' ? body.treeSummary.instructions : undefined,
         replaceInstructions: body.treeSummary?.mode === 'custom' ? body.treeSummary.replace : undefined,
+      })), {
+        session,
+        accepted: () => true,
+        settled: () => agentSettled,
+        acceptedIsActivity: true,
       });
       if (result?.cancelled) throw new Error(result.aborted ? 'Tree navigation aborted' : 'Tree navigation cancelled');
       subscription?.();
@@ -504,13 +602,15 @@ export class PiBridge {
       return result ?? { cancelled: false };
     } catch (error) {
       subscription?.();
+      if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
       const message = error instanceof Error ? error.message : 'Tree navigation failed';
       this.broadcast(key, isAgentAlreadyProcessingMessage(message)
         ? { type: 'agent:notice', sessionId: body.sessionId, message, data: { level: 'warning' } }
         : { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
-      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      setupSupervisor?.release();
+      if (runtimeSession) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false, session: runtimeSession });
       releaseStreamKeyLock?.();
       markSessionIdle();
     }
@@ -570,16 +670,55 @@ export class PiBridge {
 
   async status(projectPath: string, sessionId: string | undefined, key: string | string[]): Promise<AgentStatus> {
     const branch = await getGitBranch(projectPath).catch(() => undefined);
-    if (!sessionId) return {
+    const inactiveStatus: AgentStatus = {
       branch,
       running: false,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, subscription: false },
       statuses: [],
     };
-    const running = await this.isSessionActive(projectPath, sessionId);
-    const session = await this.getSession(projectPath, sessionId);
-    await this.bindWebExtensions(session, projectPath, sessionId, key);
-    return this.agentStatus(session, branch, running);
+    if (!sessionId) return inactiveStatus;
+    const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    const recovery = this.runtimeRecoveries.get(cacheKey);
+    if (recovery) return { ...inactiveStatus, recovery };
+    let attemptedCreation = false;
+
+    while (true) {
+      const latestRecovery = this.runtimeRecoveries.get(cacheKey);
+      if (latestRecovery) return { ...inactiveStatus, recovery: latestRecovery };
+      const currentEntry = this.runtimeSessions.get(cacheKey);
+      if (!currentEntry) {
+        if (attemptedCreation) return inactiveStatus;
+        attemptedCreation = true;
+        try {
+          await this.getSession(projectPath, sessionId);
+        } catch (error) {
+          const creationRecovery = this.runtimeRecoveries.get(cacheKey);
+          if (creationRecovery) return { ...inactiveStatus, recovery: creationRecovery };
+          if (!this.runtimeSessions.has(cacheKey)) throw error;
+        }
+        continue;
+      }
+
+      const resolved = await currentEntry.promise.then(
+        (session) => ({ ok: true as const, session }),
+        (error) => ({ ok: false as const, error }),
+      );
+      const entryRecovery = this.runtimeRecoveries.get(cacheKey);
+      if (entryRecovery) return { ...inactiveStatus, recovery: entryRecovery };
+      if (this.runtimeSessions.get(cacheKey) !== currentEntry) continue;
+      if (!resolved.ok) throw resolved.error;
+      const session = resolved.session;
+      if (!session || typeof session !== 'object') return inactiveStatus;
+      if (this.recoveringSessions.has(session) || this.sessionDisposals.has(session)) return inactiveStatus;
+
+      const running = await this.isSessionActive(projectPath, sessionId);
+      if (this.runtimeRecoveries.has(cacheKey) || this.runtimeSessions.get(cacheKey) !== currentEntry) continue;
+      await this.bindWebExtensions(session, projectPath, sessionId, key);
+      const recoveryAfterBind = this.runtimeRecoveries.get(cacheKey);
+      if (recoveryAfterBind) return { ...inactiveStatus, recovery: recoveryAfterBind };
+      if (this.runtimeSessions.get(cacheKey) !== currentEntry || this.recoveringSessions.has(session) || this.sessionDisposals.has(session)) continue;
+      return this.agentStatus(session, branch, running);
+    }
   }
 
   async compact(projectPath: string, body: CompactBody, key: string | string[]) {
@@ -587,27 +726,42 @@ export class PiBridge {
     let markSessionIdle: () => void = () => undefined;
     let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
+    let agentSettled = false;
+    let runtimeSession: object | undefined;
+    let setupSupervisor: RuntimeSetupSupervisor | undefined;
     try {
       markSessionIdle = await this.markSessionActive(projectPath, body.sessionId);
-      const session = await this.getSession(projectPath, body.sessionId);
+      setupSupervisor = this.superviseRuntimeSetup(projectPath, body.sessionId);
+      const session = await setupSupervisor.wait(this.getSession(projectPath, body.sessionId));
+      if (session && typeof session === 'object') {
+        runtimeSession = session;
+        setupSupervisor.operation.session = session;
+      }
       releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
       if (typeof session?.compact !== 'function') throw new Error('Loaded pi SDK session does not expose compact()');
-      await this.bindWebExtensions(session, projectPath, body.sessionId, key);
-
+      this.clearRuntimeRecovery(projectPath, body.sessionId);
+      await setupSupervisor.wait(this.bindWebExtensions(session, projectPath, body.sessionId, key));
       this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
-      subscription = typeof session?.subscribe === 'function'
-        ? session.subscribe((event: unknown) => this.broadcast(key, { type: 'agent:event', sessionId: body.sessionId, data: event }))
-        : undefined;
-      const result = await session.compact(body.instructions?.trim() || undefined);
+      subscription = this.subscribeSessionEvents(session, key, body.sessionId, {
+        onEvent: (type) => { if (type === 'agent_settled') agentSettled = true; },
+      });
+      const result = await setupSupervisor.watch(Promise.resolve().then(() => session.compact(body.instructions?.trim() || undefined)), {
+        session,
+        accepted: () => true,
+        settled: () => agentSettled,
+        acceptedIsActivity: true,
+      });
       subscription?.();
       this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
       return result;
     } catch (error) {
       subscription?.();
+      if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
       this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Compaction failed' });
       throw error;
     } finally {
-      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      setupSupervisor?.release();
+      if (runtimeSession) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false, session: runtimeSession });
       releaseStreamKeyLock?.();
       markSessionIdle();
     }
@@ -619,50 +773,129 @@ export class PiBridge {
     if (!command) throw new Error('Missing command');
     let markSessionIdle: () => void = () => undefined;
     let releaseStreamKeyLock: (() => void) | undefined;
+    let runtimeSession: object | undefined;
+    let setupSupervisor: RuntimeSetupSupervisor | undefined;
 
     try {
       markSessionIdle = await this.markSessionActive(projectPath, body.sessionId);
-      const session = await this.getSession(projectPath, body.sessionId);
+      setupSupervisor = this.superviseRuntimeSetup(projectPath, body.sessionId);
+      const session = await setupSupervisor.wait(this.getSession(projectPath, body.sessionId));
+      if (session && typeof session === 'object') {
+        runtimeSession = session;
+        setupSupervisor.operation.session = session;
+      }
       releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
-      await this.bindWebExtensions(session, projectPath, body.sessionId, key);
       if (session?.isBashRunning) throw new Error('A shell command is already running');
       if (typeof session?.executeBash !== 'function') throw new Error('Loaded pi SDK session does not expose executeBash()');
-
+      this.clearRuntimeRecovery(projectPath, body.sessionId);
+      await setupSupervisor.wait(this.bindWebExtensions(session, projectPath, body.sessionId, key));
       this.broadcast(key, { type: 'bash:start', sessionId: body.sessionId, message: command });
       const excludeFromContext = Boolean(body.excludeFromContext);
-      const eventResult = typeof session?.extensionRunner?.emitUserBash === 'function'
-        ? await session.extensionRunner.emitUserBash({ type: 'user_bash', command, excludeFromContext, cwd: projectPath })
-        : undefined;
-      if (eventResult?.result) {
-        if (eventResult.result.output) this.broadcast(key, { type: 'bash:update', sessionId: body.sessionId, message: eventResult.result.output });
-        if (typeof session?.recordBashResult === 'function') session.recordBashResult(command, eventResult.result, { excludeFromContext });
-        this.broadcast(key, { type: 'bash:finish', sessionId: body.sessionId, message: command, data: eventResult.result });
-        return eventResult.result;
-      }
-      const result = await session.executeBash(command, (chunk: string) => {
-        this.broadcast(key, { type: 'bash:update', sessionId: body.sessionId, message: chunk });
-      }, { excludeFromContext, operations: eventResult?.operations });
-      this.broadcast(key, { type: 'bash:finish', sessionId: body.sessionId, message: command, data: result });
+      let bashAccepted = false;
+      const result = await setupSupervisor.watch((async () => {
+        const eventResult = typeof session?.extensionRunner?.emitUserBash === 'function'
+          ? await session.extensionRunner.emitUserBash({ type: 'user_bash', command, excludeFromContext, cwd: projectPath })
+          : undefined;
+        if (this.sessionCannotPublish(session)) throw new AgentRuntimeRecoveryError(AGENT_ABORT_RECOVERY_MESSAGE, false);
+        if (eventResult?.result) {
+          if (eventResult.result.output && !this.sessionCannotPublish(session)) this.broadcast(key, { type: 'bash:update', sessionId: body.sessionId, message: eventResult.result.output });
+          if (typeof session?.recordBashResult === 'function') session.recordBashResult(command, eventResult.result, { excludeFromContext });
+          return eventResult.result;
+        }
+        bashAccepted = true;
+        return session.executeBash(command, (chunk: string) => {
+          if (!this.sessionCannotPublish(session)) this.broadcast(key, { type: 'bash:update', sessionId: body.sessionId, message: chunk });
+        }, { excludeFromContext, operations: eventResult?.operations });
+      })(), {
+        session,
+        accepted: () => {
+          if (this.cachedSessionHasSdkActivity(session)) bashAccepted = true;
+          return bashAccepted;
+        },
+        settled: () => false,
+        acceptedIsActivity: true,
+      });
+      if (!this.sessionCannotPublish(session)) this.broadcast(key, { type: 'bash:finish', sessionId: body.sessionId, message: command, data: result });
       return result;
     } catch (error) {
+      if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
       this.broadcast(key, { type: 'bash:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Shell command failed' });
       throw error;
     } finally {
-      this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false });
+      setupSupervisor?.release();
+      if (runtimeSession) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false, session: runtimeSession });
       releaseStreamKeyLock?.();
       markSessionIdle();
     }
   }
 
-  async abort(projectPath: string, sessionId?: string) {
-    this.cancelExtensionUiRequests(projectPath, sessionId);
-    const session = await this.getSession(projectPath, sessionId);
-    if (typeof session?.clearQueue === 'function') session.clearQueue();
-    if (typeof session?.abortBash === 'function' && session.isBashRunning) session.abortBash();
-    if (typeof session?.abortBranchSummary === 'function') session.abortBranchSummary();
-    if (typeof session?.abortCompaction === 'function' && session.isCompacting) session.abortCompaction();
-    if (typeof session?.abortRetry === 'function' && session.isRetrying) session.abortRetry();
-    if (typeof session?.abort === 'function') await session.abort();
+  async abort(projectPath: string, sessionId?: string, key?: string | string[]) {
+    const operationKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    if (this.abortingRuntimeSessions.has(operationKey)) return;
+    const hadActiveLock = this.activeRuntimeSessions.has(operationKey);
+    const operationsAtAbort = new Set(this.runtimeOperations.get(operationKey) ?? []);
+    const abortDeadline = Date.now() + this.abortGraceMs;
+    this.abortingRuntimeSessions.add(operationKey);
+    try {
+      let loadTimer: NodeJS.Timeout | undefined;
+      const loaded = await Promise.race([
+        this.getSession(projectPath, sessionId).then((session) => ({ session })),
+        new Promise<undefined>((resolve) => {
+          loadTimer = setTimeout(() => resolve(undefined), Math.max(0, abortDeadline - Date.now()));
+          loadTimer.unref();
+        }),
+      ]).finally(() => { if (loadTimer) clearTimeout(loadTimer); });
+      if (!loaded) {
+        let recovered = false;
+        const currentOperations = this.runtimeOperations.get(operationKey);
+        for (const operation of operationsAtAbort) {
+          if (currentOperations?.has(operation) && operation.recover(AGENT_ABORT_RECOVERY_MESSAGE)) recovered = true;
+        }
+        if (!recovered) this.recoverPendingRuntimeSession(projectPath, sessionId, AGENT_ABORT_RECOVERY_MESSAGE);
+        return;
+      }
+
+      const session = loaded.session;
+      this.cancelExtensionUiRequests(projectPath, sessionId, { session });
+      if (typeof session?.clearQueue === 'function') session.clearQueue();
+      if (typeof session?.abortBash === 'function' && session.isBashRunning) session.abortBash();
+      if (typeof session?.abortBranchSummary === 'function') session.abortBranchSummary();
+      if (typeof session?.abortCompaction === 'function' && session.isCompacting) session.abortCompaction();
+      if (typeof session?.abortRetry === 'function' && session.isRetrying) session.abortRetry();
+      if (typeof session?.abort !== 'function') return;
+
+      const hasPendingOperation = () => [...operationsAtAbort].some((operation) => this.runtimeOperations.get(operationKey)?.has(operation));
+      const hadPendingOperation = operationsAtAbort.size > 0;
+      let timer: NodeJS.Timeout | undefined;
+      const abortTask = Promise.resolve().then(() => session.abort());
+      const completed = await Promise.race([
+        (async () => {
+          await abortTask.catch(() => undefined);
+          while (hasPendingOperation()) await new Promise((resolve) => setTimeout(resolve, 25));
+          return true;
+        })(),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), Math.max(0, abortDeadline - Date.now()));
+          timer.unref();
+        }),
+      ]).finally(() => { if (timer) clearTimeout(timer); });
+      if (completed) return;
+
+      let recovered = false;
+      const currentOperations = this.runtimeOperations.get(operationKey);
+      for (const operation of operationsAtAbort) {
+        if (currentOperations?.has(operation) && operation.recover(AGENT_ABORT_RECOVERY_MESSAGE)) recovered = true;
+      }
+      if (recovered || hadPendingOperation || !hadActiveLock) return;
+
+      const cached = this.runtimeSessions.get(operationKey);
+      const cachedSession = await cached?.promise.catch(() => undefined);
+      if (cachedSession !== session || (sessionId && !(await this.isSessionActive(projectPath, sessionId)))) return;
+      const report = this.recoverRuntimeSession(projectPath, sessionId, session, AGENT_ABORT_RECOVERY_MESSAGE);
+      if (report && key) this.broadcast(key, { type: 'agent:error', sessionId, message: AGENT_ABORT_RECOVERY_MESSAGE });
+    } finally {
+      this.abortingRuntimeSessions.delete(operationKey);
+    }
   }
 
   extensionUiRequests(projectPath: string, sessionId?: string) {
@@ -680,10 +913,12 @@ export class PiBridge {
     return pending.request;
   }
 
-  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void; syntheticStartActive?: () => boolean } = {}) {
+  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void; onEvent?: (type: string | undefined) => void; syntheticStartActive?: () => boolean } = {}) {
     if (typeof session?.subscribe !== 'function') return undefined;
     return session.subscribe((event: unknown) => {
+      if (session && typeof session === 'object' && this.sessionCannotPublish(session)) return;
       const type = agentEventType(event);
+      options.onEvent?.(type);
       if (options.mirrorLifecycle && isCommandActivityStartEvent(type) && !options.lifecycle?.started) {
         if (options.lifecycle) options.lifecycle.started = true;
         options.onActivityStart?.();
@@ -728,6 +963,120 @@ export class PiBridge {
       if (this.cachedSessionIsStreaming(session) && typeof session?.agent?.waitForIdle === 'function') await session.agent.waitForIdle();
       else await new Promise((resolve) => setTimeout(resolve, 100));
     }
+  }
+
+  private superviseRuntimeSetup(projectPath: string, sessionId?: string): RuntimeSetupSupervisor {
+    const operationKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    if (this.abortingRuntimeSessions.has(operationKey)) throw new Error('Session is stopping. Wait for abort to finish.');
+    let closed = false;
+    let rejectRecovery: (error: Error) => void = () => undefined;
+    const recovery = new Promise<never>((_resolve, reject) => { rejectRecovery = reject; });
+    const operations = this.runtimeOperations.get(operationKey) ?? new Set<RuntimeOperation>();
+    const operation: RuntimeOperation = {
+      recover: (message) => {
+        if (closed) return false;
+        closed = true;
+        const report = operation.session
+          ? this.recoverRuntimeSession(projectPath, sessionId, operation.session, message)
+          : this.recoverPendingRuntimeSession(projectPath, sessionId, message);
+        rejectRecovery(new AgentRuntimeRecoveryError(message, report));
+        return true;
+      },
+    };
+    operations.add(operation);
+    this.runtimeOperations.set(operationKey, operations);
+
+    const watch = async <T>(task: Promise<T>, options: RuntimeWatchOptions) => {
+      let taskFinished = false;
+      let sawActivity = false;
+      let idleSince: number | undefined;
+      let timer: NodeJS.Timeout | undefined;
+      const check = () => {
+        if (closed || taskFinished) return;
+        const settled = options.settled();
+        const hasUiRequest = [...this.pendingExtensionUiRequests.values()].some((item) => item.session === options.session && item.projectPath === projectPath && item.request.sessionId === sessionId);
+        const inUse = settled ? this.cachedSessionHasSdkActivity(options.session) : this.cachedSessionInUse(options.session);
+        if (inUse) sawActivity = true;
+        if (!options.accepted() || (!settled && !sawActivity && !options.acceptedIsActivity) || (options.requireSettled && !settled) || hasUiRequest || inUse) {
+          idleSince = undefined;
+        } else {
+          idleSince ??= Date.now();
+          const grace = settled ? this.runtimeSettledGraceMs : this.runtimeIdleGraceMs;
+          if (Date.now() - idleSince >= grace) {
+            operation.recover(AGENT_RUNTIME_RECOVERY_MESSAGE);
+            return;
+          }
+        }
+        timer = setTimeout(check, this.runtimeWatchIntervalMs);
+        timer.unref();
+      };
+      void task.then(() => { taskFinished = true; }, () => { taskFinished = true; });
+      timer = setTimeout(check, this.runtimeWatchIntervalMs);
+      timer.unref();
+      try {
+        return await Promise.race([task, recovery]);
+      } finally {
+        taskFinished = true;
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    return {
+      operation,
+      wait: <T>(task: Promise<T>) => Promise.race([task, recovery]),
+      watch,
+      release: () => {
+        closed = true;
+        operations.delete(operation);
+        if (!operations.size && this.runtimeOperations.get(operationKey) === operations) this.runtimeOperations.delete(operationKey);
+      },
+    };
+  }
+
+  private recoverPendingRuntimeSession(projectPath: string, sessionId: string | undefined, message: string) {
+    const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    this.runtimeRecoveries.set(cacheKey, { id: randomUUID(), message, at: Date.now() });
+    const cached = this.runtimeSessions.get(cacheKey);
+    if (cached && this.runtimeSessions.get(cacheKey) === cached) {
+      this.runtimeSessions.delete(cacheKey);
+      if (cached.timer) clearTimeout(cached.timer);
+      void cached.promise.then((session) => this.disposeCachedSession(session)).catch(() => undefined);
+    }
+    return true;
+  }
+
+  private recoverRuntimeSession(projectPath: string, sessionId: string | undefined, session: object, message: string) {
+    const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    if (this.recoveringSessions.has(session)) return this.runtimeRecoveries.has(cacheKey);
+    this.recoveringSessions.add(session);
+
+    const cached = this.runtimeSessions.get(cacheKey);
+    const originatingEntry = this.runtimeSessionEntries.get(session);
+    const report = !cached || cached === originatingEntry;
+    if (report) {
+      this.runtimeRecoveries.set(cacheKey, { id: randomUUID(), message, at: Date.now() });
+      this.cancelExtensionUiRequests(projectPath, sessionId, { session });
+    }
+    if (cached && cached === originatingEntry && this.runtimeSessions.get(cacheKey) === cached) {
+      this.runtimeSessions.delete(cacheKey);
+      if (cached.timer) clearTimeout(cached.timer);
+    }
+    for (const [key, entry] of this.runtimeSessions) {
+      if (!this.isRuntimeSessionCacheKeyForProject(projectPath, key)) continue;
+      void entry.promise.then((cachedSession) => {
+        if (cachedSession !== session || this.runtimeSessions.get(key) !== entry) return;
+        this.runtimeSessions.delete(key);
+        if (entry.timer) clearTimeout(entry.timer);
+      }).catch(() => undefined);
+    }
+    void this.disposeCachedSession(session)
+      .catch(() => this.disposeCachedSession(session))
+      .catch(() => undefined);
+    return report;
+  }
+
+  private clearRuntimeRecovery(projectPath: string, sessionId?: string) {
+    this.runtimeRecoveries.delete(this.runtimeSessionCacheKey(projectPath, sessionId));
   }
 
   private bindSessionStreamKeys(session: object, key: string | string[]) {
@@ -817,6 +1166,7 @@ export class PiBridge {
         },
       },
       onError: (error: { extensionPath?: string; event?: string; error?: string }) => {
+        if (this.sessionCannotPublish(session)) return;
         this.incrementExtensionErrorCount(session);
         this.broadcast(this.sessionStreamKeys.get(session) ?? key, {
           type: 'agent:error',
@@ -828,7 +1178,7 @@ export class PiBridge {
   }
 
   private createExtensionUiRequest<T>(session: object, projectPath: string, sessionId: string | undefined, request: Omit<ExtensionUiRequest, 'id' | 'sessionId' | 'createdAt'>, opts: { signal?: AbortSignal; timeout?: number } | undefined, defaultValue: T, parseResponse: (response: ExtensionUiResponse) => T) {
-    if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+    if (opts?.signal?.aborted || this.sessionCannotPublish(session)) return Promise.resolve(defaultValue);
 
     const id = randomUUID();
     const streamKey = this.sessionStreamKeys.get(session) ?? [];
@@ -855,7 +1205,7 @@ export class PiBridge {
     const abort = () => this.settleExtensionUiRequest(pending, { cancelled: true }, defaultValue);
 
     return new Promise<T>((resolve) => {
-      pending = { projectPath, streamKey, request: pendingRequest, resolve, parseResponse, defaultValue, cleanup };
+      pending = { session, projectPath, streamKey, request: pendingRequest, resolve, parseResponse, defaultValue, cleanup };
       this.pendingExtensionUiRequests.set(id, pending);
       opts?.signal?.addEventListener('abort', abort, { once: true });
       if (pendingRequest.timeout) {
@@ -872,10 +1222,10 @@ export class PiBridge {
     this.broadcast(pending.streamKey, { type: 'agent:ui-response', sessionId: pending.request.sessionId, data: { id: pending.request.id, response } });
   }
 
-  private cancelExtensionUiRequests(projectPath: string, sessionId?: string, options: { allWhenSessionMissing?: boolean } = {}) {
+  private cancelExtensionUiRequests(projectPath: string, sessionId?: string, options: { allWhenSessionMissing?: boolean; session?: object } = {}) {
     const allWhenSessionMissing = options.allWhenSessionMissing ?? true;
     for (const pending of [...this.pendingExtensionUiRequests.values()]) {
-      if (pending.projectPath !== projectPath) continue;
+      if (pending.projectPath !== projectPath || (options.session && pending.session !== options.session)) continue;
       if (sessionId) {
         if (pending.request.sessionId !== sessionId) continue;
       } else if (!allWhenSessionMissing && pending.request.sessionId !== undefined) {
@@ -902,7 +1252,7 @@ export class PiBridge {
 
   private webUiContext(session: object, projectPath: string, sessionId?: string) {
     const notify = (message: string, level?: string) => {
-      this.broadcast(this.sessionStreamKeys.get(session) ?? [], { type: 'agent:notice', sessionId, message, data: { level } });
+      if (!this.sessionCannotPublish(session)) this.broadcast(this.sessionStreamKeys.get(session) ?? [], { type: 'agent:notice', sessionId, message, data: { level } });
     };
     const passthrough = (text: string) => text;
     const theme = {
@@ -1022,7 +1372,12 @@ export class PiBridge {
     };
   }
 
+  private sessionCannotPublish(session: object) {
+    return this.recoveringSessions.has(session) || this.sessionDisposals.has(session);
+  }
+
   private setExtensionStatus(session: object, key: string, text: unknown, sessionId?: string) {
+    if (this.sessionCannotPublish(session)) return;
     const statusKey = sanitizeStatusText(String(key ?? ''));
     if (!statusKey) return;
     const statuses = this.extensionStatuses.get(session) ?? new Map<string, string>();
@@ -1423,9 +1778,15 @@ export class PiBridge {
   }
 
   private async markSessionActiveWithState(projectPath: string, sessionId?: string): Promise<RuntimeSessionLock> {
+    const operationKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    if (this.abortingRuntimeSessions.has(operationKey)) throw new Error('Session is stopping. Wait for abort to finish.');
     if (!sessionId) return { release: () => undefined, wasActive: false };
     const lock = await this.lockRuntimeSessionWithState(projectPath, sessionId);
     if (!lock) throw new Error('Session is being deleted.');
+    if (this.abortingRuntimeSessions.has(this.runtimeSessionCacheKey(projectPath, sessionId))) {
+      lock.release();
+      throw new Error('Session is stopping. Wait for abort to finish.');
+    }
     return lock;
   }
 
@@ -1512,11 +1873,18 @@ export class PiBridge {
   private cachedSessionInUse(session: unknown) {
     const candidates = [session];
     if (session && typeof session === 'object') candidates.push((session as { session?: unknown }).session);
+    return candidates.some((candidate) => Boolean(candidate && typeof candidate === 'object' && this.extensionAsyncTasks.get(candidate)?.size))
+      || this.cachedSessionHasSdkActivity(session);
+  }
+
+  private cachedSessionHasSdkActivity(session: unknown) {
+    const candidates = [session];
+    if (session && typeof session === 'object') candidates.push((session as { session?: unknown }).session);
     return candidates.some((candidate) => {
       if (!candidate || typeof candidate !== 'object') return false;
       try {
         const value = candidate as { isStreaming?: unknown; isBashRunning?: unknown; isCompacting?: unknown; isRetrying?: unknown; state?: { isStreaming?: unknown }; agent?: { state?: { isStreaming?: unknown } } };
-        return Boolean(this.extensionAsyncTasks.get(candidate)?.size || value.isStreaming || value.isBashRunning || value.isCompacting || value.isRetrying || value.state?.isStreaming || value.agent?.state?.isStreaming);
+        return Boolean(value.isStreaming || value.isBashRunning || value.isCompacting || value.isRetrying || value.state?.isStreaming || value.agent?.state?.isStreaming);
       } catch {
         return false;
       }
@@ -1539,10 +1907,46 @@ export class PiBridge {
 
   private async disposeCachedSession(session: unknown) {
     if (!session || typeof session !== 'object') return;
+    const existing = this.sessionDisposals.get(session);
+    if (existing) return existing;
     const disposable = session as { dispose?: () => unknown; close?: () => unknown; destroy?: () => unknown };
-    if (typeof disposable.dispose === 'function') await disposable.dispose();
-    else if (typeof disposable.close === 'function') await disposable.close();
-    else if (typeof disposable.destroy === 'function') await disposable.destroy();
+    const disposal = Promise.resolve().then(async () => {
+      if (typeof disposable.dispose === 'function') await disposable.dispose();
+      else if (typeof disposable.close === 'function') await disposable.close();
+      else if (typeof disposable.destroy === 'function') await disposable.destroy();
+    });
+    this.sessionDisposals.set(session, disposal);
+    try {
+      await disposal;
+    } catch (error) {
+      if (this.sessionDisposals.get(session) === disposal) this.sessionDisposals.delete(session);
+      throw error;
+    }
+  }
+
+  private createSessionPromise(factory: () => Promise<unknown>) {
+    const task = Promise.resolve().then(factory);
+    if (this.sessionCreateTimeoutMs <= 0) return task;
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+    return new Promise<unknown>((resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(new Error('Agent session initialization timed out. Retry to start a fresh runtime.'));
+      }, this.sessionCreateTimeoutMs);
+      timer.unref();
+      void task.then((session) => {
+        if (timer) clearTimeout(timer);
+        if (timedOut) {
+          void this.disposeCachedSession(session).catch(() => undefined);
+          return;
+        }
+        resolve(session);
+      }, (error) => {
+        if (timer) clearTimeout(timer);
+        if (!timedOut) reject(error);
+      });
+    });
   }
 
   private async getCommandSession(projectPath: string, sessionId?: string): Promise<any> {
@@ -1550,12 +1954,12 @@ export class PiBridge {
     const cached = this.getCachedSession(this.commandSessions, projectPath);
     if (cached) return cached;
 
-    const sessionPromise = (async () => {
+    const sessionPromise = this.createSessionPromise(async () => {
       const sdk = await this.loadSdk();
       if (!sdk.createAgentSession || typeof sdk.SessionManager?.inMemory !== 'function') throw new Error('No supported pi SDK command session factory found');
       const result = await sdk.createAgentSession({ cwd: projectPath, sessionManager: sdk.SessionManager.inMemory(projectPath) });
       return result.session ?? result;
-    })();
+    });
     this.setCachedSession(this.commandSessions, projectPath, sessionPromise);
     try {
       return await sessionPromise;
@@ -1568,10 +1972,15 @@ export class PiBridge {
   private async getSession(projectPath: string, sessionId?: string): Promise<any> {
     const sessionDir = projectSessionDir(projectPath);
     const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
-    const cached = this.getCachedSession(this.runtimeSessions, cacheKey);
-    if (cached) return cached;
+    const cachedPromise = this.getCachedSession(this.runtimeSessions, cacheKey);
+    if (cachedPromise) {
+      const session = await cachedPromise;
+      const cached = this.runtimeSessions.get(cacheKey);
+      if (session && typeof session === 'object' && cached?.promise === cachedPromise) this.runtimeSessionEntries.set(session, cached);
+      return session;
+    }
 
-    const sessionPromise = (async () => {
+    const sessionPromise = this.createSessionPromise(async () => {
       const sdk = await this.loadSdk();
       if (!sdk.createAgentSession) throw new Error('No supported pi SDK session factory found');
 
@@ -1582,10 +1991,13 @@ export class PiBridge {
 
       const result = await sdk.createAgentSession({ cwd: projectPath, sessionManager });
       return result.session ?? result;
-    })();
+    });
     this.setCachedSession(this.runtimeSessions, cacheKey, sessionPromise);
     try {
-      return await sessionPromise;
+      const session = await sessionPromise;
+      const cached = this.runtimeSessions.get(cacheKey);
+      if (session && typeof session === 'object' && cached?.promise === sessionPromise) this.runtimeSessionEntries.set(session, cached);
+      return session;
     } catch (error) {
       if (this.runtimeSessions.get(cacheKey)?.promise === sessionPromise) this.runtimeSessions.delete(cacheKey);
       throw error;
@@ -1788,7 +2200,7 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
   app.post<{ Params: { projectId: string }; Body: { sessionId?: string } }>('/api/projects/:projectId/agent/abort', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
-      await bridge.abort(project.path, request.body?.sessionId);
+      await bridge.abort(project.path, request.body?.sessionId, streamKey(project.id, request.body?.sessionId));
       return { ok: true };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Abort failed' });

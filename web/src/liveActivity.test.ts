@@ -28,6 +28,18 @@ describe('live agent activity', () => {
     assert.equal(shouldUseOptimizedStreamingRender(completed, false), false);
   });
 
+  test('shows a recoverable crash error and clears the running state', () => {
+    const active = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    const recovered = reduceAgentActivityEvent(active, {
+      type: 'agent:error',
+      message: 'Agent stopped responding or crashed. Its session runtime was reset. You can retry or continue.',
+    });
+
+    assert.equal(recovered.running, false);
+    assert.equal(recovered.streaming, false);
+    assert.match(recovered.error ?? '', /retry or continue/i);
+  });
+
   test('keeps terminal text after a tool in its original output position', () => {
     let activity: AgentActivity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
     activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Before tool. ', contentIndex: 0 }));
