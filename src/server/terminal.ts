@@ -1,14 +1,12 @@
 import type { FastifyInstance } from 'fastify';
-import { exec } from 'node:child_process';
+import { exec, execFileSync, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
-import { promisify } from 'node:util';
 import * as pty from 'node-pty';
 import { clearProjectFileCaches } from './files.js';
 import type { ProjectRegistry } from './projects.js';
 import { resolveWithin } from './util.js';
 
-const execAsync = promisify(exec);
 const MAX_COMMAND_LENGTH = 4000;
 const MAX_TERMINAL_INPUT_LENGTH = 64 * 1024;
 const MAX_TERMINAL_REPLAY_LENGTH = 1024 * 1024;
@@ -63,14 +61,40 @@ type TerminalSession = {
   exitDisposable?: Disposable;
 };
 
-export async function registerTerminalRoutes(app: FastifyInstance, registry: ProjectRegistry) {
+export async function registerTerminalRoutes(app: FastifyInstance, registry: ProjectRegistry, options: { isClosing?: () => boolean } = {}) {
   const terminalSessions = new Map<string, TerminalSession>();
+  const commandChildren = new Set<ChildProcess>();
+  const commandProcessSessions = new Set<number>();
+  let closing = false;
+  const commandGroupSweepTimer = process.platform === 'win32' ? undefined : setInterval(() => {
+    for (const sessionId of commandProcessSessions) {
+      if (!processGroupExists(sessionId) && !processGroupsForSessions([sessionId]).length) commandProcessSessions.delete(sessionId);
+    }
+  }, 1_000);
+  commandGroupSweepTimer?.unref();
 
-  app.addHook('onClose', async () => {
+  app.addHook('preClose', async () => {
+    closing = true;
+    const terminalProcessSessions = process.platform === 'win32'
+      ? []
+      : [...terminalSessions.values()].map((session) => session.terminal.pid).filter((pid) => pid > 0);
+    const processSessionIds = [...new Set([...commandProcessSessions, ...terminalProcessSessions])];
+    const processGroupIds = [...new Set([...processSessionIds, ...processGroupsForSessions(processSessionIds)])];
     for (const session of terminalSessions.values()) disposeTerminalSession(terminalSessions, session, true);
+    if (commandGroupSweepTimer) clearInterval(commandGroupSweepTimer);
+    for (const processGroupId of processGroupIds) signalProcessGroup(processGroupId, 'SIGTERM');
+    for (const child of commandChildren) if (process.platform === 'win32') signalCommandChild(child, 'SIGTERM');
+    await waitForCommandProcesses(processGroupIds, commandChildren, 1_000);
+    const remainingProcessGroupIds = [...new Set([...processGroupIds, ...processGroupsForSessions(processSessionIds)])];
+    for (const processGroupId of remainingProcessGroupIds) if (processGroupExists(processGroupId)) signalProcessGroup(processGroupId, 'SIGKILL');
+    for (const child of commandChildren) if (process.platform === 'win32') signalCommandChild(child, 'SIGKILL');
+    await waitForCommandProcesses(remainingProcessGroupIds, commandChildren, 250);
+    commandProcessSessions.clear();
+    commandChildren.clear();
   });
 
   app.post<{ Params: { projectId: string }; Body: { command?: string; cwd?: string } }>('/api/projects/:projectId/terminal', async (request, reply) => {
+    if (closing || options.isClosing?.()) return reply.code(503).send({ error: 'pi-web is shutting down.' });
     const command = request.body?.command?.trim();
     if (!command) return reply.code(400).send({ error: 'Missing command' });
     if (command.length > MAX_COMMAND_LENGTH) return reply.code(400).send({ error: 'Command is too long' });
@@ -84,10 +108,11 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
         timeout: 120_000,
         maxBuffer: 8 * 1024 * 1024,
         env: process.env,
+        detached: process.platform !== 'win32',
       };
 
       try {
-        const { stdout, stderr } = await execAsync(command, options);
+        const { stdout, stderr } = await executeTrackedCommand(commandChildren, commandProcessSessions, command, options);
         return { stdout, stderr, exitCode: 0, cwd };
       } catch (error) {
         const failed = error as Error & { stdout?: string; stderr?: string; code?: number | string; signal?: string };
@@ -108,6 +133,11 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
 
   app.get<{ Params: { projectId: string }; Querystring: { projectPath?: string; cwd?: string; cols?: string; rows?: string; terminalId?: string } }>('/ws/projects/:projectId/terminal', { websocket: true }, (connection: any, request) => {
     const socket: WebSocket = connection.socket ?? connection;
+    if (closing || options.isClosing?.()) {
+      sendTerminalMessage(socket, { type: 'error', message: 'pi-web is shutting down.' });
+      socket.close();
+      return;
+    }
 
     try {
       const project = registry.getOrAdd(request.params.projectId, request.query.projectPath, { hidden: true });
@@ -321,11 +351,78 @@ function disposeTerminalSession(sessions: Map<string, TerminalSession>, session:
   session.exitDisposable = undefined;
   sessions.delete(session.key);
   if (!kill) return;
+  if (process.platform !== 'win32' && session.terminal.pid > 0) signalProcessGroup(session.terminal.pid, 'SIGTERM');
   try {
     session.terminal.kill();
   } catch {
     // The process may already be gone.
   }
+}
+
+function signalCommandChild(child: ChildProcess, signal: NodeJS.Signals) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch {
+    try { child.kill(signal); } catch { /* Child already exited. */ }
+  }
+}
+
+export function processGroupsForSessions(sessionIds: number[]) {
+  if (process.platform === 'win32' || !sessionIds.length) return [];
+  const targets = new Set(sessionIds);
+  try {
+    const output = execFileSync('ps', ['-eo', 'pgid=,sid='], { encoding: 'utf8', timeout: 1_000 });
+    const processGroups = new Set<number>();
+    for (const line of output.split('\n')) {
+      const [processGroupId, sessionId] = line.trim().split(/\s+/).map(Number);
+      if (processGroupId > 0 && targets.has(sessionId)) processGroups.add(processGroupId);
+    }
+    return [...processGroups];
+  } catch {
+    return [];
+  }
+}
+
+export function processGroupExists(processGroupId: number) {
+  if (process.platform === 'win32') return false;
+  try {
+    process.kill(-processGroupId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+export function signalProcessGroup(processGroupId: number, signal: NodeJS.Signals) {
+  if (process.platform === 'win32') return;
+  try { process.kill(-processGroupId, signal); } catch { /* The process group may already be gone. */ }
+}
+
+async function waitForCommandProcesses(processGroupIds: number[], children: Set<ChildProcess>, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const groupsRunning = processGroupIds.some(processGroupExists);
+    const childrenRunning = process.platform === 'win32' && [...children].some((child) => child.exitCode === null && child.signalCode === null);
+    if (!groupsRunning && !childrenRunning) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function executeTrackedCommand(children: Set<ChildProcess>, processSessions: Set<number>, command: string, options: Parameters<typeof exec>[1]) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = exec(command, options, (error, stdout, stderr) => {
+      children.delete(child);
+      if (error) {
+        Object.assign(error, { stdout: String(stdout), stderr: String(stderr) });
+        reject(error);
+      } else resolve({ stdout: String(stdout), stderr: String(stderr) });
+    });
+    children.add(child);
+    if (process.platform !== 'win32' && child.pid) processSessions.add(child.pid);
+    child.once('exit', () => children.delete(child));
+  });
 }
 
 function resolveShell() {

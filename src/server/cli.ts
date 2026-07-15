@@ -16,6 +16,36 @@ const dev = Boolean(args.dev) || process.env.NODE_ENV === 'development';
 try {
   const logMode = resolveLogMode(args);
   const app = await buildApp({ host, port, password, workspace, expose, dev, logMode, basePath });
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const configuredTimeout = Number(process.env.PI_WEB_SHUTDOWN_TIMEOUT_MS);
+    const resourceTimeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 10_000;
+    const timeoutMs = resourceTimeoutMs + 4_000;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const closed = await Promise.race([
+        app.close().then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+          timer.unref();
+        }),
+      ]);
+      if (!closed) {
+        console.error(`Timed out shutting down after ${signal}`);
+        process.exit(1);
+      }
+      process.exitCode = 0;
+    } catch (error) {
+      console.error(`Could not shut down after ${signal}:`, error);
+      process.exit(1);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
   await app.listen({ host, port });
 
   const urls = new Set<string>();

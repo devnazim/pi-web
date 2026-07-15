@@ -26,6 +26,13 @@ export async function buildApp(options: ServerOptions) {
   });
   const registry = new ProjectRegistry(options.workspace);
   const bridge = new PiBridge();
+  let closing = false;
+  let bridgeDisposal: Promise<void> | undefined;
+  app.addHook('preClose', async () => {
+    closing = true;
+    const configuredTimeout = Number(process.env.PI_WEB_SHUTDOWN_TIMEOUT_MS);
+    bridgeDisposal = bridge.dispose({ timeoutMs: Number.isFinite(configuredTimeout) && configuredTimeout > 0 ? configuredTimeout : 10_000 });
+  });
 
   await app.register(websocket);
 
@@ -37,7 +44,7 @@ export async function buildApp(options: ServerOptions) {
   await registerSettingsRoutes(app, registry);
   await registerFileRoutes(app, registry);
   await registerGitRoutes(app, registry);
-  await registerTerminalRoutes(app, registry);
+  await registerTerminalRoutes(app, registry, { isClosing: () => closing });
   await registerPiRoutes(app, registry, bridge);
 
   if (!options.dev) {
@@ -64,6 +71,9 @@ export async function buildApp(options: ServerOptions) {
     }
   }
 
+  app.addHook('preClose', async () => {
+    await bridgeDisposal;
+  });
   return app;
 }
 

@@ -125,7 +125,15 @@ type AgentStatus = {
 type CachedSession = { promise: Promise<unknown>; expiresAt: number; timer?: NodeJS.Timeout };
 type RuntimeSessionLock = { release: () => void; wasActive: boolean };
 type RuntimeOperation = { session?: object; recover: (message: string) => boolean };
-type RuntimeWatchOptions = { session: object; accepted: () => boolean; settled: () => boolean; acceptedIsActivity?: boolean; requireSettled?: boolean };
+type RuntimeWatchOptions = {
+  session: object;
+  accepted: () => boolean;
+  settled: () => boolean;
+  progress?: () => number;
+  terminalError?: () => string | undefined;
+  acceptedIsActivity?: boolean;
+  requireSettled?: boolean;
+};
 type RuntimeSetupSupervisor = {
   operation: RuntimeOperation;
   wait: <T>(task: Promise<T>) => Promise<T>;
@@ -138,6 +146,7 @@ type PiBridgeOptions = {
   runtimeSettledGraceMs?: number;
   runtimeIdleGraceMs?: number;
   runtimeWatchIntervalMs?: number;
+  runtimeNoProgressTimeoutMs?: number;
   abortGraceMs?: number;
   sessionCreateTimeoutMs?: number;
 };
@@ -158,6 +167,7 @@ const SESSION_CREATE_TIMEOUT_MS = 60_000;
 const RUNTIME_SETTLED_GRACE_MS = 2_000;
 const RUNTIME_IDLE_GRACE_MS = 30_000;
 const RUNTIME_WATCH_INTERVAL_MS = 250;
+const RUNTIME_NO_PROGRESS_TIMEOUT_MS = 5 * 60_000;
 const ABORT_GRACE_MS = 5_000;
 const EXTENSION_COMMAND_BUSY_DELAY_MS = 300;
 const IMAGE_TYPE_SNIFF_BYTES = 4100;
@@ -194,13 +204,19 @@ export class PiBridge {
   private readonly runtimeSettledGraceMs: number;
   private readonly runtimeIdleGraceMs: number;
   private readonly runtimeWatchIntervalMs: number;
+  private readonly runtimeNoProgressTimeoutMs: number;
   private readonly abortGraceMs: number;
   private readonly sessionCreateTimeoutMs: number;
+  private closing = false;
+  private disposePromise?: Promise<void>;
 
   constructor(options: PiBridgeOptions = {}) {
     this.runtimeSettledGraceMs = options.runtimeSettledGraceMs ?? RUNTIME_SETTLED_GRACE_MS;
     this.runtimeIdleGraceMs = options.runtimeIdleGraceMs ?? RUNTIME_IDLE_GRACE_MS;
     this.runtimeWatchIntervalMs = options.runtimeWatchIntervalMs ?? RUNTIME_WATCH_INTERVAL_MS;
+    const configuredNoProgressTimeout = Number(process.env.PI_WEB_AGENT_NO_PROGRESS_TIMEOUT_MS);
+    this.runtimeNoProgressTimeoutMs = options.runtimeNoProgressTimeoutMs
+      ?? (Number.isFinite(configuredNoProgressTimeout) && configuredNoProgressTimeout > 0 ? configuredNoProgressTimeout : RUNTIME_NO_PROGRESS_TIMEOUT_MS);
     this.abortGraceMs = options.abortGraceMs ?? ABORT_GRACE_MS;
     this.sessionCreateTimeoutMs = options.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
   }
@@ -209,7 +225,47 @@ export class PiBridge {
     return import('@earendil-works/pi-coding-agent') as Promise<Record<string, any>>;
   }
 
+  async dispose(options: { timeoutMs?: number } = {}) {
+    if (this.disposePromise) return this.disposePromise;
+    this.closing = true;
+    const cachedEntries = new Set([...this.runtimeSessions.values(), ...this.commandSessions.values()]);
+    this.runtimeSessions.clear();
+    this.commandSessions.clear();
+    for (const entry of cachedEntries) if (entry.timer) clearTimeout(entry.timer);
+    for (const operations of this.runtimeOperations.values()) {
+      for (const operation of [...operations]) operation.recover('pi-web is shutting down.');
+    }
+    for (const pending of [...this.pendingExtensionUiRequests.values()]) this.settleExtensionUiRequest(pending, { cancelled: true }, pending.defaultValue);
+    for (const sockets of [...this.sockets.values(), ...this.notificationSockets.values()]) {
+      for (const socket of sockets) {
+        try { socket.close?.(); } catch { /* Ignore shutdown races. */ }
+      }
+    }
+    this.sockets.clear();
+    this.notificationSockets.clear();
+
+    const disposal = Promise.allSettled([...cachedEntries].map(async (entry) => {
+      const session = await entry.promise.catch(() => undefined);
+      await this.disposeCachedSession(session);
+    })).then(() => undefined);
+    const timeoutMs = options.timeoutMs ?? 10_000;
+    this.disposePromise = timeoutMs > 0
+      ? Promise.race([
+          disposal,
+          new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, timeoutMs);
+            timer.unref();
+          }),
+        ])
+      : disposal;
+    return this.disposePromise;
+  }
+
   subscribe(key: string, socket: WebSocket) {
+    if (this.closing) {
+      try { socket.close?.(); } catch { /* Ignore shutdown races. */ }
+      return;
+    }
     const set = this.sockets.get(key) ?? new Set<WebSocket>();
     set.add(socket);
     this.sockets.set(key, set);
@@ -217,6 +273,10 @@ export class PiBridge {
   }
 
   subscribeNotifications(projectId: string, socket: WebSocket) {
+    if (this.closing) {
+      try { socket.close?.(); } catch { /* Ignore shutdown races. */ }
+      return;
+    }
     const set = this.notificationSockets.get(projectId) ?? new Set<WebSocket>();
     set.add(socket);
     this.notificationSockets.set(projectId, set);
@@ -355,6 +415,9 @@ export class PiBridge {
     let preflightReported = false;
     let preflightAccepted = false;
     let agentSettled = false;
+    let progressGeneration = 0;
+    let assistantError: string | undefined;
+    let terminalSdkError: string | undefined;
     let runtimeSession: object | undefined;
     let setupSupervisor: RuntimeSetupSupervisor | undefined;
     const clearCommandBusyTimer = () => {
@@ -425,7 +488,29 @@ export class PiBridge {
         mirrorLifecycle: extensionCommand,
         lifecycle,
         onActivityStart: extensionCommand ? ensureCommandBusyStarted : undefined,
-        onEvent: (type) => { if (type === 'agent_settled') agentSettled = true; },
+        onEvent: (event, type) => {
+          progressGeneration += 1;
+          if (type === 'message_end' && event && typeof event === 'object') {
+            const message = (event as { message?: unknown }).message;
+            if (message && typeof message === 'object' && (message as { role?: unknown }).role === 'assistant') {
+              assistantError = (message as { stopReason?: unknown }).stopReason === 'error'
+                ? String((message as { errorMessage?: unknown }).errorMessage || 'Agent failed')
+                : undefined;
+            }
+          }
+          if (type === 'compaction_end' && event && typeof event === 'object') {
+            const compactionEvent = event as { aborted?: unknown; willRetry?: unknown; errorMessage?: unknown };
+            if (compactionEvent.aborted !== true && typeof compactionEvent.errorMessage === 'string' && compactionEvent.errorMessage) terminalSdkError = compactionEvent.errorMessage;
+            else if (compactionEvent.aborted !== true && compactionEvent.willRetry === true) {
+              assistantError = undefined;
+              terminalSdkError = undefined;
+            }
+          }
+          if (type === 'agent_settled') {
+            agentSettled = true;
+            if (!terminalSdkError && assistantError) terminalSdkError = assistantError;
+          }
+        },
         syntheticStartActive: () => commandBusyStarted,
       });
       if (extensionCommand) {
@@ -462,6 +547,9 @@ export class PiBridge {
 
       const { prompt, images } = await setupSupervisor.wait(this.preparePromptAttachments(projectPath, body.prompt, body.attachments));
       agentSettled = false;
+      progressGeneration = 0;
+      assistantError = undefined;
+      terminalSdkError = undefined;
 
       if (typeof session?.prompt === 'function') {
         const promptTask = Promise.resolve().then(() => session.prompt(prompt, {
@@ -476,17 +564,29 @@ export class PiBridge {
           session,
           accepted: () => preflightAccepted,
           settled: () => agentSettled,
+          progress: () => progressGeneration,
+          terminalError: () => terminalSdkError,
           acceptedIsActivity: !extensionCommand,
           requireSettled: extensionCommand,
         });
+        if (terminalSdkError) {
+          const report = this.recoverRuntimeSession(projectPath, body.sessionId, session, terminalSdkError);
+          throw new AgentRuntimeRecoveryError(terminalSdkError, report);
+        }
         if (!extensionCommand) reportPreflight(true);
       } else if (typeof session?.followUp === 'function') {
         await setupSupervisor.watch(Promise.resolve().then(() => session.followUp(prompt, images.length ? images : undefined)), {
           session,
           accepted: () => true,
           settled: () => agentSettled,
+          progress: () => progressGeneration,
+          terminalError: () => terminalSdkError,
           acceptedIsActivity: true,
         });
+        if (terminalSdkError) {
+          const report = this.recoverRuntimeSession(projectPath, body.sessionId, session, terminalSdkError);
+          throw new AgentRuntimeRecoveryError(terminalSdkError, report);
+        }
         reportPreflight(true);
       } else {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
@@ -502,8 +602,14 @@ export class PiBridge {
           session,
           accepted: () => preflightAccepted,
           settled: () => agentSettled,
+          progress: () => progressGeneration,
+          terminalError: () => terminalSdkError,
           requireSettled: true,
         });
+        if (terminalSdkError) {
+          const report = this.recoverRuntimeSession(projectPath, body.sessionId, session, terminalSdkError);
+          throw new AgentRuntimeRecoveryError(terminalSdkError, report);
+        }
         reportPreflight(true);
       }
       subscription?.();
@@ -566,6 +672,7 @@ export class PiBridge {
     let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
     let agentSettled = false;
+    let progressGeneration = 0;
     let runtimeSession: object | undefined;
     let setupSupervisor: RuntimeSetupSupervisor | undefined;
     try {
@@ -583,7 +690,10 @@ export class PiBridge {
       this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
       await setupSupervisor.wait(this.bindWebExtensions(session, projectPath, body.sessionId, key));
       subscription = this.subscribeSessionEvents(session, key, body.sessionId, {
-        onEvent: (type) => { if (type === 'agent_settled') agentSettled = true; },
+        onEvent: (_event, type) => {
+          progressGeneration += 1;
+          if (type === 'agent_settled') agentSettled = true;
+        },
       });
       if (typeof session?.navigateTree !== 'function') throw new Error('Loaded pi SDK session does not expose navigateTree()');
       const result = await setupSupervisor.watch(Promise.resolve().then(() => session.navigateTree(body.targetId, {
@@ -594,6 +704,7 @@ export class PiBridge {
         session,
         accepted: () => true,
         settled: () => agentSettled,
+        progress: () => progressGeneration,
         acceptedIsActivity: true,
       });
       if (result?.cancelled) throw new Error(result.aborted ? 'Tree navigation aborted' : 'Tree navigation cancelled');
@@ -727,6 +838,9 @@ export class PiBridge {
     let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
     let agentSettled = false;
+    let progressGeneration = 0;
+    let compactionAborted = false;
+    let terminalSdkError: string | undefined;
     let runtimeSession: object | undefined;
     let setupSupervisor: RuntimeSetupSupervisor | undefined;
     try {
@@ -743,21 +857,38 @@ export class PiBridge {
       await setupSupervisor.wait(this.bindWebExtensions(session, projectPath, body.sessionId, key));
       this.broadcast(key, { type: 'agent:start', sessionId: body.sessionId });
       subscription = this.subscribeSessionEvents(session, key, body.sessionId, {
-        onEvent: (type) => { if (type === 'agent_settled') agentSettled = true; },
+        onEvent: (event, type) => {
+          progressGeneration += 1;
+          if (type === 'compaction_end' && event && typeof event === 'object') {
+            const compactionEvent = event as { aborted?: unknown; errorMessage?: unknown };
+            compactionAborted = compactionEvent.aborted === true;
+            if (!compactionAborted && typeof compactionEvent.errorMessage === 'string' && compactionEvent.errorMessage) terminalSdkError = compactionEvent.errorMessage;
+          }
+          if (type === 'agent_settled') agentSettled = true;
+        },
       });
       const result = await setupSupervisor.watch(Promise.resolve().then(() => session.compact(body.instructions?.trim() || undefined)), {
         session,
         accepted: () => true,
         settled: () => agentSettled,
+        progress: () => progressGeneration,
+        terminalError: () => terminalSdkError,
         acceptedIsActivity: true,
       });
+      if (terminalSdkError) {
+        const report = this.recoverRuntimeSession(projectPath, body.sessionId, session, terminalSdkError);
+        throw new AgentRuntimeRecoveryError(terminalSdkError, report);
+      }
       subscription?.();
       this.broadcast(key, { type: 'agent:finish', sessionId: body.sessionId });
       return result;
     } catch (error) {
       subscription?.();
-      if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
-      this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message: error instanceof Error ? error.message : 'Compaction failed' });
+      const message = error instanceof Error ? error.message : 'Compaction failed';
+      const report = error instanceof AgentRuntimeRecoveryError
+        ? error.report
+        : runtimeSession && !compactionAborted ? this.recoverRuntimeSession(projectPath, body.sessionId, runtimeSession, message) : true;
+      if (report) this.broadcast(key, { type: 'agent:error', sessionId: body.sessionId, message });
       throw error;
     } finally {
       setupSupervisor?.release();
@@ -773,6 +904,7 @@ export class PiBridge {
     if (!command) throw new Error('Missing command');
     let markSessionIdle: () => void = () => undefined;
     let releaseStreamKeyLock: (() => void) | undefined;
+    let progressGeneration = 0;
     let runtimeSession: object | undefined;
     let setupSupervisor: RuntimeSetupSupervisor | undefined;
 
@@ -796,6 +928,7 @@ export class PiBridge {
         const eventResult = typeof session?.extensionRunner?.emitUserBash === 'function'
           ? await session.extensionRunner.emitUserBash({ type: 'user_bash', command, excludeFromContext, cwd: projectPath })
           : undefined;
+        progressGeneration += 1;
         if (this.sessionCannotPublish(session)) throw new AgentRuntimeRecoveryError(AGENT_ABORT_RECOVERY_MESSAGE, false);
         if (eventResult?.result) {
           if (eventResult.result.output && !this.sessionCannotPublish(session)) this.broadcast(key, { type: 'bash:update', sessionId: body.sessionId, message: eventResult.result.output });
@@ -804,6 +937,7 @@ export class PiBridge {
         }
         bashAccepted = true;
         return session.executeBash(command, (chunk: string) => {
+          progressGeneration += 1;
           if (!this.sessionCannotPublish(session)) this.broadcast(key, { type: 'bash:update', sessionId: body.sessionId, message: chunk });
         }, { excludeFromContext, operations: eventResult?.operations });
       })(), {
@@ -813,6 +947,7 @@ export class PiBridge {
           return bashAccepted;
         },
         settled: () => false,
+        progress: () => progressGeneration,
         acceptedIsActivity: true,
       });
       if (!this.sessionCannotPublish(session)) this.broadcast(key, { type: 'bash:finish', sessionId: body.sessionId, message: command, data: result });
@@ -913,12 +1048,12 @@ export class PiBridge {
     return pending.request;
   }
 
-  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void; onEvent?: (type: string | undefined) => void; syntheticStartActive?: () => boolean } = {}) {
+  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void; onEvent?: (event: unknown, type: string | undefined) => void; syntheticStartActive?: () => boolean } = {}) {
     if (typeof session?.subscribe !== 'function') return undefined;
     return session.subscribe((event: unknown) => {
       if (session && typeof session === 'object' && this.sessionCannotPublish(session)) return;
       const type = agentEventType(event);
-      options.onEvent?.(type);
+      options.onEvent?.(event, type);
       if (options.mirrorLifecycle && isCommandActivityStartEvent(type) && !options.lifecycle?.started) {
         if (options.lifecycle) options.lifecycle.started = true;
         options.onActivityStart?.();
@@ -989,21 +1124,37 @@ export class PiBridge {
     const watch = async <T>(task: Promise<T>, options: RuntimeWatchOptions) => {
       let taskFinished = false;
       let sawActivity = false;
-      let idleSince: number | undefined;
+      let eligibleSince: number | undefined;
+      let lastProgress = options.progress?.() ?? 0;
+      let lastProgressAt = Date.now();
       let timer: NodeJS.Timeout | undefined;
       const check = () => {
         if (closed || taskFinished) return;
+        const now = Date.now();
+        const progress = options.progress?.() ?? 0;
+        if (progress !== lastProgress) {
+          lastProgress = progress;
+          lastProgressAt = now;
+        }
         const settled = options.settled();
+        const terminalError = options.terminalError?.();
         const hasUiRequest = [...this.pendingExtensionUiRequests.values()].some((item) => item.session === options.session && item.projectPath === projectPath && item.request.sessionId === sessionId);
-        const inUse = settled ? this.cachedSessionHasSdkActivity(options.session) : this.cachedSessionInUse(options.session);
+        const inUse = this.cachedSessionInUse(options.session);
         if (inUse) sawActivity = true;
-        if (!options.accepted() || (!settled && !sawActivity && !options.acceptedIsActivity) || (options.requireSettled && !settled) || hasUiRequest || inUse) {
-          idleSince = undefined;
+        const eligible = options.accepted()
+          && (settled || sawActivity || options.acceptedIsActivity)
+          && (inUse || !options.requireSettled || settled || Boolean(terminalError))
+          && !hasUiRequest;
+        if (!eligible) {
+          eligibleSince = undefined;
+          lastProgressAt = now;
         } else {
-          idleSince ??= Date.now();
-          const grace = settled ? this.runtimeSettledGraceMs : this.runtimeIdleGraceMs;
-          if (Date.now() - idleSince >= grace) {
-            operation.recover(AGENT_RUNTIME_RECOVERY_MESSAGE);
+          eligibleSince ??= now;
+          const timeout = terminalError || settled
+            ? this.runtimeSettledGraceMs
+            : inUse ? this.runtimeNoProgressTimeoutMs : this.runtimeIdleGraceMs;
+          if (now - Math.max(eligibleSince, lastProgressAt) >= timeout) {
+            operation.recover(terminalError ?? AGENT_RUNTIME_RECOVERY_MESSAGE);
             return;
           }
         }
@@ -1373,7 +1524,7 @@ export class PiBridge {
   }
 
   private sessionCannotPublish(session: object) {
-    return this.recoveringSessions.has(session) || this.sessionDisposals.has(session);
+    return this.closing || this.recoveringSessions.has(session) || this.sessionDisposals.has(session);
   }
 
   private setExtensionStatus(session: object, key: string, text: unknown, sessionId?: string) {
@@ -1778,6 +1929,7 @@ export class PiBridge {
   }
 
   private async markSessionActiveWithState(projectPath: string, sessionId?: string): Promise<RuntimeSessionLock> {
+    if (this.closing) throw new Error('pi-web is shutting down.');
     const operationKey = this.runtimeSessionCacheKey(projectPath, sessionId);
     if (this.abortingRuntimeSessions.has(operationKey)) throw new Error('Session is stopping. Wait for abort to finish.');
     if (!sessionId) return { release: () => undefined, wasActive: false };
@@ -1950,6 +2102,7 @@ export class PiBridge {
   }
 
   private async getCommandSession(projectPath: string, sessionId?: string): Promise<any> {
+    if (this.closing) throw new Error('pi-web is shutting down.');
     if (sessionId) return this.getSession(projectPath, sessionId);
     const cached = this.getCachedSession(this.commandSessions, projectPath);
     if (cached) return cached;
@@ -1970,6 +2123,7 @@ export class PiBridge {
   }
 
   private async getSession(projectPath: string, sessionId?: string): Promise<any> {
+    if (this.closing) throw new Error('pi-web is shutting down.');
     const sessionDir = projectSessionDir(projectPath);
     const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
     const cachedPromise = this.getCachedSession(this.runtimeSessions, cacheKey);

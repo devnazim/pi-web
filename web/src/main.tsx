@@ -86,6 +86,7 @@ import {
   type UploadAsset,
 } from './composerHistory';
 import { appUrl, appWebSocketUrl } from './appUrl';
+import { StaleAgentStatusError, isCurrentAgentStatusTarget, shouldRetryAgentRefresh, shouldSuppressAgentUiRequests, withRequestTimeout } from './agentRefresh';
 import {
   appendLiveActivityDelta,
   appendLivePreviewText,
@@ -168,6 +169,7 @@ type AgentStatusInfo = {
   context?: { tokens: number | null; contextWindow: number; percent: number | null; autoCompact: boolean };
   statuses: Array<{ key: string; text: string }>;
 };
+type BeginAgentStatusRequest = (projectId: string, sessionId: string, ownsUnselectedSession?: () => boolean, localOperationIsCurrent?: () => boolean) => (status: AgentStatusInfo) => boolean;
 type ExtensionUiRequestMethod = 'select' | 'confirm' | 'input' | 'editor';
 type ExtensionUiRequest = { id: string; sessionId?: string; method: ExtensionUiRequestMethod; title: string; message?: string; options?: string[]; placeholder?: string; prefill?: string; timeout?: number; createdAt: number };
 type ExtensionUiReply = { value?: string; confirmed?: boolean; cancelled?: boolean; sessionId?: string };
@@ -290,6 +292,7 @@ const WEBSOCKET_RECONNECT_MIN_DELAY_MS = 500;
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
 const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
+const AGENT_REFRESH_TIMEOUT_MS = 10_000;
 const AGENT_SOCKET_EVENT_BATCH_BUDGET_MS = 8;
 const AGENT_SOCKET_EVENT_BATCH_MAX = 100;
 const LIVE_ACTIVITY_PUBLISH_INTERVAL_MS = 80;
@@ -843,7 +846,9 @@ function Shell() {
   let liveActivityPublishFrame: number | undefined;
   let lastLiveActivityPublishAt = 0;
   let agentSocketEventGeneration = 0;
-  let agentStatusRefreshGeneration = 0;
+  let agentStatusRequestGeneration = 0;
+  let agentUiRefreshGeneration = 0;
+  const agentStatusReconciledGenerations = new Map<string, number>();
   let agentConnectionGeneration = 0;
 
   function queueStoredAgentEvent(payload: string) {
@@ -1046,6 +1051,47 @@ function Shell() {
     queryClient.setQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId], (current) => current
       ? { status: { ...current.status, running, recovery: running ? undefined : current.status.recovery } }
       : current);
+  }
+
+  function reconcileAuthoritativeAgentStatus(projectId: string, targetSessionId: string, receivedStatus: AgentStatusInfo) {
+    const status = receivedStatus.recovery ? { ...receivedStatus, running: false } : receivedStatus;
+    const statusKey = `${projectId}\u0000${targetSessionId}`;
+    agentStatusReconciledGenerations.set(statusKey, (agentStatusReconciledGenerations.get(statusKey) ?? 0) + 1);
+    queryClient.setQueryData(['agent-status', projectId, targetSessionId], { status });
+    updateWorkspaceNotifications(projectId, (state) => ({
+      ...state,
+      runningSessionIds: status.running
+        ? uniqueStrings([...state.runningSessionIds, targetSessionId])
+        : state.runningSessionIds.filter((id) => id !== targetSessionId),
+    }));
+    if (status.running) {
+      if (!liveAgentActivityValue.running) replaceLiveActivity({ ...emptyAgentActivity(), running: true });
+      return;
+    }
+    replaceLiveActivity(status.recovery
+      ? reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:error', message: status.recovery.message })
+      : emptyAgentActivity(), emptyBashActivity());
+    removeSessionExtensionUiRequests(targetSessionId);
+  }
+
+  function invalidateAgentStatusRequests() {
+    agentStatusRequestGeneration += 1;
+  }
+
+  function beginAgentStatusRequest(projectId: string, targetSessionId: string, ownsUnselectedSession?: () => boolean, localOperationIsCurrent?: () => boolean) {
+    const socketGeneration = agentSocketEventGeneration;
+    const connectionGeneration = agentConnectionGeneration;
+    const requestGeneration = ++agentStatusRequestGeneration;
+    return (status: AgentStatusInfo) => {
+      if (
+        !isCurrentAgentStatusTarget(projectId, targetSessionId, workspaceProject()?.id, activeSessionId(), Boolean(ownsUnselectedSession?.()), localOperationIsCurrent?.() ?? true)
+        || socketGeneration !== agentSocketEventGeneration
+        || connectionGeneration !== agentConnectionGeneration
+        || requestGeneration !== agentStatusRequestGeneration
+      ) return false;
+      reconcileAuthoritativeAgentStatus(projectId, targetSessionId, status);
+      return true;
+    };
   }
 
   function updateWorkspaceNotifications(workspaceId: string, updater: (state: WorkspaceNotificationState) => WorkspaceNotificationState) {
@@ -1637,14 +1683,14 @@ function Shell() {
       queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
       if (!currentActiveSessionId) {
         const socketGeneration = agentSocketEventGeneration;
-        const refreshGeneration = ++agentStatusRefreshGeneration;
-        void api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests`)
+        const refreshGeneration = ++agentUiRefreshGeneration;
+        void apiAgentRefresh<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests`)
           .then(({ requests }) => {
             if (
               workspaceProject()?.id === project.id
               && activeSessionId() === undefined
               && socketGeneration === agentSocketEventGeneration
-              && refreshGeneration === agentStatusRefreshGeneration
+              && refreshGeneration === agentUiRefreshGeneration
               && connectionGeneration === agentConnectionGeneration
             ) replaceAllExtensionUiRequests(requests);
           })
@@ -1655,48 +1701,38 @@ function Shell() {
       queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
       queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, currentActiveSessionId] });
       const statusEventGeneration = agentSocketEventGeneration;
-      const statusRefreshGeneration = ++agentStatusRefreshGeneration;
-      void Promise.allSettled([
-        api<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`),
-        api<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests?sessionId=${encodeURIComponent(currentActiveSessionId)}`),
-      ]).then(([statusResult, requestsResult]) => {
-        if (
-          workspaceProject()?.id !== project.id
-          || activeSessionId() !== currentActiveSessionId
-          || statusEventGeneration !== agentSocketEventGeneration
-          || statusRefreshGeneration !== agentStatusRefreshGeneration
-          || connectionGeneration !== agentConnectionGeneration
-        ) return;
+      const statusRequestGeneration = ++agentStatusRequestGeneration;
+      void apiAgentRefresh<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
+        .then(({ status }) => {
+          if (
+            workspaceProject()?.id === project.id
+            && activeSessionId() === currentActiveSessionId
+            && statusEventGeneration === agentSocketEventGeneration
+            && statusRequestGeneration === agentStatusRequestGeneration
+            && connectionGeneration === agentConnectionGeneration
+          ) reconcileAuthoritativeAgentStatus(project.id, currentActiveSessionId, status);
+        })
+        .catch((error) => console.warn('Could not refresh agent status', error));
 
-        const status = statusResult.status === 'fulfilled' ? statusResult.value.status : undefined;
-        if (status) {
-          queryClient.setQueryData(['agent-status', project.id, currentActiveSessionId], { status });
-          updateWorkspaceNotifications(project.id, (state) => ({
-            ...state,
-            runningSessionIds: status.running
-              ? uniqueStrings([...state.runningSessionIds, currentActiveSessionId])
-              : state.runningSessionIds.filter((id) => id !== currentActiveSessionId),
-          }));
-          if (status.running) {
-            if (!liveAgentActivityValue.running) replaceLiveActivity({ ...emptyAgentActivity(), running: true });
-          } else {
-            replaceLiveActivity(status.recovery
-              ? reduceAgentActivityEvent(liveAgentActivityValue, { type: 'agent:error', message: status.recovery.message })
-              : emptyAgentActivity(), emptyBashActivity());
-            removeSessionExtensionUiRequests(currentActiveSessionId);
-          }
-        } else if (statusResult.status === 'rejected') {
-          console.warn('Could not refresh agent status', statusResult.reason);
-        }
-
-        if (requestsResult.status === 'rejected') {
-          console.warn('Could not load extension UI requests', requestsResult.reason);
-        } else if (status?.recovery) {
-          removeSessionExtensionUiRequests(currentActiveSessionId);
-        } else {
-          replaceSessionExtensionUiRequests(currentActiveSessionId, requestsResult.value.requests);
-        }
-      });
+      const uiEventGeneration = agentSocketEventGeneration;
+      const uiRefreshGeneration = ++agentUiRefreshGeneration;
+      const statusKey = `${project.id}\u0000${currentActiveSessionId}`;
+      const statusGeneration = agentStatusReconciledGenerations.get(statusKey) ?? 0;
+      void apiAgentRefresh<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
+        .then(({ requests }) => {
+          if (
+            workspaceProject()?.id !== project.id
+            || activeSessionId() !== currentActiveSessionId
+            || uiEventGeneration !== agentSocketEventGeneration
+            || uiRefreshGeneration !== agentUiRefreshGeneration
+            || connectionGeneration !== agentConnectionGeneration
+          ) return;
+          const currentStatusGeneration = agentStatusReconciledGenerations.get(statusKey) ?? 0;
+          const status = queryClient.getQueryData<{ status: AgentStatusInfo }>(['agent-status', project.id, currentActiveSessionId])?.status;
+          if (shouldSuppressAgentUiRequests(statusGeneration, currentStatusGeneration, status)) removeSessionExtensionUiRequests(currentActiveSessionId);
+          else replaceSessionExtensionUiRequests(currentActiveSessionId, requests);
+        })
+        .catch((error) => console.warn('Could not load extension UI requests', error));
     };
     let pendingAgentSocketPayloads: string[] = [];
     let pendingAgentSocketOffset = 0;
@@ -2316,7 +2352,7 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} beginAgentStatusRequest={beginAgentStatusRequest} invalidateAgentStatusRequests={invalidateAgentStatusRequests} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -4796,7 +4832,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -4935,14 +4971,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
                     class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
                     style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
                   >
-                    <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
+                    <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                     <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
                 <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} onTreeSelection={setTreeSelection} />
+                  <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
                   <div
                     class="terminal-resize-handle"
                     role="separator"
@@ -4974,7 +5010,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
   );
 }
 
-function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
@@ -4986,6 +5022,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let activeComposerDraftTreeSelection: TreeSelection | undefined;
   let restoringComposerDraftTreeSelection: TreeSelection | undefined;
   let runningCommandToken: symbol | undefined;
+  let localCommandGeneration = 0;
   let pendingAgentSelectionApply: { sessionId: string; promise: Promise<void> } | undefined;
   let liveTurnActivityActive = false;
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
@@ -5166,11 +5203,35 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     const pollFast = liveBusy();
     return {
       queryKey: ['agent-status', props.project.id, sessionId ?? 'active'],
-      queryFn: ({ signal }) => api<{ status: AgentStatusInfo }>(`/api/projects/${props.project.id}/agent/status${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`, { signal }),
-      refetchInterval: (query) => pollFast || query.state.data?.status.running ? 1500 : 5000,
+      queryFn: async ({ signal }) => {
+        const localCommandGenerationAtRequest = localCommandGeneration;
+        const applyStatus = sessionId
+          ? props.beginAgentStatusRequest(
+              props.project.id,
+              sessionId,
+              () => commandSessionId() === sessionId,
+              () => localCommandGeneration === localCommandGenerationAtRequest,
+            )
+          : undefined;
+        const response = await apiWithTimeout<{ status: AgentStatusInfo }>(`/api/projects/${props.project.id}/agent/status${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`, { signal });
+        if (applyStatus && !applyStatus(response.status)) throw new StaleAgentStatusError('Agent status response was superseded');
+        return response;
+      },
+      retry: shouldRetryAgentRefresh,
+      refetchInterval: (query) => pollFast || (query.state.data?.status.running && !query.state.data.status.recovery) ? 1500 : 5000,
     };
   });
-  const busy = createMemo(() => liveBusy() || Boolean(agentStatus.data?.status.running));
+  const busy = createMemo(() => liveBusy() || Boolean(agentStatus.data?.status.running && !agentStatus.data.status.recovery));
+  createEffect(() => {
+    const status = agentStatus.data?.status;
+    if (!status || (status.running && !status.recovery)) return;
+    if (runningCommandToken) {
+      localCommandGeneration += 1;
+      props.invalidateAgentStatusRequests();
+    }
+    runningCommandToken = undefined;
+    setRunningCommand(undefined);
+  });
   const canSteerAgent = createMemo(() => liveActivity().streaming && !runningCommand() && !liveShellActivity().running && visibleExtensionUiRequests().length === 0);
   const voiceSupported = createMemo(() => Boolean(browserSpeechRecognitionConstructor()));
   const voiceButtonTitle = createMemo(() => {
@@ -5338,6 +5399,10 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setThinkingExplicit(hasStoredThinking || hasDraftThinking);
     setSessionControlsHydratedKey(undefined);
     setCommandSessionId(props.sessionId ? undefined : draft.commandSessionId);
+    if (runningCommandToken) {
+      localCommandGeneration += 1;
+      props.invalidateAgentStatusRequests();
+    }
     runningCommandToken = undefined;
     setRunningCommand(undefined);
     setStickToBottom(true);
@@ -6075,6 +6140,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   async function executeShellCommand(projectId: string, sessionId: string, command: { command: string; excludeFromContext: boolean }, mirrorActiveStream: boolean, reflectActivity: () => boolean) {
     const token = Symbol('running-command');
     if (reflectActivity()) {
+      localCommandGeneration += 1;
+      props.invalidateAgentStatusRequests();
       runningCommandToken = token;
       setRunningCommand(command.command);
     }
@@ -6090,6 +6157,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       await queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, sessionId] });
     } finally {
       if (reflectActivity() && runningCommandToken === token) {
+        localCommandGeneration += 1;
+        props.invalidateAgentStatusRequests();
         runningCommandToken = undefined;
         setRunningCommand(undefined);
       }
@@ -12056,6 +12125,19 @@ function isWebSocketPongMessage(data: unknown) {
     return parsed.type === 'pong';
   } catch {
     return false;
+  }
+}
+
+async function apiWithTimeout<T>(url: string, init: RequestInit = {}, timeoutMs = AGENT_REFRESH_TIMEOUT_MS): Promise<T> {
+  return withRequestTimeout((signal) => api<T>(url, { ...init, signal }), init.signal, timeoutMs);
+}
+
+async function apiAgentRefresh<T>(url: string, init: RequestInit = {}): Promise<T> {
+  try {
+    return await apiWithTimeout<T>(url, init);
+  } catch (error) {
+    if (!shouldRetryAgentRefresh(0, error)) throw error;
+    return apiWithTimeout<T>(url, init);
   }
 }
 

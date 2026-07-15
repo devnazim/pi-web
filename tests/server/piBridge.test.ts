@@ -89,6 +89,198 @@ test('does not recover a pending operation while the SDK reports it active', asy
   assert.equal(disposed, 0);
 });
 
+test('provider error followed by failed auto-compaction emits one terminal error', async () => {
+  const bridge = new PiBridge({ runtimeSettledGraceMs: 5, runtimeWatchIntervalMs: 1 });
+  const events: Array<{ type?: string; message?: string }> = [];
+  let listener: ((event: unknown) => void) | undefined;
+  let disposed = 0;
+  const session = {
+    isStreaming: false,
+    isCompacting: false,
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    prompt: async (_prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      listener?.({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'WebSocket error' } });
+      listener?.({ type: 'agent_end', willRetry: false });
+      listener?.({ type: 'compaction_start' });
+      listener?.({ type: 'compaction_end', aborted: false, willRetry: false, errorMessage: 'Auto-compaction failed: Summarization failed: WebSocket error' });
+      listener?.({ type: 'agent_settled' });
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = (_key: string, event: { type?: string; message?: string }) => { events.push(event); };
+
+  await assert.rejects(
+    bridge.prompt(process.cwd(), { sessionId: 'provider-error-session', prompt: 'test' }, 'project:provider-error-session'),
+    /Summarization failed: WebSocket error/i,
+  );
+
+  const terminalErrors = events.filter((event) => event.type === 'agent:error');
+  assert.equal(terminalErrors.length, 1);
+  assert.match(terminalErrors[0].message ?? '', /Summarization failed: WebSocket error/i);
+  assert.equal(events.some((event) => event.type === 'agent:finish'), false);
+  assert.equal(disposed, 1);
+});
+
+test('does not recover when successful compaction retries a provider error', async () => {
+  const bridge = new PiBridge({ runtimeSettledGraceMs: 5, runtimeWatchIntervalMs: 1 });
+  const events: Array<{ type?: string }> = [];
+  let listener: ((event: unknown) => void) | undefined;
+  let disposed = 0;
+  const session = {
+    isStreaming: false,
+    isCompacting: false,
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    prompt: async (_prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+      options.preflightResult?.(true);
+      listener?.({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'Context overflow' } });
+      listener?.({ type: 'agent_end', willRetry: false });
+      listener?.({ type: 'compaction_start' });
+      listener?.({ type: 'compaction_end', aborted: false, willRetry: true });
+      listener?.({ type: 'agent_start' });
+      listener?.({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [] } });
+      listener?.({ type: 'agent_end', willRetry: false });
+      listener?.({ type: 'agent_settled' });
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = (_key: string, event: { type?: string }) => { events.push(event); };
+
+  await bridge.prompt(process.cwd(), { sessionId: 'provider-retry-session', prompt: 'test' }, 'project:provider-retry-session');
+
+  assert.equal(events.some((event) => event.type === 'agent:error'), false);
+  assert.equal(disposed, 0);
+});
+
+test('recovers stale active flags after the no-progress timeout', async () => {
+  const bridge = new PiBridge({ runtimeNoProgressTimeoutMs: 5, runtimeWatchIntervalMs: 1 });
+  let disposed = 0;
+  const session = {
+    isStreaming: false,
+    prompt: (_prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+      session.isStreaming = true;
+      options.preflightResult?.(true);
+      return new Promise<void>(() => undefined);
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+
+  await assert.rejects(
+    bridge.prompt(process.cwd(), { sessionId: 'no-progress-session', prompt: 'test' }, 'project:no-progress-session'),
+    /stopped responding or crashed/i,
+  );
+  assert.equal(disposed, 1);
+});
+
+test('SDK events keep an active operation alive past the no-progress timeout', async () => {
+  const bridge = new PiBridge({ runtimeNoProgressTimeoutMs: 8, runtimeWatchIntervalMs: 1 });
+  let listener: ((event: unknown) => void) | undefined;
+  let finishPrompt: (() => void) | undefined;
+  let disposed = 0;
+  const session = {
+    isStreaming: false,
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    prompt: (_prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+      session.isStreaming = true;
+      options.preflightResult?.(true);
+      return new Promise<void>((resolve) => { finishPrompt = resolve; });
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+
+  const prompt = bridge.prompt(process.cwd(), { sessionId: 'progress-session', prompt: 'test' }, 'project:progress-session');
+  const progress = setInterval(() => listener?.({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: '.' } }), 2);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  clearInterval(progress);
+  assert.equal(disposed, 0);
+  session.isStreaming = false;
+  finishPrompt?.();
+  await prompt;
+  assert.equal(disposed, 0);
+});
+
+test('recovers an extension command whose active flags stop making progress', async () => {
+  const bridge = new PiBridge({ runtimeNoProgressTimeoutMs: 5, runtimeWatchIntervalMs: 1 });
+  let listener: ((event: unknown) => void) | undefined;
+  let disposed = 0;
+  const session = {
+    isStreaming: false,
+    extensionRunner: { getCommand: (name: string) => name === 'stuck' ? {} : undefined },
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    prompt: () => {
+      session.isStreaming = true;
+      listener?.({ type: 'agent_start' });
+      return new Promise<void>(() => undefined);
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+
+  await assert.rejects(
+    bridge.prompt(process.cwd(), { sessionId: 'extension-no-progress-session', prompt: '/stuck' }, 'project:extension-no-progress-session'),
+    /stopped responding or crashed/i,
+  );
+  assert.equal(disposed, 1);
+});
+
+test('recovers a terminal provider error from delayed extension-command activity', async () => {
+  const bridge = new PiBridge({ runtimeSettledGraceMs: 1_000, runtimeWatchIntervalMs: 1 });
+  const events: Array<{ type?: string }> = [];
+  let listener: ((event: unknown) => void) | undefined;
+  let disposed = 0;
+  const session = {
+    isStreaming: false,
+    extensionRunner: { getCommand: (name: string) => name === 'delayed' ? {} : undefined },
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    prompt: async () => {
+      session.isStreaming = true;
+      listener?.({ type: 'agent_start' });
+      setTimeout(() => {
+        listener?.({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'Delayed provider failure' } });
+        listener?.({ type: 'agent_end', willRetry: false });
+        listener?.({ type: 'agent_settled' });
+        session.isStreaming = false;
+      }, 1);
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = (_key: string, event: { type?: string }) => { events.push(event); };
+
+  await assert.rejects(
+    bridge.prompt(process.cwd(), { sessionId: 'delayed-extension-session', prompt: '/delayed' }, 'project:delayed-extension-session'),
+    /Delayed provider failure/i,
+  );
+
+  assert.equal(events.filter((event) => event.type === 'agent:error').length, 1);
+  assert.equal(disposed, 1);
+});
+
 test('reports queued prompt recovery as a terminal error', async () => {
   const bridge = new PiBridge({ runtimeIdleGraceMs: 5, runtimeWatchIntervalMs: 1 });
   const events: Array<{ type?: string; message?: string }> = [];
@@ -494,6 +686,83 @@ test('bounds session creation and disposes a late runtime', async () => {
   finishCreation?.({ session: { dispose: () => { disposed += 1; } } });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(disposed, 1);
+});
+
+test('rejected manual compaction recovers its cached runtime once', async () => {
+  const bridge = new PiBridge();
+  const events: Array<{ type?: string }> = [];
+  let listener: ((event: unknown) => void) | undefined;
+  let disposed = 0;
+  const session = {
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    compact: async () => {
+      listener?.({ type: 'compaction_end', aborted: false, willRetry: false, errorMessage: 'Summarization failed' });
+      throw new Error('Summarization failed');
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActive = async () => () => undefined;
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = (_key: string, event: { type?: string }) => { events.push(event); };
+
+  await assert.rejects(
+    bridge.compact(process.cwd(), { sessionId: 'manual-compaction-session' }, 'project:manual-compaction-session'),
+    /Summarization failed/i,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(events.filter((event) => event.type === 'agent:error').length, 1);
+  assert.equal(disposed, 1);
+});
+
+test('cancelled manual compaction preserves its healthy runtime', async () => {
+  const bridge = new PiBridge();
+  const events: Array<{ type?: string }> = [];
+  let listener: ((event: unknown) => void) | undefined;
+  let disposed = 0;
+  const session = {
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    compact: async () => {
+      listener?.({ type: 'compaction_end', aborted: true, willRetry: false });
+      throw new Error('Compaction aborted');
+    },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActive = async () => () => undefined;
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = (_key: string, event: { type?: string }) => { events.push(event); };
+
+  await assert.rejects(
+    bridge.compact(process.cwd(), { sessionId: 'cancelled-compaction-session' }, 'project:cancelled-compaction-session'),
+    /Compaction aborted/i,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(events.filter((event) => event.type === 'agent:error').length, 1);
+  assert.equal(disposed, 0);
+});
+
+test('dispose closes sockets and cached SDK sessions', async () => {
+  const bridge = new PiBridge();
+  let disposed = 0;
+  let socketsClosed = 0;
+  const runtimeSession = { dispose: () => { disposed += 1; } };
+  const commandSession = { dispose: () => { disposed += 1; } };
+  (bridge as any).runtimeSessions.set('runtime', { promise: Promise.resolve(runtimeSession), expiresAt: Date.now() + 60_000 });
+  (bridge as any).commandSessions.set('command', { promise: Promise.resolve(commandSession), expiresAt: Date.now() + 60_000 });
+  (bridge as any).sockets.set('socket', new Set([{ readyState: 1, send: () => undefined, close: () => { socketsClosed += 1; }, on: () => undefined }]));
+
+  await bridge.dispose({ timeoutMs: 50 });
+
+  assert.equal(disposed, 2);
+  assert.equal(socketsClosed, 1);
+  await assert.rejects((bridge as any).getSession(process.cwd(), 'closed-session'), /shutting down/i);
 });
 
 test('lists refreshed models from the session registry', async () => {
