@@ -87,6 +87,7 @@ import {
 } from './composerHistory';
 import { appUrl, appWebSocketUrl } from './appUrl';
 import { StaleAgentStatusError, isCurrentAgentStatusTarget, shouldRetryAgentRefresh, shouldSuppressAgentUiRequests, withRequestTimeout } from './agentRefresh';
+import { markSessionActivityStarted, pendingUserMessagesAfterTerminalRefresh, shouldRefreshCompletedSession, unresolvedPendingUserMessages, type PendingUserMessageHandoff } from './chatHandoff';
 import {
   appendLiveActivityDelta,
   appendLivePreviewText,
@@ -100,6 +101,7 @@ import {
   type AgentServerEvent,
   type AgentToolActivity,
 } from './liveActivity';
+import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -268,8 +270,6 @@ type BrowserSpeechRecognition = {
   abort: () => void;
 };
 type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
-
-type WorkspaceNotificationServerEvent = { type?: string; projectId?: string; sessionId?: string; message?: string; data?: unknown };
 type FaviconStatus = 'idle' | 'unread' | 'running' | 'error';
 
 const THINKING_LEVELS: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
@@ -687,6 +687,8 @@ function Shell() {
   const [liveShellActivity, setLiveShellActivity] = createSignal<BashActivity>(emptyBashActivity());
   const [extensionUiRequests, setExtensionUiRequests] = createSignal<Record<string, ExtensionUiRequest>>({});
   const settledExtensionUiRequestIds = new Set<string>();
+  const completedSessionRefreshes = new Set<string>();
+  const recentWorkspaceNotificationEvents = new Map<string, number>();
   const [toolPanel, setToolPanel] = createSignal<ToolPanel>();
   const [reviewInitialSessionSidebarOpen, setReviewInitialSessionSidebarOpen] = createSignal<boolean>();
   const [chatSearchInput, setChatSearchInput] = createSignal('');
@@ -1065,13 +1067,23 @@ function Shell() {
         : state.runningSessionIds.filter((id) => id !== targetSessionId),
     }));
     if (status.running) {
+      markSessionActivityStarted(completedSessionRefreshes, projectId, targetSessionId);
       if (!liveAgentActivityValue.running) replaceLiveActivity({ ...emptyAgentActivity(), running: true });
       return;
     }
     replaceLiveActivity(status.recovery
       ? reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:error', message: status.recovery.message })
-      : emptyAgentActivity(), emptyBashActivity());
+      : reduceAgentActivityEvent(liveAgentActivityValue, { type: 'agent:finish' }), emptyBashActivity());
     removeSessionExtensionUiRequests(targetSessionId);
+  }
+
+  function refreshCompletedSession(workspaceId: string, targetSessionId: string, operationId?: string) {
+    if (!shouldRefreshCompletedSession(completedSessionRefreshes, workspaceId, targetSessionId, operationId)) return;
+    queryClient.invalidateQueries({ queryKey: ['session', workspaceId, targetSessionId] });
+    queryClient.invalidateQueries({ queryKey: ['session-tree', workspaceId, targetSessionId] });
+    queryClient.invalidateQueries({ queryKey: ['sessions', workspaceId] });
+    queryClient.invalidateQueries({ queryKey: ['agent-status', workspaceId, targetSessionId] });
+    invalidateProjectFileCaches(workspaceId);
   }
 
   function invalidateAgentStatusRequests() {
@@ -1282,7 +1294,11 @@ function Shell() {
     const sessionId = event.sessionId;
     const read = isWorkspaceNotificationViewed(workspaceId, sessionId);
     const runningSessionId = sessionId ?? 'active';
-    const notification = workspaceNotificationFromEvent(event, workspaceId, read);
+    if (event.type === 'agent:start' || event.type === 'bash:start') resetWorkspaceNotificationEventDeduplication(recentWorkspaceNotificationEvents, workspaceId, sessionId);
+    const candidateNotification = workspaceNotificationFromEvent(event, workspaceId, read);
+    const notification = candidateNotification && !isDuplicateWorkspaceNotificationEvent(recentWorkspaceNotificationEvents, workspaceId, event)
+      ? candidateNotification
+      : undefined;
 
     updateWorkspaceNotifications(workspaceId, (state) => {
       let runningSessionIds = state.runningSessionIds;
@@ -1291,13 +1307,8 @@ function Shell() {
       return notification ? { runningSessionIds, items: [notification, ...state.items] } : { ...state, runningSessionIds };
     });
 
-    if ((event.type === 'agent:finish' || event.type === 'agent:error' || event.type === 'bash:finish' || event.type === 'bash:error') && sessionId) {
-      queryClient.invalidateQueries({ queryKey: ['session', workspaceId, sessionId] });
-      queryClient.invalidateQueries({ queryKey: ['session-tree', workspaceId, sessionId] });
-      queryClient.invalidateQueries({ queryKey: ['sessions', workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ['agent-status', workspaceId, sessionId] });
-      invalidateProjectFileCaches(workspaceId);
-    }
+    if ((event.type === 'agent:start' || event.type === 'bash:start') && sessionId) markSessionActivityStarted(completedSessionRefreshes, workspaceId, sessionId);
+    if ((event.type === 'agent:finish' || event.type === 'agent:error' || event.type === 'bash:finish' || event.type === 'bash:error') && sessionId) refreshCompletedSession(workspaceId, sessionId, event.operationId);
 
     if (!notification) return;
     const actionNeeded = isActionNeededNotification(notification);
@@ -1762,18 +1773,16 @@ function Shell() {
         const stopsRunning = parsed.type === 'agent:finish'
           || parsed.type === 'agent:error'
           || parsed.type === 'bash:finish'
-          || parsed.type === 'bash:error'
-          || (dataType === 'agent_end' && !agentEndWillRetry);
-        if (eventSessionId && startsRunning) updateAgentRunningCache(project.id, eventSessionId, true);
+          || parsed.type === 'bash:error';
+        if (eventSessionId && startsRunning) {
+          markSessionActivityStarted(completedSessionRefreshes, project.id, eventSessionId);
+          updateAgentRunningCache(project.id, eventSessionId, true);
+        }
         if (parsed.type === 'agent:status' && eventSessionId) updateAgentStatusCache(project.id, eventSessionId, parsed.data);
         if (stopsRunning && eventSessionId) {
           updateAgentRunningCache(project.id, eventSessionId, false);
           removeSessionExtensionUiRequests(eventSessionId);
-          queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
-          queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, eventSessionId] });
-          queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
-          queryClient.invalidateQueries({ queryKey: ['agent-status', project.id, eventSessionId] });
-          invalidateProjectFileCaches(project.id);
+          refreshCompletedSession(project.id, eventSessionId, parsed.operationId);
         }
       } catch {
         if (shouldShowAgentEvent(payload)) handleAgentEvent(payload);
@@ -5010,6 +5019,8 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
   );
 }
 
+type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; attachments: UploadAsset[] };
+
 function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
@@ -5024,6 +5035,10 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let runningCommandToken: symbol | undefined;
   let localCommandGeneration = 0;
   let pendingAgentSelectionApply: { sessionId: string; promise: Promise<void> } | undefined;
+  let pendingUserMessageSequence = 0;
+  let pendingTerminalRefreshCount = 0;
+  let terminalSubmissionGeneration = 0;
+  let handledPendingTerminalError = '';
   let liveTurnActivityActive = false;
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
@@ -5054,13 +5069,14 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [highlightedCompletionIndex, setHighlightedCompletionIndex] = createSignal(0);
   const [runningCommand, setRunningCommand] = createSignal<string>();
   const [commandSessionId, setCommandSessionId] = createSignal<string>();
-  const [pendingUserMessage, setPendingUserMessage] = createSignal<{ sessionId: string; text: string; attachments: UploadAsset[]; userMessageCount: number }>();
+  const [pendingUserMessages, setPendingUserMessages] = createSignal<PendingUserMessage[]>([]);
   const [liveTurnTranscriptSnapshot, setLiveTurnTranscriptSnapshot] = createSignal<LiveTranscriptSnapshot>();
   const [liveTurnRetired, setLiveTurnRetired] = createSignal(false);
   const [mobileStatusOpen, setMobileStatusOpen] = createSignal(false);
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
+  const [pendingTerminalRefreshActive, setPendingTerminalRefreshActive] = createSignal(false);
   const [attachBusy, setAttachBusy] = createSignal(false);
   const [attachErrorToast, setAttachErrorToast] = createSignal<{ id: number; message: string }>();
   const [extensionUiResponding, setExtensionUiResponding] = createSignal<string>();
@@ -5160,12 +5176,15 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     return detail.branch;
   });
   const liveTurnTranscriptEntries = createMemo(() => session.data?.branch ?? transcriptEntries());
-  const pendingUserMessageVisible = createMemo(() => {
-    const pending = pendingUserMessage();
-    if (!pending) return false;
-    if (props.sessionId && pending.sessionId !== props.sessionId) return false;
-    return userMessageCount(transcriptEntries()) <= pending.userMessageCount;
+  const activePendingUserMessages = createMemo(() => {
+    const sessionId = props.sessionId ?? commandSessionId();
+    return pendingUserMessages().filter((pending) => pending.projectId === props.project.id && (!sessionId || pending.sessionId === sessionId));
   });
+  const unresolvedActivePendingUserMessages = createMemo(() => unresolvedPendingUserMessages(
+    transcriptEntries().filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
+    activePendingUserMessages(),
+  ));
+  const pendingUserMessageVisible = createMemo(() => unresolvedActivePendingUserMessages().length > 0);
   const visibleTranscriptEntries = createMemo(() => {
     const options = { hideThinking: hideThinking(), toolOutputMode: toolOutputMode() };
     const entries = transcriptEntries().filter((entry) => shouldDisplayTranscriptEntry(entry, options));
@@ -5241,7 +5260,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const voiceButtonLabel = createMemo(() => voiceSupported() ? voiceListening() ? 'Stop voice input' : 'Dictate prompt' : 'Voice input is not supported in this browser');
   const composerCanSubmit = createMemo(() => {
     const prompt = text().trim();
-    if (!prompt || attachBusy()) return false;
+    if (!prompt || attachBusy() || aborting() || pendingTerminalRefreshActive()) return false;
     if (parseAgentComposerCommand(prompt)) return !busy();
     if (!busy()) return true;
     const commandName = composerSlashCommandName(prompt);
@@ -5282,6 +5301,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       setLiveTurnTranscriptSnapshot(liveTranscriptSnapshot(untrack(liveTurnTranscriptEntries), options));
       setLiveTurnRetired(false);
     }
+    if (!active && liveTurnActivityActive) terminalSubmissionGeneration += 1;
     if (!active && !activity.error) {
       if (liveAgentActivityHasPreviewText(activity, options)) {
         if (transcriptHasCaughtUpToLiveActivity(liveTurnTranscriptEntries(), options, liveTurnTranscriptSnapshot(), activity)) setLiveTurnRetired(true);
@@ -5294,13 +5314,25 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   });
 
   createEffect(() => {
-    const pending = pendingUserMessage();
-    if (!pending) return;
-    if (props.sessionId && pending.sessionId !== props.sessionId) {
-      setPendingUserMessage(undefined);
+    const activePending = activePendingUserMessages();
+    if (!activePending.length || unresolvedActivePendingUserMessages().length) return;
+    const resolvedIds = new Set(activePending.map(({ id }) => id));
+    setPendingUserMessages((pending) => pending.filter(({ id }) => !resolvedIds.has(id)));
+  });
+
+  createEffect(() => {
+    const error = liveActivity().error;
+    const sessionId = props.sessionId ?? commandSessionId();
+    if (!error || !sessionId) {
+      handledPendingTerminalError = '';
       return;
     }
-    if (userMessageCount(transcriptEntries()) > pending.userMessageCount) setPendingUserMessage(undefined);
+    const key = `${props.project.id}\u0000${sessionId}\u0000${error}`;
+    if (key === handledPendingTerminalError) return;
+    handledPendingTerminalError = key;
+    terminalSubmissionGeneration += 1;
+    const pendingAtTerminal = activePendingUserMessages();
+    if (pendingAtTerminal.length) void reconcilePendingUserMessagesAfterTerminal(props.project.id, sessionId, pendingAtTerminal);
   });
 
   createEffect(() => {
@@ -5382,7 +5414,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     resetComposerHistory();
     setComposerHistory(readComposerHistory(props.project.id, 'normal'));
     setComposerShellHistory(readComposerHistory(props.project.id, 'shell'));
-    setPendingUserMessage((pending) => pending && props.sessionId && pending.sessionId === props.sessionId ? pending : undefined);
+    setPendingUserMessages((pending) => pending.filter(({ projectId }) => projectId === props.project.id));
     const controlsSessionId = props.sessionId ?? draft.commandSessionId;
     const storedControls = controlsSessionId ? readSessionComposerControls(props.project.id, controlsSessionId) : undefined;
     const hasStoredAgent = Boolean(storedControls && 'agent' in storedControls);
@@ -6096,16 +6128,40 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setUploads((items) => items.filter((item) => item.path !== path));
   }
 
+  async function reconcilePendingUserMessagesAfterTerminal(projectId: string, sessionId: string, pendingAtTerminal: PendingUserMessage[]) {
+    pendingTerminalRefreshCount += 1;
+    setPendingTerminalRefreshActive(true);
+    try {
+      const detail = await api<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}`);
+      queryClient.setQueryData(['session', projectId, sessionId], detail);
+      const retainedIds = new Set(pendingUserMessagesAfterTerminalRefresh(
+        detail.branch.filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
+        pendingAtTerminal,
+      ).map(({ id }) => id));
+      const terminalIds = new Set(pendingAtTerminal.map(({ id }) => id));
+      setPendingUserMessages((pending) => pending.filter(({ id }) => !terminalIds.has(id) || retainedIds.has(id)));
+    } catch {
+      queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] });
+    } finally {
+      pendingTerminalRefreshCount -= 1;
+      if (pendingTerminalRefreshCount === 0) setPendingTerminalRefreshActive(false);
+    }
+  }
+
   async function interruptAgent() {
+    const projectId = props.project.id;
     const sessionId = props.sessionId ?? commandSessionId();
     if (aborting() || !sessionId) return;
+    terminalSubmissionGeneration += 1;
+    const pendingAtInterrupt = pendingUserMessages().filter((pending) => pending.projectId === projectId && pending.sessionId === sessionId);
     setAborting(true);
     try {
-      await api(`/api/projects/${props.project.id}/agent/abort`, {
+      await api(`/api/projects/${projectId}/agent/abort`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId }),
       });
+      await reconcilePendingUserMessagesAfterTerminal(projectId, sessionId, pendingAtInterrupt);
       setRunningCommand(undefined);
     } finally {
       setAborting(false);
@@ -6364,13 +6420,14 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
 
   async function send(event: SubmitEvent) {
     event.preventDefault();
+    const submissionTerminalGeneration = terminalSubmissionGeneration;
     const prompt = text().trim();
     const uploadAssets = composerUploadAssets(uploads());
     const shellCommand = parseShellComposerCommand(prompt);
     const compactCommand = parseCompactComposerCommand(prompt);
     const agentCommand = parseAgentComposerCommand(prompt);
     const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined && !agentCommand;
-    if (!prompt || attachBusy() || (busy() && !steeringSubmit)) return;
+    if (!prompt || attachBusy() || aborting() || pendingTerminalRefreshActive() || (busy() && !steeringSubmit)) return;
     stopVoiceRecognition(true);
     if (agentCommand && await handleComposerAgentCommand(agentCommand.argument)) {
       resetComposerHistory();
@@ -6432,6 +6489,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     const selectSubmittedSession = () => {
       if (mirrorActiveStream && submittedWorkspaceStillCurrent()) props.onSession(submittedSessionId, projectId, routeSessionId ?? null);
     };
+    let submittedPendingUserMessageId: number | undefined;
+    let submissionInterruptedByTerminalRefresh = false;
 
     if (submittedComposerStillActive()) {
       setText('');
@@ -6470,9 +6529,29 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
         return;
       }
       const attachmentAssets = uniqueUploadAssets([...uploadAssets, ...await resolveComposerFileReferenceAssets(projectId, prompt)]);
+      if (aborting() || pendingTerminalRefreshActive() || submissionTerminalGeneration !== terminalSubmissionGeneration) {
+        submissionInterruptedByTerminalRefresh = true;
+        throw new Error('Conversation refresh interrupted submission');
+      }
       const attachments = attachmentAssets.map((asset) => asset.path);
       addComposerHistory({ text: prompt, uploads: uploadAssets }, 'normal', projectId);
-      if (!extensionCommand && submittedComposerStillActive()) setPendingUserMessage({ sessionId: submittedSessionId, text: prompt, attachments: attachmentAssets, userMessageCount: userMessageCount(transcriptEntries()) });
+      if (!extensionCommand && submittedComposerStillActive()) {
+        const pendingMessageId = ++pendingUserMessageSequence;
+        submittedPendingUserMessageId = pendingMessageId;
+        setPendingUserMessages((pending) => [...pending, {
+          id: pendingMessageId,
+          projectId,
+          sessionId: submittedSessionId,
+          text: prompt,
+          attachments: attachmentAssets,
+          previousUserEntryIds: (session.data?.entries ?? transcriptEntries()).filter(isUserMessageEntry).map((entry) => entry.id),
+          accepted: false,
+        }]);
+      }
+      if (aborting() || pendingTerminalRefreshActive() || submissionTerminalGeneration !== terminalSubmissionGeneration) {
+        submissionInterruptedByTerminalRefresh = true;
+        throw new Error('Conversation refresh interrupted submission');
+      }
       await api(`/api/projects/${projectId}/agent/prompt`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -6489,6 +6568,10 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           streamingBehavior: steeringSubmit && !extensionCommand ? 'steer' : undefined,
         }),
       });
+      if (submittedPendingUserMessageId !== undefined) {
+        const pendingMessageId = submittedPendingUserMessageId;
+        setPendingUserMessages((pending) => pending.map((message) => message.id === pendingMessageId ? { ...message, accepted: true } : message));
+      }
       selectSubmittedSession();
       if (submittedComposerStillActive()) {
         props.onTreeSelection(undefined);
@@ -6496,7 +6579,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       }
     } catch (error) {
       if (submittedDraftKey) clearedComposerDraftKeys.delete(submittedDraftKey);
-      setPendingUserMessage((pending) => pending?.sessionId === submittedSessionId ? undefined : pending);
+      if (submittedPendingUserMessageId !== undefined) setPendingUserMessages((pending) => pending.filter(({ id }) => id !== submittedPendingUserMessageId));
       if (activeComposerDraftKey === submittedDraftKey && !text().trim() && composerUploadAssets(uploads()).length === 0) {
         setText(prompt);
         setUploads(uploadAssets);
@@ -6504,7 +6587,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       } else if (submittedDraftKey && !composerDrafts.has(submittedDraftKey)) {
         saveComposerDraft(submittedDraftKey, { text: prompt, uploads: uploadAssets, commandSessionId: submittedCommandSessionId, treeSelection: submittedTreeSelection, agent: submittedAgentExplicit ? submittedAgent : undefined, agentExplicit: submittedAgentExplicit, model: submittedModelExplicit ? submittedModel : undefined, modelExplicit: submittedModelExplicit, thinking: submittedThinkingExplicit ? submittedThinkingLevel : undefined, thinkingExplicit: submittedThinkingExplicit });
       }
-      console.error('Could not send chat message', error);
+      if (!submissionInterruptedByTerminalRefresh) console.error('Could not send chat message', error);
     }
   }
 
@@ -6550,9 +6633,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
                 );
               }}
             </For>
-            <Show when={pendingUserMessageVisible() ? pendingUserMessage() : undefined}>
-              {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending().text }]} attachments={pending().attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
-            </Show>
+            <For each={unresolvedActivePendingUserMessages()}>
+              {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
+            </For>
             <LiveAgentActivity activity={displayedLiveActivity()} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
             <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
           </div>
@@ -10346,8 +10429,8 @@ function workspaceNotificationFromEvent(event: WorkspaceNotificationServerEvent,
   const type = typeof data.type === 'string' ? data.type : '';
   if (type === 'notice') return { ...base, title: 'Pi notice', message: singleLine(String(data.message ?? 'Notice')), level: notificationLevelFromUnknown(data.level), kind: 'notice' };
   if (type === 'auto_retry_start') return { ...base, title: 'Retrying request', message: singleLine(String(data.errorMessage ?? 'Provider error')), level: 'warning', kind: 'retry' };
-  if (type === 'auto_retry_end') return { ...base, title: data.success ? 'Retry succeeded' : 'Retry failed', message: singleLine(String(data.success ? 'Request recovered.' : data.finalError ?? 'Provider error')), level: data.success ? 'success' : 'error', kind: 'retry' };
-  if (type === 'compaction_end') return { ...base, title: 'Compaction finished', message: data.aborted ? 'Context compaction was aborted.' : 'Context compaction completed.', level: data.aborted ? 'warning' : 'success', kind: 'compaction' };
+  if (type === 'auto_retry_end') return data.success ? undefined : { ...base, title: 'Retry failed', message: singleLine(String(data.finalError ?? 'Provider error')), level: 'error', kind: 'retry' };
+  if (type === 'compaction_end') return data.aborted ? { ...base, title: 'Compaction aborted', message: 'Context compaction was aborted.', level: 'warning', kind: 'compaction' } : undefined;
   if (/approval|permission|confirm/i.test(type)) return { ...base, title: 'Approval needed', message: singleLine(String(data.message ?? type.replace(/_/g, ' '))), level: 'warning', kind: 'notice' };
   if (/input/i.test(type)) return { ...base, title: 'Input needed', message: singleLine(String(data.message ?? type.replace(/_/g, ' '))), level: 'warning', kind: 'notice' };
   if (/review/i.test(type)) return { ...base, title: 'Review ready', message: singleLine(String(data.message ?? type.replace(/_/g, ' '))), level: 'info', kind: 'review' };

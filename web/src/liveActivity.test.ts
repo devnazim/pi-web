@@ -18,14 +18,21 @@ function assistantMessageStart(): AgentServerEvent {
 }
 
 describe('live agent activity', () => {
-  test('uses optimized plain text only while the agent is actively streaming', () => {
-    const active = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
-    assert.equal(shouldUseOptimizedStreamingRender(active, true), true);
-    assert.equal(shouldUseOptimizedStreamingRender(active, false), false);
+  test('stops optimized streaming at agent_end but stays running until the bridge settles', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Final answer', contentIndex: 0 }));
+    assert.equal(shouldUseOptimizedStreamingRender(activity, true), true);
+    assert.equal(shouldUseOptimizedStreamingRender(activity, false), false);
 
-    const completed = reduceAgentActivityEvent(active, { type: 'agent:event', data: { type: 'agent_end' } });
-    assert.equal(shouldUseOptimizedStreamingRender(completed, true), false);
-    assert.equal(shouldUseOptimizedStreamingRender(completed, false), false);
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'agent_end', willRetry: false } });
+    assert.equal(activity.running, true);
+    assert.equal(activity.streaming, false);
+    assert.equal(shouldUseOptimizedStreamingRender(activity, true), false);
+
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:finish' });
+    assert.equal(activity.running, false);
+    assert.equal(activity.streaming, false);
+    assert.equal(activity.text, 'Final answer');
   });
 
   test('shows a recoverable crash error and clears the running state', () => {
@@ -93,6 +100,7 @@ describe('live agent activity', () => {
     activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Final answer', contentIndex: 0 }));
     activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'auto_retry_end', success: true, attempt: 1 } });
     activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'agent_end', willRetry: false } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:finish' });
 
     assert.deepEqual(retireAgentActivityPreview(activity), {
       ...emptyAgentActivity(),
@@ -100,16 +108,29 @@ describe('live agent activity', () => {
     });
   });
 
+  test('keeps failed retry activity running until the bridge reports the terminal error', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'auto_retry_start', attempt: 1 } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'auto_retry_end', success: false, finalError: 'provider failed' } });
+
+    assert.equal(activity.running, true);
+    assert.equal(activity.streaming, false);
+
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:error', message: 'provider failed' });
+    assert.equal(activity.running, false);
+  });
+
   test('keeps post-response compaction active after retiring persisted content', () => {
     let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
     activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Final answer', contentIndex: 0 }));
     activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'agent_end', willRetry: false } });
     activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'compaction_start' } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'compaction_end', aborted: false, willRetry: false } });
 
     assert.deepEqual(retireAgentActivityPreview(activity), {
       ...emptyAgentActivity(),
       running: true,
-      notices: ['compacting context'],
+      notices: ['compacting context', 'compaction finished'],
     });
   });
 });

@@ -84,6 +84,7 @@ export interface GitStatus {
 
 export interface AgentEvent {
   type: string;
+  operationId?: string;
   sessionId?: string;
   entry?: SessionEntry;
   message?: string;

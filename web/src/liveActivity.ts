@@ -8,7 +8,7 @@ export type AgentActivityToolItem = { type: 'tool'; tool: AgentToolActivity };
 export type AgentActivityItem = AgentActivityContentItem | AgentActivityToolItem;
 export type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
 export type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; items: AgentActivityItem[]; notices: string[]; deltaContentKeys: string[]; retry?: AgentRetryActivity };
-export type AgentServerEvent = { type?: string; message?: string; data?: unknown };
+export type AgentServerEvent = { type?: string; operationId?: string; message?: string; data?: unknown };
 
 const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 8_000;
 
@@ -102,8 +102,8 @@ export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentSe
     return message?.role === 'assistant' ? { ...activity, deltaContentKeys: [] } : activity;
   }
   if (type === 'agent_end') {
-    const running = data.willRetry === true;
-    return { ...activity, running, streaming: false, error: running ? undefined : activity.error, retry: running ? activity.retry : undefined };
+    const willRetry = data.willRetry === true;
+    return { ...activity, running: true, streaming: false, error: willRetry ? undefined : activity.error, retry: willRetry ? activity.retry : undefined };
   }
   if (type === 'message_update') {
     const messageEvent = data.assistantMessageEvent && typeof data.assistantMessageEvent === 'object' ? data.assistantMessageEvent as Record<string, unknown> : {};
@@ -140,16 +140,16 @@ export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentSe
   }
   if (type === 'auto_retry_end') {
     const failed = data.success !== true;
-    return { ...activity, retry: undefined, notices: [...activity.notices, data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`], running: failed ? false : activity.running, streaming: failed ? false : activity.streaming };
+    return { ...activity, retry: undefined, notices: [...activity.notices, data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`], running: true, streaming: failed ? false : activity.streaming };
   }
   if (type === 'compaction_start') return { ...activity, running: true, notices: [...activity.notices, 'compacting context'] };
   if (type === 'compaction_end') {
-    const running = data.willRetry === true;
+    const willRetry = data.willRetry === true;
     return {
       ...activity,
-      running,
-      streaming: running ? activity.streaming : false,
-      retry: running ? activity.retry : undefined,
+      running: true,
+      streaming: willRetry ? activity.streaming : false,
+      retry: willRetry ? activity.retry : undefined,
       notices: [...activity.notices, data.aborted ? 'compaction aborted' : 'compaction finished'],
     };
   }

@@ -244,6 +244,56 @@ test('recovers an extension command whose active flags stop making progress', as
   assert.equal(disposed, 1);
 });
 
+test('finishes extension activity only after the whole command settles', async () => {
+  const bridge = new PiBridge({ runtimeSettledGraceMs: 1_000, runtimeWatchIntervalMs: 1 });
+  const events: Array<{ type?: string; operationId?: string }> = [];
+  let listener: ((event: unknown) => void) | undefined;
+  let finishPrompt: (() => void) | undefined;
+  let markAgentEndEmitted: () => void = () => undefined;
+  const agentEndEmitted = new Promise<void>((resolve) => { markAgentEndEmitted = resolve; });
+  const session = {
+    isStreaming: false,
+    extensionRunner: { getCommand: (name: string) => name === 'settled' ? {} : undefined },
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    prompt: () => {
+      session.isStreaming = true;
+      listener?.({ type: 'agent_start' });
+      listener?.({ type: 'agent_end', willRetry: false });
+      markAgentEndEmitted();
+      return new Promise<void>((resolve) => { finishPrompt = resolve; });
+    },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = (_key: string, event: { type?: string; operationId?: string }) => { events.push(event); };
+
+  const prompt = bridge.prompt(process.cwd(), { sessionId: 'settled-extension-session', prompt: '/settled' }, 'project:settled-extension-session');
+  await agentEndEmitted;
+  assert.equal(events.filter((event) => event.type === 'agent:finish').length, 0);
+
+  listener?.({ type: 'agent_settled' });
+  assert.equal(events.filter((event) => event.type === 'agent:finish').length, 0);
+
+  listener?.({ type: 'agent_start' });
+  listener?.({ type: 'agent_end', willRetry: false });
+  listener?.({ type: 'agent_settled' });
+  assert.equal(events.filter((event) => event.type === 'agent:finish').length, 0);
+
+  session.isStreaming = false;
+  finishPrompt?.();
+  await prompt;
+
+  const starts = events.filter((event) => event.type === 'agent:start');
+  const finishes = events.filter((event) => event.type === 'agent:finish');
+  assert.equal(starts.length, 1);
+  assert.equal(finishes.length, 1);
+  assert.equal(typeof starts[0].operationId, 'string');
+  assert.equal(finishes[0].operationId, starts[0].operationId);
+});
+
 test('recovers a terminal provider error from delayed extension-command activity', async () => {
   const bridge = new PiBridge({ runtimeSettledGraceMs: 1_000, runtimeWatchIntervalMs: 1 });
   const events: Array<{ type?: string }> = [];
@@ -278,6 +328,7 @@ test('recovers a terminal provider error from delayed extension-command activity
   );
 
   assert.equal(events.filter((event) => event.type === 'agent:error').length, 1);
+  assert.equal(events.filter((event) => event.type === 'agent:finish').length, 0);
   assert.equal(disposed, 1);
 });
 
