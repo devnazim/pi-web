@@ -12,6 +12,9 @@ const MAX_TERMINAL_INPUT_LENGTH = 64 * 1024;
 const MAX_TERMINAL_REPLAY_LENGTH = 1024 * 1024;
 const MAX_TERMINAL_PENDING_DATA_LENGTH = 128 * 1024;
 const MAX_TERMINAL_METADATA_LENGTH = 2048;
+const TERMINAL_FLOW_CONTROL_HIGH_WATERMARK = 100_000;
+const TERMINAL_FLOW_CONTROL_LOW_WATERMARK = 5_000;
+const TERMINAL_REPLACED_CLOSE_CODE = 4001;
 const TERMINAL_IDLE_TTL_MS = 30 * 60_000;
 const DEFAULT_TERMINAL_ID = 'default';
 const DEFAULT_TERMINAL_COLS = 80;
@@ -27,7 +30,7 @@ type Disposable = { dispose(): void };
 type WebSocket = {
   readyState: number;
   send(data: string): void;
-  close(): void;
+  close(code?: number, reason?: string): void;
   on(event: 'close' | 'message', listener: (...args: any[]) => void): void;
 };
 
@@ -36,6 +39,7 @@ type TerminalClientMessage = {
   data?: unknown;
   cols?: unknown;
   rows?: unknown;
+  dataOffset?: unknown;
   cwd?: unknown;
   title?: unknown;
 };
@@ -54,6 +58,10 @@ type TerminalSession = {
   pendingData: string;
   cols: number;
   rows: number;
+  flowControlSocket?: WebSocket;
+  sentDataOffset: number;
+  acknowledgedDataOffset: number;
+  outputPaused?: boolean;
   idleTimer?: NodeJS.Timeout;
   dataFlush?: NodeJS.Immediate;
   disposed?: boolean;
@@ -188,6 +196,8 @@ function createTerminalSession(sessions: Map<string, TerminalSession>, key: stri
     pendingData: '',
     cols,
     rows,
+    sentDataOffset: 0,
+    acknowledgedDataOffset: 0,
   };
 
   session.dataDisposable = terminal.onData((data) => queueTerminalData(session, data));
@@ -204,13 +214,16 @@ function createTerminalSession(sessions: Map<string, TerminalSession>, key: stri
 function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: TerminalSession, socket: WebSocket, cols: number, rows: number) {
   clearTerminalIdleTimer(session);
   flushTerminalData(session);
+  for (const existingSocket of session.sockets) existingSocket.close(TERMINAL_REPLACED_CLOSE_CODE, 'Terminal opened in another window');
+  session.sockets.clear();
   session.sockets.add(socket);
+  resetTerminalFlowControl(session, socket);
   resizeTerminalSession(session, cols, rows);
   sendTerminalMessage(socket, { type: 'ready', cwd: session.cwd, title: session.title, shell: session.shell, shellName: session.shellName, terminalId: session.id, persistent: true });
   if (session.replay) sendTerminalMessage(socket, { type: 'data', data: session.replay, replay: true });
 
   socket.on('message', (data: { toString(): string }) => {
-    if (session.disposed) return;
+    if (session.disposed || !session.sockets.has(socket)) return;
     let message: TerminalClientMessage;
     try {
       message = JSON.parse(data.toString()) as TerminalClientMessage;
@@ -239,6 +252,14 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
       return;
     }
 
+    if (message.type === 'ack') {
+      if (socket !== session.flowControlSocket || typeof message.dataOffset !== 'number' || !Number.isSafeInteger(message.dataOffset)) return;
+      if (message.dataOffset <= session.acknowledgedDataOffset || message.dataOffset > session.sentDataOffset) return;
+      session.acknowledgedDataOffset = message.dataOffset;
+      if (session.outputPaused && session.sentDataOffset - session.acknowledgedDataOffset < TERMINAL_FLOW_CONTROL_LOW_WATERMARK) resumeTerminalOutput(session);
+      return;
+    }
+
     if (message.type === 'clear') {
       if (session.dataFlush) {
         clearImmediate(session.dataFlush);
@@ -260,6 +281,7 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
 
   socket.on('close', () => {
     session.sockets.delete(socket);
+    if (session.flowControlSocket === socket) resetTerminalFlowControl(session, undefined);
     if (!session.disposed && !session.sockets.size) scheduleTerminalIdleCleanup(sessions, session);
   });
 }
@@ -289,7 +311,18 @@ function flushTerminalData(session: TerminalSession) {
   const data = session.pendingData;
   session.pendingData = '';
   clearProjectFileCaches(session.projectId);
-  broadcastTerminalMessage(session, { type: 'data', data });
+  const dataOffset = session.sentDataOffset + data.length;
+  if (!broadcastTerminalMessage(session, { type: 'data', data, dataOffset })) return;
+
+  session.sentDataOffset = dataOffset;
+  if (!session.outputPaused && session.sentDataOffset - session.acknowledgedDataOffset > TERMINAL_FLOW_CONTROL_HIGH_WATERMARK) {
+    try {
+      session.terminal.pause();
+      session.outputPaused = true;
+    } catch {
+      // The PTY may have exited while its final data was being flushed.
+    }
+  }
 }
 
 function updateTerminalMetadata(session: TerminalSession, message: TerminalClientMessage) {
@@ -318,8 +351,29 @@ function resizeTerminalSession(session: TerminalSession, cols: number, rows: num
   }
 }
 
+function resetTerminalFlowControl(session: TerminalSession, socket: WebSocket | undefined) {
+  session.flowControlSocket = socket;
+  session.sentDataOffset = 0;
+  session.acknowledgedDataOffset = 0;
+  resumeTerminalOutput(session);
+}
+
+function resumeTerminalOutput(session: TerminalSession) {
+  if (!session.outputPaused) return;
+  try {
+    session.terminal.resume();
+    session.outputPaused = false;
+  } catch {
+    // The PTY may already be gone.
+  }
+}
+
 function broadcastTerminalMessage(session: TerminalSession, message: Record<string, unknown>) {
-  for (const socket of session.sockets) sendTerminalMessage(socket, message);
+  let sentToFlowControlSocket = false;
+  for (const socket of session.sockets) {
+    if (sendTerminalMessage(socket, message) && socket === session.flowControlSocket) sentToFlowControlSocket = true;
+  }
+  return sentToFlowControlSocket;
 }
 
 function scheduleTerminalIdleCleanup(sessions: Map<string, TerminalSession>, session: TerminalSession) {
@@ -459,10 +513,12 @@ function trimTerminalReplay(value: string) {
 }
 
 function sendTerminalMessage(socket: WebSocket, message: Record<string, unknown>) {
-  if (socket.readyState !== 1) return;
+  if (socket.readyState !== 1) return false;
   try {
     socket.send(JSON.stringify(message));
+    return true;
   } catch {
     // Ignore write races with websocket close.
+    return false;
   }
 }

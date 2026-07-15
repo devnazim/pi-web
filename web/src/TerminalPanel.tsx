@@ -7,7 +7,7 @@ import './terminal-font.css';
 type TerminalProject = { id: string; path: string };
 type ResolvedThemeMode = 'light' | 'dark';
 type TerminalStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
-type TerminalServerMessage = { type?: string; data?: string; replay?: boolean; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
+type TerminalServerMessage = { type?: string; data?: string; dataOffset?: number; replay?: boolean; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
 type TerminalRuntime = { Terminal: typeof import('@xterm/xterm').Terminal; FitAddon: typeof import('@xterm/addon-fit').FitAddon };
 type Disposable = { dispose(): void };
 type TerminalModifier = 'ctrl' | 'alt' | 'shift';
@@ -62,6 +62,7 @@ const TERMINAL_RESIZE_SETTLE_DELAY_MS = 180;
 const TERMINAL_RECONNECT_BASE_DELAY_MS = 750;
 const TERMINAL_RECONNECT_MAX_DELAY_MS = 8_000;
 const TERMINAL_RECONNECT_STABLE_MS = 10_000;
+const TERMINAL_REPLACED_CLOSE_CODE = 4001;
 const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
   '`': '~',
   '1': '!',
@@ -259,9 +260,11 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (sendTerminalClientMessage(socket, { type: 'input', data })) return;
           if (socket?.readyState === WebSocket.CONNECTING) pendingInput = trimTerminalQueuedInput(pendingInput + data);
         };
-        const writeTerminalData = (data: string, replay = false) => {
+        const writeTerminalData = (data: string, replay = false, dataOffset?: number) => {
           if (!replay) {
-            xterm?.write(data);
+            xterm?.write(data, () => {
+              if (Number.isSafeInteger(dataOffset)) sendTerminalClientMessage(socket, { type: 'ack', dataOffset });
+            });
             return;
           }
           replayClipboardSuppression += 1;
@@ -460,7 +463,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             if (nextCwd) setCwd(nextCwd);
           } else if (message.type === 'data' && typeof message.data === 'string') {
             props.onFilesystemActivity?.();
-            writeTerminalData(message.data, message.replay === true);
+            writeTerminalData(message.data, message.replay === true, message.dataOffset);
           } else if (message.type === 'error') {
             setStatus('error');
             xterm.writeln(`\r\n\x1b[31m${message.message ?? 'Terminal error'}\x1b[0m`);
@@ -473,7 +476,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             xterm.writeln(`\r\n\x1b[2mTerminal exited${typeof message.exitCode === 'number' ? ` with code ${message.exitCode}` : ''}.\x1b[0m`);
           }
         });
-        socket.addEventListener('close', () => {
+        socket.addEventListener('close', (event) => {
           if (terminalSocket !== socket) return;
           clearHeartbeatTimers();
           if (resizeMessageTimer !== undefined) {
@@ -486,6 +489,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           }
           setStatus(status() === 'error' ? 'error' : 'disconnected');
           if (disposed || terminalExited) return;
+          if (event.code === TERMINAL_REPLACED_CLOSE_CODE) {
+            xterm?.writeln('\r\n\x1b[2mTerminal opened in another window. Reconnect to take control.\x1b[0m');
+            return;
+          }
 
           const delay = Math.min(TERMINAL_RECONNECT_MAX_DELAY_MS, TERMINAL_RECONNECT_BASE_DELAY_MS * (2 ** Math.min(autoReconnectAttempts, 5)));
           autoReconnectAttempts += 1;
