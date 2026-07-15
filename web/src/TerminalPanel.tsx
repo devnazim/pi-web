@@ -56,7 +56,7 @@ const TERMINAL_LETTER_SPACING = 0;
 const MAX_TERMINAL_QUEUED_INPUT_LENGTH = 64 * 1024;
 const MAX_TERMINAL_METADATA_LENGTH = 2048;
 const TERMINAL_HEARTBEAT_MS = 30_000;
-const TERMINAL_HEARTBEAT_TIMEOUT_MS = 10_000;
+const TERMINAL_HEARTBEAT_TIMEOUT_MS = 30_000;
 const TERMINAL_RESIZE_SEND_DELAY_MS = 80;
 const TERMINAL_RESIZE_SETTLE_DELAY_MS = 180;
 const TERMINAL_RECONNECT_BASE_DELAY_MS = 750;
@@ -237,7 +237,6 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         xterm.loadAddon(fitAddon);
         xterm.open(terminalElement);
         terminal = xterm;
-        let pingTerminalSocket: (() => void) | undefined;
 
         const sendTerminalMetadata = (metadata: { cwd?: string; title?: string }) => {
           if (sendTerminalClientMessage(socket, { type: 'metadata', ...metadata })) return;
@@ -257,10 +256,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         };
         const sendTerminalInput = (data: string) => {
           props.onFilesystemActivity?.();
-          if (sendTerminalClientMessage(socket, { type: 'input', data })) {
-            pingTerminalSocket?.();
-            return;
-          }
+          if (sendTerminalClientMessage(socket, { type: 'input', data })) return;
           if (socket?.readyState === WebSocket.CONNECTING) pendingInput = trimTerminalQueuedInput(pendingInput + data);
         };
         const writeTerminalData = (data: string, replay = false) => {
@@ -395,7 +391,6 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           sendTerminalHeartbeat();
           heartbeatTimer = window.setInterval(sendTerminalHeartbeat, TERMINAL_HEARTBEAT_MS);
         };
-        pingTerminalSocket = sendTerminalHeartbeat;
 
         socket = new WebSocket(appWebSocketUrl(`/ws/projects/${projectId}/terminal?${params}`));
         terminalSocket = socket;
@@ -425,6 +420,9 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         socket.addEventListener('open', () => {
           if (terminalSocket !== socket || !resizeTerminal || !xterm) return;
           setStatus('connected');
+          // Reassert the PTY size for every connection, even when the grid did not change.
+          lastSentCols = 0;
+          lastSentRows = 0;
           resizeTerminal(true, true);
           if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
           if (pendingInput) {

@@ -308,7 +308,7 @@ function updateTerminalMetadata(session: TerminalSession, message: TerminalClien
 }
 
 function resizeTerminalSession(session: TerminalSession, cols: number, rows: number) {
-  if (session.disposed || (session.cols === cols && session.rows === rows)) return;
+  if (session.disposed) return;
   try {
     session.terminal.resize(cols, rows);
     session.cols = cols;
