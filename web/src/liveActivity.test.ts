@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
   emptyAgentActivity,
+  liveActivityMatchesPersistedPreview,
   reduceAgentActivityEvent,
   retireAgentActivityPreview,
   shouldUseOptimizedStreamingRender,
@@ -93,6 +94,21 @@ describe('live agent activity', () => {
     activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_end', content: 'Hello' }));
 
     assert.deepEqual(activity.items, [{ type: 'text', text: 'Hello' }]);
+  });
+
+  test('matches persisted final text even when thinking persistence differs', () => {
+    const activity = { ...emptyAgentActivity(), text: 'Final answer', thinking: 'Detailed live reasoning' };
+
+    assert.equal(liveActivityMatchesPersistedPreview(activity, { text: 'Final answer', thinking: 'Short persisted reasoning' }, false), true);
+    assert.equal(liveActivityMatchesPersistedPreview(activity, { text: 'Different answer', thinking: 'Detailed live reasoning' }, false), false);
+  });
+
+  test('requires persisted thinking when a response has no final text', () => {
+    const activity = { ...emptyAgentActivity(), thinking: 'Thinking-only response' };
+
+    assert.equal(liveActivityMatchesPersistedPreview(activity, { text: '', thinking: 'Thinking-only response' }, false), true);
+    assert.equal(liveActivityMatchesPersistedPreview(activity, { text: '', thinking: 'Different reasoning' }, false), false);
+    assert.equal(liveActivityMatchesPersistedPreview(activity, { text: '', thinking: '' }, true), true);
   });
 
   test('retires persisted response content while preserving completion notices', () => {

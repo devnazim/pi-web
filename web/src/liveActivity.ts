@@ -83,6 +83,24 @@ export function shouldUseOptimizedStreamingRender(activity: AgentActivity, enabl
   return enabled && activity.running && activity.streaming;
 }
 
+export function liveActivityMatchesPersistedPreview(activity: AgentActivity, preview: { text: string; thinking: string }, hideThinking: boolean) {
+  if (activity.text.trim()) return textContainsPreview(preview.text, activity.text);
+  return hideThinking || !activity.thinking.trim() || textContainsPreview(preview.thinking, activity.thinking);
+}
+
+function textContainsPreview(fullText: string, previewText: string) {
+  const full = comparablePreviewText(fullText);
+  const preview = comparablePreviewText(previewText);
+  if (!full || !preview) return false;
+  if (full === preview || full.includes(preview)) return true;
+  const sampleLength = Math.min(1000, preview.length);
+  return sampleLength >= 80 && full.includes(preview.slice(preview.length - sampleLength));
+}
+
+function comparablePreviewText(value: string) {
+  return value.replace(/^…\s*/, '').replace(/\s+/g, ' ').trim();
+}
+
 export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEvent): AgentActivity {
   if (event.type === 'agent:start') return { ...emptyAgentActivity(), running: true };
   if (event.type === 'agent:finish') return { ...activity, running: false, streaming: false, retry: undefined };

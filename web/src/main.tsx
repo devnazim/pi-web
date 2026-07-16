@@ -92,6 +92,7 @@ import {
   appendLiveActivityDelta,
   appendLivePreviewText,
   emptyAgentActivity,
+  liveActivityMatchesPersistedPreview,
   reduceAgentActivityEvent,
   retireAgentActivityPreview,
   shouldUseOptimizedStreamingRender,
@@ -1839,7 +1840,19 @@ function Shell() {
       },
       onMessage: (event) => {
         agentSocketEventGeneration += 1;
-        pendingAgentSocketPayloads.push(typeof event.data === 'string' ? event.data : String(event.data));
+        const payload = typeof event.data === 'string' ? event.data : String(event.data);
+        try {
+          // The notification socket can refresh the persisted transcript before this RAF queue drains.
+          // Apply the turn boundary now so Chat snapshots the transcript before completion arrives.
+          if ((JSON.parse(payload) as AgentServerEvent).type === 'agent:start') {
+            flushPendingAgentSocketPayloads();
+            processAgentSocketPayload(payload);
+            return;
+          }
+        } catch {
+          // Preserve malformed events through the normal payload path.
+        }
+        pendingAgentSocketPayloads.push(payload);
         scheduleAgentSocketFlush();
       },
     });
@@ -9998,7 +10011,7 @@ function transcriptHasCaughtUpToLiveActivity(entries: SessionEntry[], options: {
     if (preview.userMessageCount === snapshot.userMessageCount && snapshot.assistantAfterLastUserId && !sameAssistant && (!snapshotText || !currentText.includes(snapshotText))) return false;
     if (sameAssistant && currentText === snapshotText) return false;
   }
-  return liveActivityMatchesAssistantPreview(activity, preview, options);
+  return liveActivityMatchesPersistedPreview(activity, preview, options.hideThinking);
 }
 
 function assistantAggregatePreviewAfterLastUser(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): AssistantAggregatePreview {
@@ -10025,12 +10038,6 @@ function assistantAggregatePreviewAfterLastUser(entries: SessionEntry[], options
   return preview;
 }
 
-function liveActivityMatchesAssistantPreview(activity: AgentActivity, preview: AssistantEntryPreview, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }) {
-  const textMatches = !activity.text.trim() || textContainsPreview(preview.text, activity.text);
-  const thinkingMatches = options.hideThinking || !activity.thinking.trim() || textContainsPreview(preview.thinking, activity.thinking);
-  return textMatches && thinkingMatches;
-}
-
 function assistantEntryPreview(entry: SessionEntry, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): AssistantEntryPreview {
   const parts = entryContentParts(entry, options);
   return {
@@ -10046,15 +10053,6 @@ function joinPreviewSegments(current: string, next: string) {
 
 function assistantPreviewText(preview: AssistantEntryPreview) {
   return `${preview.text}${preview.thinking}${preview.error}`;
-}
-
-function textContainsPreview(fullText: string, previewText: string) {
-  const full = comparablePreviewText(fullText);
-  const preview = comparablePreviewText(previewText);
-  if (!full || !preview) return false;
-  if (full === preview || full.includes(preview)) return true;
-  const sampleLength = Math.min(1000, preview.length);
-  return sampleLength >= 80 && full.includes(preview.slice(preview.length - sampleLength));
 }
 
 function comparablePreviewText(value: string) {
