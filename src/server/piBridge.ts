@@ -1108,9 +1108,28 @@ export class PiBridge {
   }
 
   private async waitForSessionIdle(session: any) {
-    while (this.cachedSessionInUse(session)) {
-      if (this.cachedSessionIsStreaming(session) && typeof session?.agent?.waitForIdle === 'function') await session.agent.waitForIdle();
-      else await new Promise((resolve) => setTimeout(resolve, 100));
+    while (!this.sessionCannotPublish(session) && this.cachedSessionInUse(session)) {
+      const candidates = [session];
+      if (session && typeof session === 'object') candidates.push(session.session);
+      const extensionTasks = new Set<Promise<unknown>>();
+      for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== 'object') continue;
+        for (const task of this.extensionAsyncTasks.get(candidate) ?? []) extensionTasks.add(task);
+      }
+
+      if (extensionTasks.size) await Promise.allSettled(extensionTasks);
+      else if (this.cachedSessionIsStreaming(session) && typeof session?.agent?.waitForIdle === 'function') await session.agent.waitForIdle();
+      else {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        continue;
+      }
+
+      // Recovery races this wait but cannot cancel it. Stop before creating another timer for a stale
+      // session; otherwise stale activity flags could keep an abandoned wait alive indefinitely.
+      if (this.sessionCannotPublish(session)) return;
+      // The outer session can remain active after its core agent is idle. Yield to timers and I/O so
+      // extension sends can settle and the runtime watchdog can recover genuinely stale activity.
+      if (this.cachedSessionInUse(session)) await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
 

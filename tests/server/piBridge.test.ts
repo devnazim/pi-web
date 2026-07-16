@@ -244,6 +244,129 @@ test('recovers an extension command whose active flags stop making progress', as
   assert.equal(disposed, 1);
 });
 
+test('does not spin when the outer session remains streaming after the core agent is idle', async () => {
+  const bridge = new PiBridge();
+  let waitForIdleCalls = 0;
+  let timerRan = false;
+  const session = {
+    isStreaming: true,
+    agent: {
+      waitForIdle: async () => {
+        waitForIdleCalls += 1;
+        // Keep the pre-fix implementation from hanging the test process forever.
+        if (waitForIdleCalls === 1_000) session.isStreaming = false;
+      },
+    },
+  };
+  const timer = setTimeout(() => {
+    timerRan = true;
+    session.isStreaming = false;
+  }, 0);
+
+  await (bridge as any).waitForSessionIdle(session);
+  clearTimeout(timer);
+
+  assert.equal(timerRan, true);
+  assert.equal(waitForIdleCalls, 1);
+});
+
+test('tracked extension activity settles without polling an already-idle core agent', async () => {
+  const bridge = new PiBridge();
+  let waitForIdleCalls = 0;
+  let idle = false;
+  let finishExtensionTask: () => void = () => undefined;
+  let markOuterSessionIdle: () => void = () => undefined;
+  const outerSessionIdle = new Promise<void>((resolve) => { markOuterSessionIdle = resolve; });
+  const session = {
+    isStreaming: true,
+    agent: {
+      waitForIdle: async () => {
+        waitForIdleCalls += 1;
+        // Keep the pre-fix implementation from hanging the test process forever.
+        if (waitForIdleCalls === 1_000) session.isStreaming = false;
+      },
+    },
+  };
+  const extensionTask = new Promise<void>((resolve) => { finishExtensionTask = resolve; });
+  (bridge as any).trackExtensionAsyncTask(session, extensionTask);
+  setTimeout(() => {
+    session.isStreaming = false;
+    markOuterSessionIdle();
+  }, 0);
+
+  const waitForIdle = (bridge as any).waitForSessionIdle(session).then(() => { idle = true; });
+  await outerSessionIdle;
+  assert.equal(idle, false);
+
+  finishExtensionTask();
+  await waitForIdle;
+  assert.equal(waitForIdleCalls, 0);
+});
+
+test('stops a recovered idle wait when tracked activity later settles with stale streaming state', async () => {
+  const bridge = new PiBridge();
+  let waitForIdleCalls = 0;
+  let finishExtensionTask: () => void = () => undefined;
+  const session = {
+    isStreaming: true,
+    agent: {
+      waitForIdle: async () => { waitForIdleCalls += 1; },
+    },
+  };
+  const extensionTask = new Promise<void>((resolve) => { finishExtensionTask = resolve; });
+  (bridge as any).trackExtensionAsyncTask(session, extensionTask);
+  let idleWaitFinished = false;
+  const idleWait = (bridge as any).waitForSessionIdle(session).then(() => { idleWaitFinished = true; });
+
+  (bridge as any).recoveringSessions.add(session);
+  finishExtensionTask();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const finishedAfterRecovery = idleWaitFinished;
+  if (!idleWaitFinished) {
+    session.isStreaming = false;
+    await idleWait;
+  }
+
+  assert.equal(finishedAfterRecovery, true);
+  assert.equal(waitForIdleCalls, 0);
+});
+
+test('recovers a stuck tracked extension task without starving the supervisor', async () => {
+  const bridge = new PiBridge({ runtimeNoProgressTimeoutMs: 5, runtimeWatchIntervalMs: 1 });
+  let listener: ((event: unknown) => void) | undefined;
+  let sendUserMessageCalls = 0;
+  let disposed = 0;
+  const session = {
+    isStreaming: false,
+    extensionRunner: { getCommand: (name: string) => name === 'stuck-send' ? {} : undefined },
+    subscribe: (next: (event: unknown) => void) => {
+      listener = next;
+      return () => { listener = undefined; };
+    },
+    bindExtensions: async () => undefined,
+    sendUserMessage: () => {
+      sendUserMessageCalls += 1;
+      return new Promise<void>(() => undefined);
+    },
+    prompt: () => {
+      session.isStreaming = true;
+      listener?.({ type: 'agent_start' });
+      void session.sendUserMessage();
+    },
+    agent: { waitForIdle: async () => undefined },
+    dispose: () => { disposed += 1; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+
+  await assert.rejects(
+    bridge.prompt(process.cwd(), { sessionId: 'stuck-extension-task-session', prompt: '/stuck-send' }, 'project:stuck-extension-task-session'),
+    /stopped responding or crashed/i,
+  );
+  assert.equal(sendUserMessageCalls, 1);
+  assert.equal(disposed, 1);
+});
+
 test('finishes extension activity only after the whole command settles', async () => {
   const bridge = new PiBridge({ runtimeSettledGraceMs: 1_000, runtimeWatchIntervalMs: 1 });
   const events: Array<{ type?: string; operationId?: string }> = [];
