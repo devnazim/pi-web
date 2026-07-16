@@ -88,6 +88,23 @@ export function liveActivityMatchesPersistedPreview(activity: AgentActivity, pre
   return hideThinking || !activity.thinking.trim() || textContainsPreview(preview.thinking, activity.thinking);
 }
 
+export function persistedTranscriptMatchesLiveActivity(
+  activity: AgentActivity,
+  preview: { userMessageCount: number; latestAssistantId?: string; text: string; thinking: string; error: string },
+  snapshot: { userMessageCount: number; assistantAfterLastUserId?: string; assistantAfterLastUserText?: string } | undefined,
+  hideThinking: boolean,
+) {
+  if (!preview.latestAssistantId) return false;
+  if (snapshot) {
+    const snapshotText = comparablePreviewText(snapshot.assistantAfterLastUserText ?? '');
+    const currentText = comparablePreviewText(`${preview.text}${preview.thinking}${preview.error}`);
+    const sameAssistant = preview.latestAssistantId === snapshot.assistantAfterLastUserId;
+    if (preview.userMessageCount < snapshot.userMessageCount) return false;
+    if (preview.userMessageCount === snapshot.userMessageCount && snapshot.assistantAfterLastUserId && !sameAssistant && (!snapshotText || !currentText.includes(snapshotText))) return false;
+  }
+  return liveActivityMatchesPersistedPreview(activity, preview, hideThinking);
+}
+
 function textContainsPreview(fullText: string, previewText: string) {
   const full = comparablePreviewText(fullText);
   const preview = comparablePreviewText(previewText);

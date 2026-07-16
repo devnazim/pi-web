@@ -92,7 +92,7 @@ import {
   appendLiveActivityDelta,
   appendLivePreviewText,
   emptyAgentActivity,
-  liveActivityMatchesPersistedPreview,
+  persistedTranscriptMatchesLiveActivity,
   reduceAgentActivityEvent,
   retireAgentActivityPreview,
   shouldUseOptimizedStreamingRender,
@@ -10000,18 +10000,7 @@ function liveAgentActivityHasPreviewText(activity: AgentActivity, options: { hid
 }
 
 function transcriptHasCaughtUpToLiveActivity(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined, activity: AgentActivity) {
-  const preview = assistantAggregatePreviewAfterLastUser(entries, options);
-  if (!preview.latestAssistantId) return false;
-  const previewText = assistantPreviewText(preview);
-  if (snapshot) {
-    const snapshotText = comparablePreviewText(snapshot.assistantAfterLastUserText ?? '');
-    const currentText = comparablePreviewText(previewText);
-    const sameAssistant = preview.latestAssistantId === snapshot.assistantAfterLastUserId;
-    if (preview.userMessageCount < snapshot.userMessageCount) return false;
-    if (preview.userMessageCount === snapshot.userMessageCount && snapshot.assistantAfterLastUserId && !sameAssistant && (!snapshotText || !currentText.includes(snapshotText))) return false;
-    if (sameAssistant && currentText === snapshotText) return false;
-  }
-  return liveActivityMatchesPersistedPreview(activity, preview, options.hideThinking);
+  return persistedTranscriptMatchesLiveActivity(activity, assistantAggregatePreviewAfterLastUser(entries, options), snapshot, options.hideThinking);
 }
 
 function assistantAggregatePreviewAfterLastUser(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): AssistantAggregatePreview {
@@ -10053,10 +10042,6 @@ function joinPreviewSegments(current: string, next: string) {
 
 function assistantPreviewText(preview: AssistantEntryPreview) {
   return `${preview.text}${preview.thinking}${preview.error}`;
-}
-
-function comparablePreviewText(value: string) {
-  return value.replace(/^…\s*/, '').replace(/\s+/g, ' ').trim();
 }
 
 function chatDisplayEntries(entries: SessionEntry[]) {

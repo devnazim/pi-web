@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 import {
   emptyAgentActivity,
   liveActivityMatchesPersistedPreview,
+  persistedTranscriptMatchesLiveActivity,
   reduceAgentActivityEvent,
   retireAgentActivityPreview,
   shouldUseOptimizedStreamingRender,
@@ -109,6 +110,37 @@ describe('live agent activity', () => {
     assert.equal(liveActivityMatchesPersistedPreview(activity, { text: '', thinking: 'Thinking-only response' }, false), true);
     assert.equal(liveActivityMatchesPersistedPreview(activity, { text: '', thinking: 'Different reasoning' }, false), false);
     assert.equal(liveActivityMatchesPersistedPreview(activity, { text: '', thinking: '' }, true), true);
+  });
+
+  test('retires live content already present in the turn snapshot', () => {
+    const snapshot = { userMessageCount: 1, assistantAfterLastUserId: 'assistant-1', assistantAfterLastUserText: 'Final answer' };
+    const preview = { userMessageCount: 1, latestAssistantId: 'assistant-1', text: 'Final answer', thinking: '', error: '' };
+
+    assert.equal(persistedTranscriptMatchesLiveActivity({ ...emptyAgentActivity(), text: 'Final answer' }, preview, snapshot, false), true);
+    assert.equal(persistedTranscriptMatchesLiveActivity({ ...emptyAgentActivity(), text: 'Different answer' }, preview, snapshot, false), false);
+  });
+
+  test('does not retire against a regressed or unrelated transcript branch', () => {
+    const activity = { ...emptyAgentActivity(), text: 'Final answer' };
+
+    assert.equal(persistedTranscriptMatchesLiveActivity(activity, {
+      userMessageCount: 0,
+      latestAssistantId: 'assistant-1',
+      text: 'Final answer',
+      thinking: '',
+      error: '',
+    }, { userMessageCount: 1 }, false), false);
+    assert.equal(persistedTranscriptMatchesLiveActivity(activity, {
+      userMessageCount: 1,
+      latestAssistantId: 'assistant-2',
+      text: 'Final answer',
+      thinking: '',
+      error: '',
+    }, {
+      userMessageCount: 1,
+      assistantAfterLastUserId: 'assistant-1',
+      assistantAfterLastUserText: 'Prior branch answer',
+    }, false), false);
   });
 
   test('retires persisted response content while preserving completion notices', () => {
