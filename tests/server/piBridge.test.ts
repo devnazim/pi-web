@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { rm } from 'node:fs/promises';
 import { test } from 'node:test';
 import { PiBridge } from '../../src/server/piBridge.js';
+import { createSessionFile, sessionManagerForSession } from '../../src/server/sessions.js';
+import { sessionIdFromPath } from '../../src/server/util.js';
 
 test('binds browser extension UI in RPC mode', async () => {
   const bridge = new PiBridge();
@@ -11,6 +15,45 @@ test('binds browser extension UI in RPC mode', async () => {
   }, '/workspace', 'session-1', 'project-1:session-1');
 
   assert.equal(bindings?.mode, 'rpc');
+});
+
+test('applies explicit agent selection only before the pi-web review extension command', async () => {
+  const bridge = new PiBridge();
+  const calls: string[] = [];
+  const session = {
+    extensionRunner: {
+      getCommand: (name: string) => ['pi-web-review', 'other-extension', 'agent'].includes(name) ? {} : undefined,
+    },
+    prompt: async (prompt: string) => { calls.push(`prompt:${prompt}`); },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).applySuiteAgentSelection = async (_session: unknown, agent: string) => { calls.push(`select:${agent}`); };
+  (bridge as any).waitForCommandActivity = async () => undefined;
+  (bridge as any).broadcast = () => undefined;
+
+  await bridge.prompt(process.cwd(), {
+    sessionId: 'review-agent-session',
+    prompt: '/pi-web-review',
+    agent: 'reviewer',
+  }, 'project:review-agent-session');
+  await bridge.prompt(process.cwd(), {
+    sessionId: 'review-agent-session',
+    prompt: '/other-extension',
+    agent: 'other',
+  }, 'project:review-agent-session');
+  await bridge.prompt(process.cwd(), {
+    sessionId: 'review-agent-session',
+    prompt: '/agent alternate',
+    agent: 'alternate',
+  }, 'project:review-agent-session');
+
+  assert.deepEqual(calls, [
+    'select:reviewer',
+    'prompt:/pi-web-review',
+    'prompt:/other-extension',
+    'prompt:/agent alternate',
+  ]);
 });
 
 test('recovers a settled agent operation whose SDK promise never resolves', async () => {
@@ -843,6 +886,65 @@ test('status follows a replacement when a stale cache entry rejects', async () =
   rejectStale?.(new Error('stale session failed'));
 
   assert.equal((await status).sessionName, 'replacement-after-rejection');
+});
+
+test('uses the retained manager and named Pi Web review extension for durable sessions only', async () => {
+  const sessionDir = `/tmp/pi-web-review-loader-${randomUUID()}`;
+  const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
+  process.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
+  try {
+    const projectPath = process.cwd();
+    const sessionId = sessionIdFromPath(await createSessionFile(projectPath));
+    const retainedSessionManager = await sessionManagerForSession(sessionId, projectPath);
+    let loaderOptions: Record<string, any> | undefined;
+    let reloads = 0;
+    let createOptions: Record<string, any> | undefined;
+    const bridge = new PiBridge();
+    (bridge as any).loadSdk = async () => ({
+      DefaultResourceLoader: class {
+        constructor(options: Record<string, any>) { loaderOptions = options; }
+        async reload() { reloads += 1; }
+      },
+      SettingsManager: { create: () => ({ source: 'settings' }) },
+      SessionManager: {
+        open: () => { throw new Error('durable sessions must use the server-retained session manager'); },
+      },
+      createAgentSession: async (options: Record<string, any>) => {
+        createOptions = options;
+        return { session: {} };
+      },
+    });
+
+    await (bridge as any).getSession(projectPath, sessionId);
+
+    assert.equal(reloads, 1);
+    assert.equal(loaderOptions?.cwd, projectPath);
+    assert.equal(loaderOptions?.extensionFactories.length, 1);
+    assert.equal(loaderOptions?.extensionFactories[0].name, 'pi-web-review');
+    assert.equal(createOptions?.resourceLoader instanceof Object, true);
+    assert.equal(createOptions?.settingsManager, loaderOptions?.settingsManager);
+    assert.equal(createOptions?.sessionManager, retainedSessionManager);
+
+    let sessionlessCreateOptions: Record<string, any> | undefined;
+    const sessionlessBridge = new PiBridge();
+    (sessionlessBridge as any).loadSdk = async () => ({
+      DefaultResourceLoader: class {
+        constructor() { throw new Error('sessionless command discovery must not add the review extension'); }
+      },
+      SessionManager: { inMemory: () => ({}) },
+      createAgentSession: async (options: Record<string, any>) => {
+        sessionlessCreateOptions = options;
+        return { session: {} };
+      },
+    });
+
+    assert.deepEqual(await sessionlessBridge.commands(projectPath), []);
+    assert.equal(sessionlessCreateOptions?.resourceLoader, undefined);
+  } finally {
+    if (previousSessionDir === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    else process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionDir;
+    await rm(sessionDir, { recursive: true, force: true });
+  }
 });
 
 test('bounds session creation and disposes a late runtime', async () => {

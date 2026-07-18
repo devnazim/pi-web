@@ -103,6 +103,7 @@ import {
   type AgentToolActivity,
 } from './liveActivity';
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
+import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -125,6 +126,21 @@ type GitFileSelection = { path: string; staged: boolean };
 type GitFileActionMenuState = { file: GitFile; staged: boolean; x: number; y: number };
 type GitFileDiff = { path: string; staged: boolean; original: string; modified: string; unavailable?: boolean; message?: string; patch?: string };
 type ReviewFileDiffState = { key: string; loading: boolean; data?: GitFileDiff; error?: unknown };
+type ReviewThreadAnchor = { path: string; staged?: boolean; startLine: number; endLine: number; selectedText: string; contextBefore: string[]; contextAfter: string[]; [key: string]: unknown };
+type ReviewMessage = { id: string; author: 'user' | 'agent'; body: string; createdAt?: string; updatedAt?: string; deletedAt?: string };
+type ReviewThread = {
+  id: string;
+  anchor: ReviewThreadAnchor;
+  status: 'open' | 'resolved';
+  outdated: boolean;
+  outdatedReason?: string;
+  latestUserRevision?: unknown;
+  createdAt?: string;
+  updatedAt?: string;
+  messages: ReviewMessage[];
+};
+type ReviewThreadsResponse = { revision: number; threads: ReviewThread[] };
+type ReviewNoteDraft = ReviewLineRange & { path: string; staged: boolean; body: string; sessionId: string; selectedText: string; contextBefore: string[]; contextAfter: string[] };
 type GitStatus = { branch: string; files: GitFile[] };
 type ReviewEditorKind = 'diff' | 'patch';
 type ReviewDiffEditorViewState = import('monaco-editor').editor.IDiffEditorViewState;
@@ -144,6 +160,10 @@ type ReviewWorkspaceState = {
   commitDialogOpen: boolean;
   commitMessage: string;
   editorState?: ReviewEditorState;
+  reviewDrafts: Record<string, ReviewNoteDraft>;
+  reviewReplyDrafts: Record<string, string>;
+  reviewEditDrafts: Record<string, string>;
+  reviewCollapsedThreads: Record<string, boolean>;
 };
 type ProjectFileEntry = { name: string; type: 'directory' | 'file' };
 type ProjectFilesResponse = { path: string; entries: ProjectFileEntry[] };
@@ -388,6 +408,7 @@ const REVIEW_SOURCE_CONTROL_MIN_WIDTH = 260;
 const REVIEW_PREVIEW_MIN_WIDTH = 420;
 const REVIEW_SOURCE_CONTROL_RESIZE_KEY_STEP = 24;
 const REVIEW_EDITOR_SCROLL_BEYOND_LAST_COLUMN = 24;
+const REVIEW_CONTEXT_LINE_COUNT = 3;
 let reviewEditorModelSequence = 0;
 const RECENT_PROJECTS_KEY = 'pi-web-recent-projects';
 const RECENT_FILES_KEY_PREFIX = 'pi-web-recent-files:';
@@ -589,6 +610,10 @@ function createReviewWorkspaceState(): ReviewWorkspaceState {
     fileListScrollLeft: 0,
     commitDialogOpen: false,
     commitMessage: '',
+    reviewDrafts: {},
+    reviewReplyDrafts: {},
+    reviewEditDrafts: {},
+    reviewCollapsedThreads: {},
   };
 }
 
@@ -5023,7 +5048,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
             }
           >
             <Show when={project()} keyed>
-              {(reviewProject) => <ReviewWorkspace project={reviewProject} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} onClose={props.onClosePanel} />}
+              {(reviewProject) => <ReviewWorkspace project={reviewProject} sessionId={props.sessionId} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} onClose={props.onClosePanel} />}
             </Show>
           </Show>
         )}
@@ -6575,7 +6600,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           prompt,
           attachments,
           mirrorActiveStream,
-          agent: submittedAgentExplicit && !steeringSubmit && !extensionCommand ? submittedAgent : undefined,
+          agent: submittedAgentExplicit && !steeringSubmit && (!extensionCommand || composerSlashCommandName(prompt) === 'pi-web-review') ? submittedAgent : undefined,
           model: submittedModelExplicit ? submittedModel || submittedDefaultModel : shouldUseAgentModel ? undefined : submittedModel || submittedDefaultModel,
           thinking: submittedThinkingExplicit || !shouldUseAgentThinking ? promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel) : undefined,
           streamingBehavior: steeringSubmit && !extensionCommand ? 'steer' : undefined,
@@ -8392,7 +8417,7 @@ function GitCommitDialog(props: { stagedCount: number; busy: boolean; error: str
   );
 }
 
-function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState; themeMode: ResolvedThemeMode; onClose: () => void }) {
+function ReviewWorkspace(props: { project: Project; sessionId?: string; state: ReviewWorkspaceState; themeMode: ResolvedThemeMode; onClose: () => void }) {
   let reviewSplitRef: HTMLDivElement | undefined;
   let fileListRef: HTMLDivElement | undefined;
   const sourceControlPanel = createResizableDimension({
@@ -8420,6 +8445,13 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
   const [actionMenu, setActionMenu] = createSignal<GitFileActionMenuState>();
   const [busyAction, setBusyAction] = createSignal('');
   const [actionError, setActionError] = createSignal('');
+  const [notesVisible, setNotesVisible] = createSignal(true);
+  const [reviewNoteError, setReviewNoteError] = createSignal('');
+  const [reviewNoteBusy, setReviewNoteBusy] = createSignal('');
+  const [newDrafts, setNewDrafts] = createSignal(props.state.reviewDrafts);
+  const [replyDrafts, setReplyDrafts] = createSignal(props.state.reviewReplyDrafts);
+  const [editDrafts, setEditDrafts] = createSignal(props.state.reviewEditDrafts);
+  const [collapsedThreads, setCollapsedThreads] = createSignal(props.state.reviewCollapsedThreads);
   const status = createQuery(() => ({
     queryKey: ['git-status', props.project.id],
     queryFn: ({ signal }) => api<{ status: GitStatus }>(`/api/projects/${props.project.id}/git/status`, { signal }),
@@ -8430,6 +8462,12 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     queryKey: ['settings', props.project.id],
     queryFn: ({ signal }) => api<PiSettingsResponse>(`/api/projects/${props.project.id}/settings`, { signal }),
     staleTime: SETTINGS_CACHE_STALE_TIME_MS,
+  }));
+  const reviewThreads = createQuery(() => ({
+    queryKey: ['review-threads', props.project.id, props.sessionId],
+    queryFn: ({ signal }) => api<ReviewThreadsResponse>(`/api/projects/${props.project.id}/review-threads?sessionId=${encodeURIComponent(props.sessionId!)}`, { signal }),
+    enabled: Boolean(props.sessionId),
+    staleTime: 5_000,
   }));
   const [diffRefreshToken, setDiffRefreshToken] = createSignal(0);
   const [fileDiffState, setFileDiffState] = createSignal<ReviewFileDiffState>({ key: '', loading: false });
@@ -8448,6 +8486,55 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
     return current && state.key === key ? state : { key, loading: Boolean(current) };
   });
   const selectedDiff = createMemo(() => selectedDiffState().data);
+  const selectedThreads = createMemo(() => {
+    const path = selected()?.path;
+    return path ? (reviewThreads.data?.threads ?? []).filter((thread) => thread.anchor.path === path) : [];
+  });
+  const anchoredSelectedThreads = createMemo(() => {
+    const selection = selected();
+    const diff = selectedDiff();
+    if (!selection || !diff || diff.unavailable || diff.patch) return [];
+    return selectedThreads().flatMap((thread) => {
+      const range = projectReviewAnchor(thread.anchor, diff.modified, selection.staged !== (thread.anchor.staged === true));
+      return range ? [{
+        ...thread,
+        anchor: { ...thread.anchor, ...range, staged: selection.staged },
+        outdated: false,
+        outdatedReason: undefined,
+      }] : [];
+    });
+  });
+  const unanchoredSelectedThreads = createMemo(() => {
+    const anchoredIds = new Set(anchoredSelectedThreads().map((thread) => thread.id));
+    return selectedThreads().filter((thread) => !anchoredIds.has(thread.id));
+  });
+  const detachedThreads = createMemo(() => {
+    const changedPaths = new Set((status.data?.status.files ?? []).map((file) => file.path));
+    return (reviewThreads.data?.threads ?? []).filter((thread) => !changedPaths.has(thread.anchor.path));
+  });
+  const visibleFileLevelThreads = createMemo(() => [...unanchoredSelectedThreads(), ...detachedThreads()]);
+  const fileLevelThreadNotice = createMemo(() => {
+    if (unanchoredSelectedThreads().length && detachedThreads().length) return 'Some conversations cannot be anchored in this preview; others belong to paths no longer present in source control changes.';
+    if (detachedThreads().length) return 'These conversations belong to paths no longer present in staged or working tree changes.';
+    return 'These conversations are outdated or cannot be safely anchored in this preview.';
+  });
+  const currentDraft = createMemo(() => {
+    const sessionId = props.sessionId;
+    const selection = selected();
+    return sessionId && selection ? newDrafts()[`${sessionId}:${selection.staged ? 'staged' : 'worktree'}:${selection.path}`] : undefined;
+  });
+  const syntaxTheme = createMemo(() => shikiSyntaxTheme(props.themeMode, settings.data?.effective));
+
+  createEffect(() => { props.state.reviewDrafts = newDrafts(); });
+  createEffect(() => { props.state.reviewReplyDrafts = replyDrafts(); });
+  createEffect(() => { props.state.reviewEditDrafts = editDrafts(); });
+  createEffect(() => { props.state.reviewCollapsedThreads = collapsedThreads(); });
+  createEffect(() => {
+    props.sessionId;
+    selected()?.path;
+    selected()?.staged;
+    setReviewNoteError('');
+  });
 
   function refreshSelectedDiff(options?: { force?: boolean }) {
     const current = selected();
@@ -8520,8 +8607,13 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
   });
 
   createEffect(() => {
-    if (!selected()) return;
-    const refreshIfIdle = () => refreshSelectedDiff();
+    const sessionId = props.sessionId;
+    if (!selected() && !sessionId) return;
+    const refreshIfIdle = () => {
+      if (reviewNoteBusy()) return;
+      if (selected()) refreshSelectedDiff();
+      if (sessionId) void reviewThreads.refetch();
+    };
     const interval = window.setInterval(refreshIfIdle, 10_000);
     window.addEventListener('focus', refreshIfIdle);
     onCleanup(() => {
@@ -8529,6 +8621,174 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
       window.removeEventListener('focus', refreshIfIdle);
     });
   });
+
+  function selectedReviewSnapshot(range: ReviewLineRange) {
+    const lines = selectedDiff()?.modified.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n') ?? [];
+    return {
+      selectedText: lines.slice(range.startLine - 1, range.endLine).join('\n'),
+      contextBefore: lines.slice(Math.max(0, range.startLine - 1 - REVIEW_CONTEXT_LINE_COUNT), range.startLine - 1),
+      contextAfter: lines.slice(range.endLine, range.endLine + REVIEW_CONTEXT_LINE_COUNT),
+    };
+  }
+
+  function setNewReviewDraft(range?: ReviewLineRange) {
+    const sessionId = props.sessionId;
+    const selection = selected();
+    if (!sessionId || !selection) return;
+    setReviewNoteError('');
+    const key = `${sessionId}:${selection.staged ? 'staged' : 'worktree'}:${selection.path}`;
+    setNewDrafts((drafts) => {
+      if (!range) {
+        const next = { ...drafts };
+        delete next[key];
+        return next;
+      }
+      const existing = drafts[key];
+      const snapshot = selectedReviewSnapshot(range);
+      return {
+        ...drafts,
+        [key]: {
+          ...range,
+          path: selection.path,
+          staged: selection.staged,
+          body: existing?.body ?? '',
+          sessionId,
+          selectedText: existing?.selectedText ?? snapshot.selectedText,
+          contextBefore: existing?.contextBefore ?? snapshot.contextBefore,
+          contextAfter: existing?.contextAfter ?? snapshot.contextAfter,
+        },
+      };
+    });
+  }
+
+  function updateNewReviewDraft(body: string) {
+    const draft = currentDraft();
+    if (!draft) return;
+    setNewDrafts((drafts) => ({ ...drafts, [`${draft.sessionId}:${draft.staged ? 'staged' : 'worktree'}:${draft.path}`]: { ...draft, body } }));
+  }
+
+  async function mutateReviewNotes(actionKey: string, path: string, init: RequestInit, onSuccess?: (result: ReviewThreadsResponse) => void) {
+    const sessionId = props.sessionId;
+    if (!sessionId || reviewThreads.data?.revision === undefined || reviewNoteBusy()) return false;
+    setReviewNoteBusy(actionKey);
+    setReviewNoteError('');
+    const queryKey = ['review-threads', props.project.id, sessionId] as const;
+    try {
+      await queryClient.cancelQueries({ queryKey, exact: true }).catch(() => undefined);
+      const result = await api<ReviewThreadsResponse>(`/api/projects/${props.project.id}/review-threads${path}?sessionId=${encodeURIComponent(sessionId)}`, init);
+      await queryClient.cancelQueries({ queryKey, exact: true }).catch(() => undefined);
+      onSuccess?.(result);
+      queryClient.setQueryData<ReviewThreadsResponse>(queryKey, (current) => !current || current.revision <= result.revision ? result : current);
+      return true;
+    } catch (error) {
+      if ((error as { status?: number }).status === 409) {
+        if (props.sessionId === sessionId) await reviewThreads.refetch().catch(() => undefined);
+        else await queryClient.invalidateQueries({ queryKey: ['review-threads', props.project.id, sessionId] }).catch(() => undefined);
+        if (props.sessionId === sessionId) setReviewNoteError(errorMessage(error, 'Review notes changed. Retry your action.'));
+      } else if (props.sessionId === sessionId) {
+        setReviewNoteError(errorMessage(error, 'Could not update review note'));
+      }
+      return false;
+    } finally {
+      setReviewNoteBusy('');
+    }
+  }
+
+  async function createReviewThread() {
+    const draft = currentDraft();
+    if (!draft || !draft.body.trim()) return;
+    const draftKey = `${draft.sessionId}:${draft.staged ? 'staged' : 'worktree'}:${draft.path}`;
+    const clearSubmittedDraft = () => setNewDrafts((drafts) => {
+      if (drafts[draftKey]?.body !== draft.body) return drafts;
+      const next = { ...drafts };
+      delete next[draftKey];
+      return next;
+    });
+    const duplicate = reviewThreads.data?.threads.some((thread) => thread.anchor.path === draft.path
+      && (thread.anchor.staged === true) === draft.staged
+      && thread.anchor.startLine === draft.startLine
+      && thread.anchor.endLine === draft.endLine
+      && thread.anchor.selectedText === draft.selectedText
+      && thread.anchor.contextBefore.join('\n') === draft.contextBefore.join('\n')
+      && thread.anchor.contextAfter.join('\n') === draft.contextAfter.join('\n')
+      && thread.messages[0]?.author === 'user'
+      && !thread.messages[0].deletedAt
+      && thread.messages[0].body === draft.body.trim());
+    if (duplicate) {
+      clearSubmittedDraft();
+      return;
+    }
+    const snapshot = selectedReviewSnapshot(draft);
+    if (snapshot.selectedText !== draft.selectedText
+      || snapshot.contextBefore.join('\n') !== draft.contextBefore.join('\n')
+      || snapshot.contextAfter.join('\n') !== draft.contextAfter.join('\n')) {
+      setReviewNoteError('The selected lines or their surrounding context changed. Cancel this draft and select them again.');
+      return;
+    }
+    await mutateReviewNotes('create', '', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        expectedRevision: reviewThreads.data?.revision,
+        anchor: {
+          path: draft.path,
+          staged: draft.staged,
+          startLine: draft.startLine,
+          endLine: draft.endLine,
+          selectedText: draft.selectedText,
+          contextBefore: draft.contextBefore,
+          contextAfter: draft.contextAfter,
+        },
+        body: draft.body.trim(),
+      }),
+    }, clearSubmittedDraft);
+  }
+
+  async function replyToReviewThread(threadId: string) {
+    const draft = replyDrafts()[threadId] ?? '';
+    const body = draft.trim();
+    if (!body) return;
+    const succeeded = await mutateReviewNotes(`reply:${threadId}`, `/${threadId}/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: reviewThreads.data?.revision, body }),
+    });
+    if (succeeded) setReplyDrafts((drafts) => drafts[threadId] === draft ? { ...drafts, [threadId]: '' } : drafts);
+  }
+
+  async function editReviewMessage(threadId: string, messageId: string) {
+    const key = `${threadId}:${messageId}`;
+    const draft = editDrafts()[key] ?? '';
+    const body = draft.trim();
+    if (!body) return;
+    const succeeded = await mutateReviewNotes(`edit:${key}`, `/${threadId}/messages/${messageId}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: reviewThreads.data?.revision, body }),
+    });
+    if (succeeded) setEditDrafts((drafts) => {
+      if (drafts[key] !== draft) return drafts;
+      const next = { ...drafts };
+      delete next[key];
+      return next;
+    });
+  }
+
+  async function deleteReviewMessage(threadId: string, messageId: string) {
+    await mutateReviewNotes(`delete:${threadId}:${messageId}`, `/${threadId}/messages/${messageId}`, {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: reviewThreads.data?.revision }),
+    });
+  }
+
+  async function setReviewThreadStatus(thread: ReviewThread) {
+    await mutateReviewNotes(`status:${thread.id}`, `/${thread.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ expectedRevision: reviewThreads.data?.revision, status: thread.status === 'open' ? 'resolved' : 'open' }),
+    });
+  }
 
   function saveFileListScroll(element: HTMLDivElement) {
     props.state.fileListScrollTop = element.scrollTop;
@@ -8645,6 +8905,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
   function refreshReview() {
     queryClient.invalidateQueries({ queryKey: ['git-status', props.project.id] });
     refreshSelectedDiff({ force: true });
+    if (props.sessionId) void reviewThreads.refetch();
   }
 
   function changeStats(file: GitFile, staged: boolean) {
@@ -8789,6 +9050,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
         </>
       </Show>
       <main class="grid min-h-0 min-w-0 grid-rows-[auto_1fr] overflow-hidden">
+        <div class="review-preview-toolbar">
         <div class="review-preview-header">
           <div class="flex min-w-0 flex-1 items-center gap-2">
             <Show when={!sourceControlOpen()}>
@@ -8804,7 +9066,57 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
               <div class="text-xs text-muted-foreground">{selected() ? (selected()?.staged ? 'Staged changes' : 'Working tree changes') : 'No preview open'}<Show when={selectedStatus()}> · {selectedStatus()?.status}</Show></div>
             </div>
           </div>
-          <button class="project-modal-close shrink-0 review-close-desktop" title="Close reviewer" onClick={props.onClose}><X class="size-4" /></button>
+          <div class="flex shrink-0 items-center gap-1">
+            <Show when={!notesVisible() || (reviewThreads.data?.threads.length ?? 0) > 0 || Object.keys(newDrafts()).length > 0}>
+              <button class={`review-notes-toggle ${notesVisible() ? 'review-notes-toggle-active' : ''}`} type="button" title={notesVisible() ? 'Hide review notes' : 'Show review notes'} aria-pressed={notesVisible()} onClick={() => setNotesVisible((visible) => !visible)}><MessageSquare class="size-3.5" /><span>{notesVisible() ? 'Hide notes' : 'Show notes'}</span></button>
+            </Show>
+            <button class="project-modal-close shrink-0 review-close-desktop" title="Close reviewer" onClick={props.onClose}><X class="size-4" /></button>
+          </div>
+        </div>
+        <Show when={notesVisible() && !props.sessionId}>
+          <div class="review-note-notice review-note-notice-actionable">
+            <span>Select or create a Pi session to add review notes. Then click a line or select a range in the right pane and choose “+”.</span>
+            <button type="button" class="review-note-notice-button" onClick={props.onClose}>Choose session</button>
+          </div>
+        </Show>
+        <Show when={notesVisible() && props.sessionId && reviewThreads.error}><div class="review-note-notice review-note-notice-error">{errorMessage(reviewThreads.error, 'Could not load review notes')}</div></Show>
+        <Show when={notesVisible() && reviewNoteError()}><div class="review-note-notice review-note-notice-error">{reviewNoteError()}</div></Show>
+        </div>
+        <div class="review-preview-body">
+        <div class="review-unanchored-slot">
+        <Show when={notesVisible() && visibleFileLevelThreads().length > 0}>
+          <section class="review-unanchored-section" aria-label="Review conversations not anchored in the current diff">
+            <div class="review-unanchored-header">
+              <div class="font-semibold text-foreground">Review conversations</div>
+              <div>{fileLevelThreadNotice()}</div>
+            </div>
+            <div class="review-unanchored-list">
+              <For each={visibleFileLevelThreads()}>
+                {(thread) => (
+                  <ReviewThreadCard
+                    thread={thread}
+                    contextLabel={`${thread.anchor.path}, ${thread.anchor.startLine === thread.anchor.endLine ? `line ${thread.anchor.startLine}` : `lines ${thread.anchor.startLine}–${thread.anchor.endLine}`}`}
+                    showContext
+                    collapsed={Boolean(collapsedThreads()[thread.id])}
+                    busyAction={reviewNoteBusy()}
+                    replyDraft={replyDrafts()[thread.id] ?? ''}
+                    editDrafts={editDrafts()}
+                    syntaxTheme={syntaxTheme()}
+                    onToggle={() => setCollapsedThreads((threads) => ({ ...threads, [thread.id]: !threads[thread.id] }))}
+                    onReplyDraft={(body) => setReplyDrafts((drafts) => ({ ...drafts, [thread.id]: body }))}
+                    onReply={() => void replyToReviewThread(thread.id)}
+                    onStartEdit={(message) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${message.id}`]: message.body }))}
+                    onEditDraft={(messageId, body) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${messageId}`]: body }))}
+                    onCancelEdit={(messageId) => setEditDrafts((drafts) => { const next = { ...drafts }; delete next[`${thread.id}:${messageId}`]; return next; })}
+                    onEdit={(messageId) => void editReviewMessage(thread.id, messageId)}
+                    onDelete={(messageId) => void deleteReviewMessage(thread.id, messageId)}
+                    onStatus={() => void setReviewThreadStatus(thread)}
+                  />
+                )}
+              </For>
+            </div>
+          </section>
+        </Show>
         </div>
         <Show when={selected()} keyed fallback={<div class="review-preview-empty">Select a file to preview its staged or unstaged changes.</div>}>
           {(selection) => (
@@ -8823,6 +9135,28 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
                 syntaxTheme={settings.data?.effective.syntaxHighlightTheme}
                 syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight}
                 syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark}
+                shikiTheme={syntaxTheme()}
+                threads={anchoredSelectedThreads()}
+                notesVisible={notesVisible()}
+                canCreateNotes={Boolean(props.sessionId && reviewThreads.data)}
+                draft={currentDraft()}
+                busyAction={reviewNoteBusy()}
+                collapsedThreads={collapsedThreads()}
+                replyDrafts={replyDrafts()}
+                editDrafts={editDrafts()}
+                onStartDraft={setNewReviewDraft}
+                onDraftBody={updateNewReviewDraft}
+                onCancelDraft={() => setNewReviewDraft()}
+                onCreateThread={() => void createReviewThread()}
+                onToggleThread={(threadId) => setCollapsedThreads((threads) => ({ ...threads, [threadId]: !threads[threadId] }))}
+                onReplyDraft={(threadId, body) => setReplyDrafts((drafts) => ({ ...drafts, [threadId]: body }))}
+                onReply={(threadId) => void replyToReviewThread(threadId)}
+                onStartEdit={(threadId, message) => setEditDrafts((drafts) => ({ ...drafts, [`${threadId}:${message.id}`]: message.body }))}
+                onEditDraft={(threadId, messageId, body) => setEditDrafts((drafts) => ({ ...drafts, [`${threadId}:${messageId}`]: body }))}
+                onCancelEdit={(threadId, messageId) => setEditDrafts((drafts) => { const next = { ...drafts }; delete next[`${threadId}:${messageId}`]; return next; })}
+                onEdit={(threadId, messageId) => void editReviewMessage(threadId, messageId)}
+                onDelete={(threadId, messageId) => void deleteReviewMessage(threadId, messageId)}
+                onStatus={(thread) => void setReviewThreadStatus(thread)}
                 diffEditorViewState={diffEditorViewState}
                 patchEditorViewState={patchEditorViewState}
                 onDiffEditorViewStateChange={saveDiffEditorViewState}
@@ -8831,6 +9165,7 @@ function ReviewWorkspace(props: { project: Project; state: ReviewWorkspaceState;
             </Show>
           )}
         </Show>
+        </div>
       </main>
       <Show when={actionMenu()} keyed>
         {(menu) => (
@@ -8879,6 +9214,28 @@ function ReviewFileDiffPreview(props: {
   syntaxTheme?: SyntaxHighlightTheme;
   syntaxThemeLight?: SyntaxHighlightTheme;
   syntaxThemeDark?: SyntaxHighlightTheme;
+  shikiTheme: ShikiSyntaxTheme;
+  threads: ReviewThread[];
+  notesVisible: boolean;
+  canCreateNotes: boolean;
+  draft?: ReviewNoteDraft;
+  busyAction: string;
+  collapsedThreads: Record<string, boolean>;
+  replyDrafts: Record<string, string>;
+  editDrafts: Record<string, string>;
+  onStartDraft: (range: ReviewLineRange) => void;
+  onDraftBody: (body: string) => void;
+  onCancelDraft: () => void;
+  onCreateThread: () => void;
+  onToggleThread: (threadId: string) => void;
+  onReplyDraft: (threadId: string, body: string) => void;
+  onReply: (threadId: string) => void;
+  onStartEdit: (threadId: string, message: ReviewMessage) => void;
+  onEditDraft: (threadId: string, messageId: string, body: string) => void;
+  onCancelEdit: (threadId: string, messageId: string) => void;
+  onEdit: (threadId: string, messageId: string) => void;
+  onDelete: (threadId: string, messageId: string) => void;
+  onStatus: (thread: ReviewThread) => void;
   diffEditorViewState: (path: string, staged: boolean) => ReviewDiffEditorViewState | undefined;
   patchEditorViewState: (path: string, staged: boolean) => ReviewPatchEditorViewState | undefined;
   onDiffEditorViewStateChange: (path: string, staged: boolean, viewState: ReviewDiffEditorViewState) => void;
@@ -8900,6 +9257,28 @@ function ReviewFileDiffPreview(props: {
             syntaxTheme={props.syntaxTheme}
             syntaxThemeLight={props.syntaxThemeLight}
             syntaxThemeDark={props.syntaxThemeDark}
+            shikiTheme={props.shikiTheme}
+            threads={props.threads}
+            notesVisible={props.notesVisible}
+            canCreateNotes={props.canCreateNotes}
+            draft={props.draft}
+            busyAction={props.busyAction}
+            collapsedThreads={props.collapsedThreads}
+            replyDrafts={props.replyDrafts}
+            editDrafts={props.editDrafts}
+            onStartDraft={props.onStartDraft}
+            onDraftBody={props.onDraftBody}
+            onCancelDraft={props.onCancelDraft}
+            onCreateThread={props.onCreateThread}
+            onToggleThread={props.onToggleThread}
+            onReplyDraft={props.onReplyDraft}
+            onReply={props.onReply}
+            onStartEdit={props.onStartEdit}
+            onEditDraft={props.onEditDraft}
+            onCancelEdit={props.onCancelEdit}
+            onEdit={props.onEdit}
+            onDelete={props.onDelete}
+            onStatus={props.onStatus}
           />
         }
       >
@@ -8960,7 +9339,144 @@ function GitFileActionMenu(props: { menu: GitFileActionMenuState; onDismiss: () 
   );
 }
 
-function ReviewDiffEditor(props: { path: string; original: string; modified: string; viewStateKey: string; viewState?: ReviewDiffEditorViewState; onViewStateChange?: (viewState: ReviewDiffEditorViewState) => void; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme }) {
+function reviewMessageTime(value?: string) {
+  if (!value) return '';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
+}
+
+function ReviewThreadCard(props: {
+  thread: ReviewThread;
+  contextLabel: string;
+  showContext?: boolean;
+  collapsed: boolean;
+  busyAction: string;
+  replyDraft: string;
+  editDrafts: Record<string, string>;
+  syntaxTheme: ShikiSyntaxTheme;
+  onToggle: () => void;
+  onReplyDraft: (body: string) => void;
+  onReply: () => void;
+  onStartEdit: (message: ReviewMessage) => void;
+  onEditDraft: (messageId: string, body: string) => void;
+  onCancelEdit: (messageId: string) => void;
+  onEdit: (messageId: string) => void;
+  onDelete: (messageId: string) => void;
+  onStatus: () => void;
+}) {
+  return (
+    <article class={`review-thread-card ${props.thread.status === 'resolved' ? 'review-thread-resolved' : ''} ${props.thread.outdated ? 'review-thread-outdated' : ''}`} aria-label={`Review thread on ${props.contextLabel}`}>
+      <button class="review-thread-header" type="button" aria-label={`${props.collapsed ? 'Expand' : 'Collapse'} review thread on ${props.contextLabel}`} aria-expanded={!props.collapsed} onClick={props.onToggle}>
+        <span class="review-thread-header-icon">{props.collapsed ? <ChevronRight class="size-3.5" /> : <ChevronDown class="size-3.5" />}</span>
+        <MessageSquare class="size-3.5 shrink-0" />
+        <span class="review-thread-title">
+          <span>{props.thread.status === 'resolved' ? 'Resolved thread' : 'Review thread'}</span>
+          <Show when={props.showContext}><span class="review-thread-location">{props.contextLabel}</span></Show>
+        </span>
+        <span class="review-thread-count">{props.thread.messages.length}</span>
+        <Show when={props.thread.outdated}><span class="review-thread-badge">Outdated</span></Show>
+      </button>
+      <Show when={!props.collapsed}>
+        <Show when={props.thread.outdated}><div class="review-thread-warning">{props.thread.outdatedReason || 'The selected lines no longer match the current file.'}</div></Show>
+        <div class="review-thread-messages">
+          <For each={props.thread.messages}>
+            {(message, messageIndex) => {
+              const editKey = `${props.thread.id}:${message.id}`;
+              return (
+                <div class={`review-thread-message ${message.author === 'agent' ? 'review-thread-message-agent' : ''}`}>
+                  <div class="review-thread-message-meta"><strong>{message.author === 'agent' ? 'Agent' : 'You'}</strong><span>{reviewMessageTime(message.updatedAt ?? message.createdAt)}</span></div>
+                  <Show when={message.deletedAt} fallback={
+                    <Show when={props.editDrafts[editKey] !== undefined} fallback={<MarkdownContent text={message.body} compact syntaxTheme={props.syntaxTheme} />}>
+                      <textarea class="review-thread-textarea" aria-label={`Edit your message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} value={props.editDrafts[editKey]} onInput={(event) => props.onEditDraft(message.id, event.currentTarget.value)} />
+                      <div class="review-thread-actions">
+                        <button class="review-thread-button" type="button" aria-label={`Save message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} disabled={!props.editDrafts[editKey]?.trim() || Boolean(props.busyAction)} onClick={() => props.onEdit(message.id)}>Save</button>
+                        <button class="review-thread-button" type="button" aria-label={`Cancel editing message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} onClick={() => props.onCancelEdit(message.id)}>Cancel</button>
+                      </div>
+                    </Show>
+                  }><div class="review-thread-tombstone">This message was deleted.</div></Show>
+                  <Show when={message.author === 'user' && !message.deletedAt && props.editDrafts[editKey] === undefined}>
+                    <div class="review-thread-actions">
+                      <button class="review-thread-link" type="button" aria-label={`Edit your message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} onClick={() => props.onStartEdit(message)}>Edit</button>
+                      <button class="review-thread-link review-thread-link-danger" type="button" aria-label={`Delete your message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} disabled={Boolean(props.busyAction)} onClick={() => props.onDelete(message.id)}>Delete</button>
+                    </div>
+                  </Show>
+                </div>
+              );
+            }}
+          </For>
+        </div>
+        <div class="review-thread-reply">
+          <textarea class="review-thread-textarea" aria-label={`Reply to review thread on ${props.contextLabel}`} value={props.replyDraft} placeholder="Reply to thread" onInput={(event) => props.onReplyDraft(event.currentTarget.value)} />
+          <div class="review-thread-actions review-thread-actions-between">
+            <button class="review-thread-link" type="button" aria-label={`${props.thread.status === 'open' ? 'Resolve' : 'Reopen'} review thread on ${props.contextLabel}`} disabled={Boolean(props.busyAction)} onClick={props.onStatus}>{props.thread.status === 'open' ? 'Resolve thread' : 'Reopen thread'}</button>
+            <button class="review-thread-button" type="button" aria-label={`Reply to review thread on ${props.contextLabel}`} disabled={!props.replyDraft.trim() || Boolean(props.busyAction)} onClick={props.onReply}>Reply</button>
+          </div>
+        </div>
+      </Show>
+    </article>
+  );
+}
+
+function ReviewDraftCard(props: { draft: ReviewNoteDraft; busy: boolean; onBody: (body: string) => void; onCancel: () => void; onSubmit: () => void }) {
+  let textareaRef: HTMLTextAreaElement | undefined;
+  const contextLabel = () => `${props.draft.path}, ${props.draft.startLine === props.draft.endLine ? `line ${props.draft.startLine}` : `lines ${props.draft.startLine}–${props.draft.endLine}`}`;
+  onMount(() => queueMicrotask(() => textareaRef?.focus({ preventScroll: true })));
+  return (
+    <div class="review-thread-card review-draft-card">
+      <div class="review-draft-title">New note on {props.draft.startLine === props.draft.endLine ? `line ${props.draft.startLine}` : `lines ${props.draft.startLine}–${props.draft.endLine}`}</div>
+      <textarea ref={textareaRef} class="review-thread-textarea" aria-label={`New review note on ${contextLabel()}`} value={props.draft.body} placeholder="Leave a review note" onInput={(event) => props.onBody(event.currentTarget.value)} />
+      <div class="review-thread-actions">
+        <button class="review-thread-button" type="button" aria-label={`Cancel new review note on ${contextLabel()}`} onClick={props.onCancel}>Cancel</button>
+        <button class="review-thread-button review-thread-button-primary" type="button" aria-label={`Add review note on ${contextLabel()}`} disabled={!props.draft.body.trim() || props.busy} onClick={props.onSubmit}>Add note</button>
+      </div>
+    </div>
+  );
+}
+
+type ReviewDiffEditorProps = {
+  path: string;
+  original: string;
+  modified: string;
+  viewStateKey: string;
+  viewState?: ReviewDiffEditorViewState;
+  onViewStateChange?: (viewState: ReviewDiffEditorViewState) => void;
+  themeMode: ResolvedThemeMode;
+  syntaxTheme?: SyntaxHighlightTheme;
+  syntaxThemeLight?: SyntaxHighlightTheme;
+  syntaxThemeDark?: SyntaxHighlightTheme;
+  shikiTheme: ShikiSyntaxTheme;
+  threads: ReviewThread[];
+  notesVisible: boolean;
+  canCreateNotes: boolean;
+  draft?: ReviewNoteDraft;
+  busyAction: string;
+  collapsedThreads: Record<string, boolean>;
+  replyDrafts: Record<string, string>;
+  editDrafts: Record<string, string>;
+  onStartDraft: (range: ReviewLineRange) => void;
+  onDraftBody: (body: string) => void;
+  onCancelDraft: () => void;
+  onCreateThread: () => void;
+  onToggleThread: (threadId: string) => void;
+  onReplyDraft: (threadId: string, body: string) => void;
+  onReply: (threadId: string) => void;
+  onStartEdit: (threadId: string, message: ReviewMessage) => void;
+  onEditDraft: (threadId: string, messageId: string, body: string) => void;
+  onCancelEdit: (threadId: string, messageId: string) => void;
+  onEdit: (threadId: string, messageId: string) => void;
+  onDelete: (threadId: string, messageId: string) => void;
+  onStatus: (thread: ReviewThread) => void;
+};
+
+function ReviewDiffEditor(props: ReviewDiffEditorProps) {
+  type NoteZoneGroup = {
+    zoneIds: string[];
+    rootDisposers: Array<() => void>;
+    resizeObservers: ResizeObserver[];
+  };
+  type NoteScrollAnchor = { lineNumber?: number; lineOffset?: number; scrollTop: number; scrollLeft: number };
+  type AddNotePointerSnapshot = { range: ReviewLineRange; path: string; modelUri?: string; versionId?: number };
+
   let containerRef: HTMLDivElement | undefined;
   let monacoApi: MonacoApi | undefined;
   let editor: import('monaco-editor').editor.IStandaloneDiffEditor | undefined;
@@ -8968,7 +9484,250 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
   let modifiedModel: import('monaco-editor').editor.ITextModel | undefined;
   let currentPath = '';
   let appliedViewStateKey = '';
+  let selectionListener: import('monaco-editor').IDisposable | undefined;
+  let threadDecorations: import('monaco-editor').editor.IEditorDecorationsCollection | undefined;
+  let draftDecorations: import('monaco-editor').editor.IEditorDecorationsCollection | undefined;
+  const threadZones: NoteZoneGroup = { zoneIds: [], rootDisposers: [], resizeObservers: [] };
+  const draftZones: NoteZoneGroup = { zoneIds: [], rootDisposers: [], resizeObservers: [] };
+  let addNoteHost: HTMLButtonElement | undefined;
+  let addNoteWidget: import('monaco-editor').editor.IContentWidget | undefined;
+  let addNoteRange: ReviewLineRange = { startLine: 1, endLine: 1 };
+  let addNotePointerSnapshot: AddNotePointerSnapshot | undefined;
   const [sideBySide, setSideBySide] = createSignal(true);
+  const [editorReady, setEditorReady] = createSignal(false);
+  const [selectionRange, setSelectionRange] = createSignal<ReviewLineRange>({ startLine: 1, endLine: 1 });
+  const notePath = createMemo(() => props.path);
+  const noteModified = createMemo(() => props.modified);
+  const noteVisibility = createMemo(() => props.notesVisible);
+  const noteCreation = createMemo(() => props.canCreateNotes);
+  const draftAnchorKey = createMemo(() => `${props.draft?.path ?? ''}:${props.draft?.startLine ?? ''}:${props.draft?.endLine ?? ''}`);
+  const threadsRenderKey = createMemo(() => JSON.stringify(props.threads));
+
+  function disposeNoteZones(group: NoteZoneGroup) {
+    const modifiedEditor = editor?.getModifiedEditor();
+    for (const observer of group.resizeObservers) observer.disconnect();
+    group.resizeObservers = [];
+    if (modifiedEditor && group.zoneIds.length) modifiedEditor.changeViewZones((accessor) => {
+      for (const id of group.zoneIds) accessor.removeZone(id);
+    });
+    group.zoneIds = [];
+    for (const disposeRoot of group.rootDisposers) disposeRoot();
+    group.rootDisposers = [];
+  }
+
+  function disposeThreadNoteUi() {
+    threadDecorations?.clear();
+    threadDecorations = undefined;
+    disposeNoteZones(threadZones);
+  }
+
+  function disposeDraftNoteUi() {
+    draftDecorations?.clear();
+    draftDecorations = undefined;
+    disposeNoteZones(draftZones);
+  }
+
+  function disposeAddNoteWidget() {
+    if (addNoteWidget) editor?.getModifiedEditor().removeContentWidget(addNoteWidget);
+    addNoteHost = undefined;
+    addNoteWidget = undefined;
+    addNotePointerSnapshot = undefined;
+  }
+
+  function disposeNoteUi() {
+    disposeAddNoteWidget();
+    disposeThreadNoteUi();
+    disposeDraftNoteUi();
+  }
+
+  function captureNoteScrollAnchor(modifiedEditor: import('monaco-editor').editor.ICodeEditor): NoteScrollAnchor {
+    const scrollTop = modifiedEditor.getScrollTop();
+    const lineNumber = modifiedEditor.getVisibleRanges()[0]?.startLineNumber;
+    return {
+      lineNumber,
+      lineOffset: lineNumber === undefined ? undefined : modifiedEditor.getTopForLineNumber(lineNumber, true) - scrollTop,
+      scrollTop,
+      scrollLeft: modifiedEditor.getScrollLeft(),
+    };
+  }
+
+  function restoreNoteScrollAnchor(modifiedEditor: import('monaco-editor').editor.ICodeEditor, anchor: NoteScrollAnchor) {
+    modifiedEditor.setScrollPosition({
+      scrollTop: anchor.lineNumber === undefined || anchor.lineOffset === undefined ? anchor.scrollTop : modifiedEditor.getTopForLineNumber(anchor.lineNumber, true) - anchor.lineOffset,
+      scrollLeft: anchor.scrollLeft,
+    });
+  }
+
+  function addReviewZone(group: NoteZoneGroup, afterLineNumber: number, renderContent: (host: HTMLDivElement) => () => void) {
+    const modifiedEditor = editor?.getModifiedEditor();
+    if (!modifiedEditor) return;
+    const host = document.createElement('div');
+    host.className = 'review-thread-zone';
+    host.onpointerdown = (event) => event.stopPropagation();
+    host.onmousedown = (event) => event.stopPropagation();
+    host.style.width = `${modifiedEditor.getLayoutInfo().contentWidth}px`;
+    group.rootDisposers.push(renderContent(host));
+    const content = host.firstElementChild as HTMLElement | null;
+    let measuredContentHeight = 32;
+    const contentHeight = () => {
+      const nextHeight = content?.getBoundingClientRect().height ?? 0;
+      if (nextHeight > 0) measuredContentHeight = nextHeight;
+      return Math.max(48, measuredContentHeight + 16);
+    };
+    let zoneId = '';
+    const zone: import('monaco-editor').editor.IViewZone = { afterLineNumber, heightInPx: contentHeight(), domNode: host };
+    modifiedEditor.changeViewZones((accessor) => {
+      zoneId = accessor.addZone(zone);
+    });
+    group.zoneIds.push(zoneId);
+    const observer = new ResizeObserver(() => {
+      if (!group.zoneIds.includes(zoneId)) return;
+      host.style.width = `${modifiedEditor.getLayoutInfo().contentWidth}px`;
+      const height = contentHeight();
+      if (zone.heightInPx === height) return;
+      const scrollAnchor = captureNoteScrollAnchor(modifiedEditor);
+      zone.heightInPx = height;
+      modifiedEditor.changeViewZones((accessor) => accessor.layoutZone(zoneId));
+      restoreNoteScrollAnchor(modifiedEditor, scrollAnchor);
+    });
+    observer.observe(content ?? host);
+    const editorDomNode = modifiedEditor.getDomNode();
+    if (editorDomNode) observer.observe(editorDomNode);
+    group.resizeObservers.push(observer);
+  }
+
+  function rebuildThreadNoteUi() {
+    const modifiedEditor = editor?.getModifiedEditor();
+    const monaco = monacoApi;
+    if (!modifiedEditor || !monaco) return;
+    const scrollAnchor = captureNoteScrollAnchor(modifiedEditor);
+    disposeThreadNoteUi();
+    if (!props.notesVisible) {
+      restoreNoteScrollAnchor(modifiedEditor, scrollAnchor);
+      return;
+    }
+
+    const decorations: import('monaco-editor').editor.IModelDeltaDecoration[] = [];
+    for (const thread of props.threads) {
+      decorations.push({
+        range: new monaco.Range(thread.anchor.startLine, 1, thread.anchor.endLine, 1),
+        options: { isWholeLine: true, className: 'review-note-line', linesDecorationsClassName: 'review-note-lines-decoration', glyphMarginClassName: 'review-note-glyph' },
+      });
+      addReviewZone(threadZones, thread.anchor.endLine, (host) => render(() => (
+        <ReviewThreadCard
+          thread={thread}
+          contextLabel={`${thread.anchor.path}, ${thread.anchor.startLine === thread.anchor.endLine ? `line ${thread.anchor.startLine}` : `lines ${thread.anchor.startLine}–${thread.anchor.endLine}`}`}
+          collapsed={Boolean(props.collapsedThreads[thread.id])}
+          busyAction={props.busyAction}
+          replyDraft={props.replyDrafts[thread.id] ?? ''}
+          editDrafts={props.editDrafts}
+          syntaxTheme={props.shikiTheme}
+          onToggle={() => props.onToggleThread(thread.id)}
+          onReplyDraft={(body) => props.onReplyDraft(thread.id, body)}
+          onReply={() => props.onReply(thread.id)}
+          onStartEdit={(message) => props.onStartEdit(thread.id, message)}
+          onEditDraft={(messageId, body) => props.onEditDraft(thread.id, messageId, body)}
+          onCancelEdit={(messageId) => props.onCancelEdit(thread.id, messageId)}
+          onEdit={(messageId) => props.onEdit(thread.id, messageId)}
+          onDelete={(messageId) => props.onDelete(thread.id, messageId)}
+          onStatus={() => props.onStatus(thread)}
+        />
+      ), host));
+    }
+
+    threadDecorations = modifiedEditor.createDecorationsCollection(decorations);
+    restoreNoteScrollAnchor(modifiedEditor, scrollAnchor);
+  }
+
+  function rebuildDraftNoteUi() {
+    const modifiedEditor = editor?.getModifiedEditor();
+    const monaco = monacoApi;
+    if (!modifiedEditor || !monaco) return;
+    const scrollAnchor = captureNoteScrollAnchor(modifiedEditor);
+    disposeDraftNoteUi();
+    if (props.notesVisible && props.draft?.path === props.path) {
+      draftDecorations = modifiedEditor.createDecorationsCollection([{
+        range: new monaco.Range(props.draft.startLine, 1, props.draft.endLine, 1),
+        options: { isWholeLine: true, className: 'review-note-line review-note-line-draft', linesDecorationsClassName: 'review-note-lines-decoration', glyphMarginClassName: 'review-note-glyph review-note-glyph-draft' },
+      }]);
+      addReviewZone(draftZones, props.draft.endLine, (host) => render(() => (
+        <Show when={props.draft?.path === props.path ? props.draft : undefined}>
+          {(draft) => <ReviewDraftCard draft={draft()} busy={Boolean(props.busyAction)} onBody={props.onDraftBody} onCancel={props.onCancelDraft} onSubmit={props.onCreateThread} />}
+        </Show>
+      ), host));
+    }
+    restoreNoteScrollAnchor(modifiedEditor, scrollAnchor);
+  }
+
+  function canShowAddNoteWidget() {
+    return props.notesVisible && props.canCreateNotes && props.draft?.path !== props.path;
+  }
+
+  function syncAddNoteWidget(range: ReviewLineRange) {
+    const modifiedEditor = editor?.getModifiedEditor();
+    const monaco = monacoApi;
+    if (!modifiedEditor || !monaco || !canShowAddNoteWidget()) {
+      disposeAddNoteWidget();
+      return;
+    }
+
+    const lineCount = modifiedEditor.getModel()?.getLineCount() ?? 1;
+    addNoteRange = {
+      startLine: Math.max(1, Math.min(range.startLine, lineCount)),
+      endLine: Math.max(1, Math.min(range.endLine, lineCount)),
+    };
+    if (!addNoteHost || !addNoteWidget) {
+      const host = document.createElement('button');
+      host.type = 'button';
+      host.className = 'review-add-note';
+      host.onpointerdown = (event) => {
+        if (event.button !== 0) return;
+        event.stopPropagation();
+        const model = modifiedEditor.getModel();
+        addNotePointerSnapshot = {
+          range: { ...addNoteRange },
+          path: props.path,
+          modelUri: model?.uri.toString(),
+          versionId: model?.getVersionId(),
+        };
+      };
+      host.onmousedown = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      };
+      host.onpointercancel = () => {
+        addNotePointerSnapshot = undefined;
+      };
+      host.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const pointerSnapshot = addNotePointerSnapshot;
+        addNotePointerSnapshot = undefined;
+        if (!canShowAddNoteWidget()) return;
+        const model = modifiedEditor.getModel();
+        if (event.detail !== 0 && pointerSnapshot && (pointerSnapshot.path !== props.path || pointerSnapshot.modelUri !== model?.uri.toString() || pointerSnapshot.versionId !== model?.getVersionId())) return;
+        props.onStartDraft({ ...(event.detail === 0 ? addNoteRange : (pointerSnapshot?.range ?? addNoteRange)) });
+      };
+      const widget: import('monaco-editor').editor.IContentWidget = {
+        allowEditorOverflow: false,
+        suppressMouseDown: true,
+        getId: () => 'pi-web-review-add-note',
+        getDomNode: () => host,
+        getPosition: () => ({
+          position: { lineNumber: addNoteRange.endLine, column: 1 },
+          preference: [monaco.editor.ContentWidgetPositionPreference.EXACT],
+        }),
+      };
+      addNoteHost = host;
+      addNoteWidget = widget;
+      modifiedEditor.addContentWidget(widget);
+    }
+
+    const rangeLabel = addNoteRange.startLine === addNoteRange.endLine ? `line ${addNoteRange.startLine}` : `lines ${addNoteRange.startLine}–${addNoteRange.endLine}`;
+    addNoteHost.title = `Add note on ${rangeLabel}`;
+    addNoteHost.setAttribute('aria-label', `Add review note on ${props.path}, ${rangeLabel}`);
+    modifiedEditor.layoutContentWidget(addNoteWidget);
+  }
 
   function saveViewState() {
     const viewState = editor?.saveViewState();
@@ -9036,7 +9795,7 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
         overviewRulerLanes: 0,
         hideCursorInOverviewRuler: true,
         folding: true,
-        glyphMargin: false,
+        glyphMargin: true,
         lineNumbersMinChars: 4,
         wordWrap: 'off',
         scrollBeyondLastColumn: REVIEW_EDITOR_SCROLL_BEYOND_LAST_COLUMN,
@@ -9044,10 +9803,23 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
         scrollbar: { useShadows: false, horizontal: 'auto', vertical: 'auto' },
       });
       createModels(monaco);
+      const modifiedEditor = editor.getModifiedEditor();
+      const updateSelection = () => {
+        const selection = modifiedEditor.getSelection();
+        if (!selection) return;
+        const nextRange = reviewSelectionLineRange(selection);
+        setSelectionRange((currentRange) => currentRange.startLine === nextRange.startLine && currentRange.endLine === nextRange.endLine ? currentRange : nextRange);
+      };
+      updateSelection();
+      selectionListener = modifiedEditor.onDidChangeCursorSelection(updateSelection);
+      setEditorReady(true);
     });
 
     onCleanup(() => {
       disposed = true;
+      setEditorReady(false);
+      selectionListener?.dispose();
+      disposeNoteUi();
       disposeFindHoverGuard?.();
       mediaQuery.removeEventListener('change', updateLayoutMode);
       saveViewState();
@@ -9090,6 +9862,35 @@ function ReviewDiffEditor(props: { path: string; original: string; modified: str
     props.syntaxThemeDark;
     if (!editor || !monacoApi) return;
     monacoApi.editor.setTheme(monacoPreviewThemeId(props.themeMode, props.syntaxThemeLight, props.syntaxThemeDark, props.syntaxTheme));
+  });
+
+  createEffect(() => {
+    if (!editorReady()) return;
+    notePath();
+    noteModified();
+    noteVisibility();
+    threadsRenderKey();
+    untrack(rebuildThreadNoteUi);
+  });
+
+  createEffect(() => {
+    if (!editorReady()) return;
+    notePath();
+    noteModified();
+    noteVisibility();
+    draftAnchorKey();
+    untrack(rebuildDraftNoteUi);
+  });
+
+  createEffect(() => {
+    if (!editorReady()) return;
+    notePath();
+    noteModified();
+    noteVisibility();
+    noteCreation();
+    draftAnchorKey();
+    const range = selectionRange();
+    untrack(() => syncAddNoteWidget(range));
   });
 
   return <div ref={containerRef} class="review-diff-editor" aria-label={`Diff preview of ${props.path}`} />;

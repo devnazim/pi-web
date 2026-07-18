@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ProjectRegistry } from './projects.js';
+import { cleanupOrphanedSessionReviewThreads, deleteSessionReviewThreads } from './reviewThreads.js';
 import type { SessionDetail, SessionSummary } from './types.js';
 import { cleanupOrphanedSessionUploads, deleteSessionUploads } from './uploads.js';
 import { pathFromSessionId, sessionDirForCwd, sessionIdFromPath } from './util.js';
@@ -22,13 +23,16 @@ type SessionListPage = { sessions: SessionSummary[]; nextCursor?: string; total:
 type SessionFileInfo = { path: string; modifiedMs: number; size: number };
 type SessionListCursor = { path: string; updatedMs: number };
 type SessionFileEntry = { type?: string; timestamp?: string; name?: string; message?: unknown; id?: unknown; [key: string]: unknown };
-type DeletedSessionFile = { path: string; sessionUuid?: string };
+type DeletedSessionFile = { path: string; sessionUuid: string };
 type SessionSummaryCacheEntry = { modifiedMs: number; size: number; summary: SessionSummary | null };
 
 const sessionSummaryCache = new Map<string, SessionSummaryCacheEntry>();
-const sessionUploadCleanupTimes = new Map<string, number>();
+const sessionResourceCleanupTimes = new Map<string, number>();
 const pendingSessionFiles = new Map<string, number>();
 const pendingSessionNames = new Map<string, string>();
+const pendingSessionUuids = new Map<string, string>();
+const pendingSessionCwds = new Map<string, string>();
+const pendingSessionManagers = new Map<string, SessionManager>();
 
 export async function listSessions(projectId: string, cwd: string): Promise<SessionSummary[]> {
   const sessions = await SessionManager.list(cwd, projectSessionDir(cwd));
@@ -81,49 +85,127 @@ export async function createSessionFile(cwd: string) {
   const filePath = manager.getSessionFile();
   const header = manager.getHeader();
   if (!filePath || !header) throw new Error('Could not create pi session');
-  rememberPendingSessionFile(filePath);
+  if (!header.id) throw new Error('Could not determine pi session UUID');
+  rememberPendingSessionFile(filePath, header.id, cwd, manager);
   return filePath;
 }
 
 export async function deleteSessionFile(sessionId: string, cwd: string): Promise<DeletedSessionFile> {
   const sessionDir = path.resolve(projectSessionDir(cwd));
-  const filePath = await resolveSessionFile(sessionId, cwd);
+  const { filePath, sessionUuid } = await resolveSessionIdentity(sessionId, cwd);
   if (path.dirname(path.resolve(filePath)) !== sessionDir) throw new Error('Session does not belong to this project');
-  const sessionUuid = await sessionUuidFromFile(filePath);
   if (existsSync(filePath)) await unlink(filePath);
   else if (!isPendingSessionFile(filePath)) throw new Error('Unknown session');
   pendingSessionFiles.delete(path.resolve(filePath));
   pendingSessionNames.delete(path.resolve(filePath));
+  pendingSessionUuids.delete(path.resolve(filePath));
+  pendingSessionCwds.delete(path.resolve(filePath));
+  pendingSessionManagers.delete(path.resolve(filePath));
   sessionSummaryCache.delete(filePath);
   return { path: filePath, sessionUuid };
 }
 
 export async function resolveSessionFile(sessionId: string, cwd: string) {
   const sessionDir = path.resolve(projectSessionDir(cwd));
+  let decodedPath: string | undefined;
   try {
-    const decoded = pathFromSessionId(sessionId);
-    const decodedPath = path.resolve(decoded);
-    // New pi sessions intentionally do not hit disk until the first assistant reply.
-    if (decodedPath.endsWith('.jsonl') && path.dirname(decodedPath) === sessionDir) {
-      if (existsSync(decodedPath)) {
-        pendingSessionFiles.delete(decodedPath);
-        pendingSessionNames.delete(decodedPath);
-        return decodedPath;
-      }
-      if (isPendingSessionFile(decodedPath)) return decodedPath;
-    }
+    decodedPath = path.resolve(pathFromSessionId(sessionId));
   } catch {
     // The id may be pi's session UUID rather than this web server's path token.
+  }
+  // New pi sessions intentionally do not hit disk until the first assistant reply.
+  if (decodedPath?.endsWith('.jsonl') && path.dirname(decodedPath) === sessionDir) {
+    if (existsSync(decodedPath)) {
+      await assertSessionFileOwnership(decodedPath, cwd);
+      pendingSessionFiles.delete(decodedPath);
+      pendingSessionNames.delete(decodedPath);
+      pendingSessionUuids.delete(decodedPath);
+      pendingSessionCwds.delete(decodedPath);
+      pendingSessionManagers.delete(decodedPath);
+      return decodedPath;
+    }
+    if (isPendingSessionFile(decodedPath)) {
+      assertPendingSessionOwnership(decodedPath, cwd);
+      return decodedPath;
+    }
+  }
+
+  cleanupPendingSessionFiles();
+  const pendingPath = [...pendingSessionUuids.entries()].find(([filePath, uuid]) => (
+    uuid === sessionId
+    && path.dirname(filePath) === sessionDir
+    && path.resolve(pendingSessionCwds.get(filePath) ?? '') === path.resolve(cwd)
+  ))?.[0];
+  if (pendingPath) {
+    pendingSessionFiles.set(pendingPath, Date.now() + PENDING_SESSION_FILE_TTL_MS);
+    return pendingPath;
   }
 
   const sessions = await SessionManager.list(cwd, sessionDir);
   const session = sessions.find((item) => item.id === sessionId || sessionIdFromPath(item.path) === sessionId || path.basename(item.path, '.jsonl').includes(sessionId));
   if (!session) throw new Error('Unknown session');
+  await assertSessionFileOwnership(session.path, cwd);
   return session.path;
 }
 
+export async function resolveSessionIdentity(sessionId: string, cwd: string): Promise<{ filePath: string; sessionUuid: string }> {
+  const sessionDir = path.resolve(projectSessionDir(cwd));
+  const filePath = await resolveSessionFile(sessionId, cwd);
+  const resolvedPath = path.resolve(filePath);
+  if (path.dirname(resolvedPath) !== sessionDir) throw new Error('Session does not belong to this project');
+  if (existsSync(resolvedPath)) {
+    const header = await sessionHeaderFromFile(resolvedPath);
+    if (!header?.id) throw new Error('Could not determine pi session UUID');
+    const normalSessionDir = path.resolve(sessionDirForCwd(cwd));
+    if (header.cwd ? path.resolve(header.cwd) !== path.resolve(cwd) : sessionDir !== normalSessionDir) {
+      throw new Error('Session does not belong to this project');
+    }
+    return { filePath, sessionUuid: header.id };
+  }
+  const sessionUuid = pendingSessionUuids.get(resolvedPath);
+  const pendingCwd = pendingSessionCwds.get(resolvedPath);
+  if (!sessionUuid) throw new Error('Could not determine pi session UUID');
+  if (!pendingCwd || path.resolve(pendingCwd) !== path.resolve(cwd)) throw new Error('Session does not belong to this project');
+  return { filePath, sessionUuid };
+}
+
+export async function currentSessionUuids(cwd: string): Promise<string[]> {
+  cleanupPendingSessionFiles();
+  const sessionDir = path.resolve(projectSessionDir(cwd));
+  const sessions = await SessionManager.list(cwd, sessionDir);
+  const sessionHeaders = await Promise.all(sessions.map((session) => sessionHeaderFromFile(session.path)));
+  return [...new Set([
+    ...sessionHeaders
+      .filter((header): header is { id: string; cwd: string | undefined } => Boolean(
+        header?.id && (header.cwd ? path.resolve(header.cwd) === path.resolve(cwd) : sessionDir === path.resolve(sessionDirForCwd(cwd))),
+      ))
+      .map((header) => header.id),
+    ...[...pendingSessionUuids.entries()]
+      .filter(([filePath]) => path.dirname(filePath) === sessionDir && path.resolve(pendingSessionCwds.get(filePath) ?? '') === path.resolve(cwd))
+      .map(([, uuid]) => uuid),
+  ])];
+}
+
+export async function resolveSessionManager(
+  sessionId: string,
+  cwd: string,
+  managerApi: Pick<typeof SessionManager, 'open'> = SessionManager,
+): Promise<SessionManager> {
+  const { filePath } = await resolveSessionIdentity(sessionId, cwd);
+  const resolvedPath = path.resolve(filePath);
+  const pendingManager = !existsSync(resolvedPath) ? pendingSessionManagers.get(resolvedPath) : undefined;
+  const manager = pendingManager ?? managerApi.open(filePath, projectSessionDir(cwd), cwd);
+  applyPendingSessionInfo(manager);
+  return manager;
+}
+
+export async function sessionManagerForSession(sessionId: string, cwd: string): Promise<SessionManager> {
+  return resolveSessionManager(sessionId, cwd);
+}
+
 export function readSessionDetail(filePath: string, cwd?: string): SessionDetail {
-  const manager = SessionManager.open(filePath, undefined, cwd);
+  const resolvedPath = path.resolve(filePath);
+  const manager = !existsSync(resolvedPath) ? pendingSessionManagers.get(resolvedPath) ?? SessionManager.open(filePath, undefined, cwd) : SessionManager.open(filePath, undefined, cwd);
   applyPendingSessionInfo(manager);
   return sessionDetailFromManager(filePath, manager);
 }
@@ -186,9 +268,13 @@ function normalizeSessionDir(sessionDir: string, cwd: string) {
   return path.isAbsolute(normalized) ? path.resolve(normalized) : path.resolve(cwd, normalized);
 }
 
-function rememberPendingSessionFile(filePath: string) {
+function rememberPendingSessionFile(filePath: string, sessionUuid: string, cwd: string, manager: SessionManager) {
   cleanupPendingSessionFiles();
-  pendingSessionFiles.set(path.resolve(filePath), Date.now() + PENDING_SESSION_FILE_TTL_MS);
+  const resolved = path.resolve(filePath);
+  pendingSessionFiles.set(resolved, Date.now() + PENDING_SESSION_FILE_TTL_MS);
+  pendingSessionUuids.set(resolved, sessionUuid);
+  pendingSessionCwds.set(resolved, path.resolve(cwd));
+  pendingSessionManagers.set(resolved, manager);
 }
 
 function isPendingSessionFile(filePath: string) {
@@ -205,6 +291,9 @@ function cleanupPendingSessionFiles() {
     if (expiresAt <= now || existsSync(filePath)) {
       pendingSessionFiles.delete(filePath);
       pendingSessionNames.delete(filePath);
+      pendingSessionUuids.delete(filePath);
+      pendingSessionCwds.delete(filePath);
+      pendingSessionManagers.delete(filePath);
     }
   }
 }
@@ -249,11 +338,26 @@ function sessionUploadIdsFromDeletedSession(deleted: DeletedSessionFile, request
   return [requestedId, deleted.sessionUuid, sessionIdFromPath(deleted.path), path.basename(deleted.path, '.jsonl')];
 }
 
-async function sessionUuidFromFile(filePath: string) {
+async function assertSessionFileOwnership(filePath: string, cwd: string) {
+  const header = await sessionHeaderFromFile(filePath);
+  if (!header?.id) throw new Error('Could not determine pi session UUID');
+  const sessionDir = path.resolve(projectSessionDir(cwd));
+  if (header.cwd ? path.resolve(header.cwd) !== path.resolve(cwd) : sessionDir !== path.resolve(sessionDirForCwd(cwd))) {
+    throw new Error('Session does not belong to this project');
+  }
+}
+
+function assertPendingSessionOwnership(filePath: string, cwd: string) {
+  const pendingCwd = pendingSessionCwds.get(path.resolve(filePath));
+  if (!pendingCwd || path.resolve(pendingCwd) !== path.resolve(cwd)) throw new Error('Session does not belong to this project');
+}
+
+async function sessionHeaderFromFile(filePath: string) {
   try {
     const line = await readFirstLine(filePath);
     const header = JSON.parse(line) as unknown;
-    return isRecord(header) && header.type === 'session' && typeof header.id === 'string' ? header.id : undefined;
+    if (!isRecord(header) || header.type !== 'session' || typeof header.id !== 'string') return undefined;
+    return { id: header.id, cwd: typeof header.cwd === 'string' ? header.cwd : undefined };
   } catch {
     return undefined;
   }
@@ -291,11 +395,11 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
       const project = registry.get(request.params.projectId);
       if (!request.query.cursor && !request.query.limit) {
         const sessions = await listSessions(project.id, project.path);
-        maybeCleanupOrphanedSessionUploads(project.path, () => currentSessionUploadIds(project.path), request.log);
+        maybeCleanupOrphanedSessionResources(project.path, request.log);
         return { sessions };
       }
       const page = await listSessionPage(project.id, project.path, request.query);
-      maybeCleanupOrphanedSessionUploads(project.path, () => currentSessionUploadIds(project.path), request.log);
+      maybeCleanupOrphanedSessionResources(project.path, request.log);
       return page;
     } catch (error) {
       return reply.code(404).send({ error: error instanceof Error ? error.message : 'Unknown project' });
@@ -322,6 +426,7 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
         const deleted = await deleteSessionFile(request.params.sessionId, project.path);
         await bridge?.disposeSession(project.path, request.params.sessionId, deleted.path).catch((error) => request.log.warn({ err: error }, 'Could not dispose cached session'));
         await deleteSessionUploads(project.path, sessionUploadIdsFromDeletedSession(deleted, request.params.sessionId)).catch((error) => request.log.warn({ err: error }, 'Could not delete session uploads'));
+        await deleteSessionReviewThreads(project.path, deleted.sessionUuid).catch((error) => request.log.warn({ err: error }, 'Could not delete session review threads'));
         return { ok: true };
       } finally {
         releaseDeleteLock?.();
@@ -342,6 +447,7 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
         const deleted = await deleteSessionFile(request.query.sessionId, project.path);
         await bridge?.disposeSession(project.path, request.query.sessionId, deleted.path).catch((error) => request.log.warn({ err: error }, 'Could not dispose cached session'));
         await deleteSessionUploads(project.path, sessionUploadIdsFromDeletedSession(deleted, request.query.sessionId)).catch((error) => request.log.warn({ err: error }, 'Could not delete session uploads'));
+        await deleteSessionReviewThreads(project.path, deleted.sessionUuid).catch((error) => request.log.warn({ err: error }, 'Could not delete session review threads'));
         return { ok: true };
       } finally {
         releaseDeleteLock?.();
@@ -430,15 +536,15 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
   });
 }
 
-function maybeCleanupOrphanedSessionUploads(projectPath: string, validSessionIds: Iterable<string | undefined> | (() => Promise<Iterable<string | undefined>>), log: { warn: (...args: any[]) => void }) {
+function maybeCleanupOrphanedSessionResources(projectPath: string, log: { warn: (...args: any[]) => void }) {
   const now = Date.now();
-  const lastCleanup = sessionUploadCleanupTimes.get(projectPath) ?? 0;
+  const lastCleanup = sessionResourceCleanupTimes.get(projectPath) ?? 0;
   if (now - lastCleanup < SESSION_UPLOAD_CLEANUP_INTERVAL_MS) return;
-  sessionUploadCleanupTimes.set(projectPath, now);
-  void (async () => {
-    const ids = typeof validSessionIds === 'function' ? await validSessionIds() : validSessionIds;
-    await cleanupOrphanedSessionUploads(projectPath, ids);
-  })().catch((error) => log.warn({ err: error }, 'Could not clean up orphaned session uploads'));
+  sessionResourceCleanupTimes.set(projectPath, now);
+  void Promise.all([
+    currentSessionUploadIds(projectPath).then((ids) => cleanupOrphanedSessionUploads(projectPath, ids)),
+    currentSessionUuids(projectPath).then((uuids) => cleanupOrphanedSessionReviewThreads(projectPath, uuids)),
+  ]).catch((error) => log.warn({ err: error }, 'Could not clean up orphaned session resources'));
 }
 
 async function listSessionFiles(dir: string): Promise<SessionFileInfo[]> {

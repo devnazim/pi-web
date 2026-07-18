@@ -8,7 +8,8 @@ import path from 'node:path';
 import { clearProjectFileCaches } from './files.js';
 import { getGitBranch } from './git.js';
 import type { ProjectRegistry } from './projects.js';
-import { applyPendingSessionInfo, projectSessionDir, resolveSessionFile, sessionDetailFromManager } from './sessions.js';
+import { createPiWebReviewExtension } from './reviewExtension.js';
+import { applyPendingSessionInfo, projectSessionDir, resolveSessionFile, sessionDetailFromManager, sessionManagerForSession } from './sessions.js';
 import type { AgentEvent } from './types.js';
 import { resolveWithin, sessionIdFromPath } from './util.js';
 
@@ -1797,7 +1798,11 @@ export class PiBridge {
   }
 
   private shouldApplySuiteAgentSelection(body: PromptBody, extensionCommand: boolean, queuedStreamingPrompt: boolean, requestedStreamingBehavior: StreamingBehavior | undefined) {
-    return Object.prototype.hasOwnProperty.call(body, 'agent') && !extensionCommand && !queuedStreamingPrompt && !requestedStreamingBehavior;
+    const selectsReviewCommandAgent = extensionCommand && slashCommandName(body.prompt) === 'pi-web-review';
+    return Object.prototype.hasOwnProperty.call(body, 'agent')
+      && (!extensionCommand || selectsReviewCommandAgent)
+      && !queuedStreamingPrompt
+      && !requestedStreamingBehavior;
   }
 
   private async applySuiteAgentSelection(session: any, value: string | undefined) {
@@ -2172,12 +2177,28 @@ export class PiBridge {
       const sdk = await this.loadSdk();
       if (!sdk.createAgentSession) throw new Error('No supported pi SDK session factory found');
 
-      const sessionManager = sessionId && sdk.SessionManager?.open
-        ? sdk.SessionManager.open(await resolveSessionFile(sessionId, projectPath), sessionDir, projectPath)
+      const sessionManager = sessionId
+        ? await sessionManagerForSession(sessionId, projectPath)
         : sdk.SessionManager?.create(projectPath, sessionDir);
       if (sessionManager) applyPendingSessionInfo(sessionManager);
 
-      const result = await sdk.createAgentSession({ cwd: projectPath, sessionManager });
+      let resourceLoader: any;
+      let settingsManager: any;
+      if (sessionId) {
+        if (typeof sdk.DefaultResourceLoader !== 'function') throw new Error('Loaded pi SDK does not expose DefaultResourceLoader');
+        settingsManager = typeof sdk.SettingsManager?.create === 'function'
+          ? sdk.SettingsManager.create(projectPath, getAgentDir())
+          : undefined;
+        resourceLoader = new sdk.DefaultResourceLoader({
+          cwd: projectPath,
+          agentDir: getAgentDir(),
+          settingsManager,
+          extensionFactories: [createPiWebReviewExtension(projectPath, sessionId)],
+        });
+        await resourceLoader.reload();
+      }
+
+      const result = await sdk.createAgentSession({ cwd: projectPath, sessionManager, settingsManager, resourceLoader });
       return result.session ?? result;
     });
     this.setCachedSession(this.runtimeSessions, cacheKey, sessionPromise);

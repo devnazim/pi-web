@@ -10,6 +10,7 @@ import { registerFileRoutes } from './files.js';
 import { registerGitRoutes } from './git.js';
 import { PiBridge, registerPiRoutes } from './piBridge.js';
 import { ProjectRegistry, registerProjectRoutes } from './projects.js';
+import { registerReviewThreadRoutes } from './reviewThreads.js';
 import { registerSessionRoutes } from './sessions.js';
 import { registerSettingsRoutes } from './settings.js';
 import { registerTerminalRoutes } from './terminal.js';
@@ -41,6 +42,7 @@ export async function buildApp(options: ServerOptions) {
   await registerAuth(app, options.password, options.basePath);
   await registerProjectRoutes(app, registry);
   await registerSessionRoutes(app, registry, bridge);
+  await registerReviewThreadRoutes(app, registry);
   await registerSettingsRoutes(app, registry);
   await registerFileRoutes(app, registry);
   await registerGitRoutes(app, registry);

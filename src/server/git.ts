@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { execFile } from 'node:child_process';
 import { lstat, readFile, readlink } from 'node:fs/promises';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import type { ProjectRegistry } from './projects.js';
 import type { GitFileChange, GitStatus } from './types.js';
@@ -9,6 +10,7 @@ import { resolveWithin } from './util.js';
 const execFileAsync = promisify(execFile);
 const MAX_GIT_FILE_DIFF_BYTES = 1024 * 1024;
 const GIT_ENV = { ...process.env, GIT_LITERAL_PATHSPECS: '1' };
+const GIT_DISCOVERY_PATHSPECS = ['.', ':(exclude,glob)**/.pi-web', ':(exclude,glob)**/.pi-web/**'];
 type GitProjectContext = { projectPrefix: string };
 type GitFileChangeAccumulator = GitFileChange & { stagedStatus: string; unstagedStatus: string };
 
@@ -113,7 +115,7 @@ export async function getGitStatus(cwd: string): Promise<GitStatus> {
 
   const [{ stdout: branchOut }, { stdout: statusOut }, stagedStats, unstagedStats] = await Promise.all([
     runGit(cwd, ['branch', '--show-current']).catch(() => ({ stdout: '' })),
-    runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']).catch(() => ({ stdout: '' })),
+    runGitDiscovery(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=all', '--', ...GIT_DISCOVERY_PATHSPECS]).catch(() => ({ stdout: '' })),
     diffStats(cwd, true, context),
     diffStats(cwd, false, context),
   ]);
@@ -128,7 +130,7 @@ export async function getGitStatus(cwd: string): Promise<GitStatus> {
     const rawFilePath = line.slice(3);
     const rawOldPath = /[RC]/.test(`${x}${y}`) ? statusEntries[++index] : undefined;
     const filePath = gitPathToProjectPath(context, rawFilePath);
-    if (filePath === undefined) continue;
+    if (filePath === undefined || isReservedAppStatePath(filePath)) continue;
     const oldPath = rawOldPath ? gitPathToProjectPath(context, rawOldPath) : undefined;
     const existing = byPath.get(filePath) ?? emptyGitFileChange(filePath);
     const stagedStatus = x !== ' ' && x !== '?' ? x : ' ';
@@ -207,17 +209,21 @@ async function gitDiff(cwd: string, filePath?: string, staged = false, oldPath?:
   if (staged) args.push('--cached');
   if (filePath) {
     const paths = oldPath && oldPath !== filePath ? [oldPath, filePath] : [filePath];
-    for (const path of paths) resolveWithin(cwd, path);
+    for (const path of paths) {
+      resolveWithin(cwd, path);
+      if (isReservedAppStatePath(path)) throw new Error('Pi Web app state is not reviewable');
+    }
     args.push('--', ...paths);
   } else {
-    args.push('--', '.');
+    args.push('--', ...GIT_DISCOVERY_PATHSPECS);
   }
-  const { stdout } = await runGit(cwd, args);
+  const { stdout } = filePath ? await runGit(cwd, args) : await runGitDiscovery(cwd, args);
   return stdout;
 }
 
 async function gitFileDiff(cwd: string, filePath: string, staged = false) {
   resolveWithin(cwd, filePath);
+  if (isReservedAppStatePath(filePath)) throw new Error('Pi Web app state is not reviewable');
   const context = await gitProjectContext(cwd);
   const file = (await getGitStatus(cwd)).files.find((item) => item.path === filePath);
   const originalPath = staged ? file?.oldPath ?? filePath : filePath;
@@ -320,6 +326,26 @@ async function gitObjectSize(cwd: string, revision: string) {
   return Number.isFinite(size) ? size : undefined;
 }
 
+export async function getReviewableFile(cwd: string, filePath: string, staged: boolean, status?: GitStatus) {
+  const normalizedPath = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!normalizedPath || normalizedPath === '.' || path.isAbsolute(filePath)) throw new Error('Invalid review file path');
+  if (isReservedAppStatePath(normalizedPath)) throw new Error('Pi Web app state is not reviewable');
+  resolveWithin(cwd, normalizedPath);
+  const file = (status ?? await getGitStatus(cwd)).files.find((item) => item.path === normalizedPath);
+  if (staged ? !file?.staged : !file?.unstaged) {
+    throw new Error(staged ? 'Review threads require a staged file' : 'Review threads require an unstaged or untracked file');
+  }
+  const result = staged
+    ? await gitBlob(cwd, '', projectPathToGitPath(await gitProjectContext(cwd), normalizedPath))
+    : await workingTreeFile(cwd, normalizedPath);
+  if (result.unavailable !== undefined) throw new Error(result.unavailable);
+  return result.content;
+}
+
+export function getReviewableWorkingTreeFile(cwd: string, filePath: string, status?: GitStatus) {
+  return getReviewableFile(cwd, filePath, false, status);
+}
+
 async function workingTreeFile(cwd: string, filePath: string) {
   const target = resolveWithin(cwd, filePath);
   const fileStat = await lstat(target).catch(() => undefined);
@@ -373,11 +399,13 @@ function formatBytes(bytes: number) {
 
 async function stageChanges(cwd: string, filePath: string) {
   resolveWithin(cwd, filePath);
+  if (isReservedAppStatePath(filePath)) throw new Error('Pi Web app state cannot be staged');
   await runGit(cwd, ['add', '--', filePath]);
 }
 
 async function unstageChanges(cwd: string, filePath: string) {
   resolveWithin(cwd, filePath);
+  if (isReservedAppStatePath(filePath)) throw new Error('Pi Web app state cannot be changed through Git routes');
   const file = (await getGitStatus(cwd)).files.find((item) => item.path === filePath);
   if (!file?.staged) throw new Error('File has no staged changes');
   const paths = file.oldPath ? [file.oldPath, filePath] : [filePath];
@@ -396,6 +424,7 @@ async function hasHead(cwd: string) {
 
 async function discardChanges(cwd: string, filePath: string) {
   resolveWithin(cwd, filePath);
+  if (isReservedAppStatePath(filePath)) throw new Error('Pi Web app state cannot be changed through Git routes');
   const file = (await getGitStatus(cwd)).files.find((item) => item.path === filePath);
   if (!file?.unstaged) throw new Error('File has no unstaged changes');
   if (file.status.includes('?')) await runGit(cwd, ['clean', '-fd', '--', filePath]);
@@ -404,6 +433,12 @@ async function discardChanges(cwd: string, filePath: string) {
 
 async function assertNoStagedChangesOutsideProject(cwd: string) {
   const context = await gitProjectContext(cwd);
+  const { stdout: reservedOut } = await runGit(cwd, ['diff', '--cached', '--name-only', '-z']);
+  const hasReservedState = reservedOut.split('\0').some((filePath) => {
+    const projectPath = gitPathToProjectPath(context, filePath);
+    return projectPath !== undefined && isReservedAppStatePath(projectPath);
+  });
+  if (hasReservedState) throw new Error('Cannot commit Pi Web app state. Unstage the nested .pi-web directory first.');
   if (!context.projectPrefix) return;
   const { stdout } = await runGit(cwd, ['status', '--porcelain=v1', '-z', '--untracked-files=no']);
   const outsidePaths = new Set<string>();
@@ -458,8 +493,8 @@ function normalizeGitPath(filePath: string) {
 async function diffStats(cwd: string, staged: boolean, context: GitProjectContext) {
   const args = ['diff', '--numstat', '-z', '--find-renames'];
   if (staged) args.push('--cached');
-  args.push('--', '.');
-  const { stdout } = await runGit(cwd, args).catch(() => ({ stdout: '' }));
+  args.push('--', ...GIT_DISCOVERY_PATHSPECS);
+  const { stdout } = await runGitDiscovery(cwd, args).catch(() => ({ stdout: '' }));
   const entries = stdout.split('\0');
   const stats: Array<readonly [string, { additions: number; deletions: number }]> = [];
   for (let index = 0; index < entries.length; index += 1) {
@@ -471,7 +506,7 @@ async function diffStats(cwd: string, staged: boolean, context: GitProjectContex
     if (!rawFilePath) continue;
     if (!parsed.filePath) index += 2;
     const filePath = gitPathToProjectPath(context, rawFilePath);
-    if (filePath === undefined) continue;
+    if (filePath === undefined || isReservedAppStatePath(filePath)) continue;
     stats.push([
       filePath,
       { additions: Number(parsed.additions) || 0, deletions: Number(parsed.deletions) || 0 },
@@ -491,8 +526,16 @@ function parseNumstatEntry(entry: string) {
   };
 }
 
+function isReservedAppStatePath(filePath: string) {
+  return normalizeGitPath(filePath).split('/').includes('.pi-web');
+}
+
 async function runGit(cwd: string, args: string[]) {
   return execFileAsync('git', args, { cwd, env: GIT_ENV, maxBuffer: 20 * 1024 * 1024 });
+}
+
+async function runGitDiscovery(cwd: string, args: string[]) {
+  return execFileAsync('git', args, { cwd, env: process.env, maxBuffer: 20 * 1024 * 1024 });
 }
 
 async function runGitBuffer(cwd: string, args: string[]) {
