@@ -104,6 +104,7 @@ import {
 } from './liveActivity';
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
+import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -119,8 +120,8 @@ type SessionListResponse = { sessions: SessionSummary[]; nextCursor?: string; to
 type SessionEntry = { type: string; id: string; parentId: string | null; timestamp?: string; role?: string; content?: unknown; text?: string; message?: { role?: string; content?: unknown;[key: string]: unknown };[key: string]: unknown };
 type SessionTreeNode = { entry: SessionEntry; children: SessionTreeNode[]; label?: string; labelTimestamp?: string };
 type TreeViewNode = Omit<SessionTreeNode, 'children'> & { id: string; children: TreeViewNode[]; display: string; roleClass: string; searchText: string; isSettingsEntry: boolean; isEmptyAssistant: boolean };
-type SessionDetail = { sessionId: string; path: string; entries: SessionEntry[]; branch: SessionEntry[]; tree: SessionTreeNode[]; leafId: string | null; name?: string };
-type SessionTreeView = Omit<SessionDetail, 'tree'> & { tree: TreeViewNode[] };
+type SessionDetail = { sessionId: string; path: string; entries: SessionEntry[]; leafId: string | null; name?: string };
+type SessionTreeView = SessionDetail & { tree: TreeViewNode[] };
 type GitFile = { path: string; oldPath?: string; status: string; staged: boolean; unstaged: boolean; additions?: number; deletions?: number; stagedAdditions?: number; stagedDeletions?: number; unstagedAdditions?: number; unstagedDeletions?: number };
 type GitFileSelection = { path: string; staged: boolean };
 type GitFileActionMenuState = { file: GitFile; staged: boolean; x: number; y: number };
@@ -309,6 +310,10 @@ const CHAT_SEARCH_DEBOUNCE_MS = 200;
 const FILE_SEARCH_DEBOUNCE_MS = 250;
 const SETTINGS_CACHE_STALE_TIME_MS = 60_000;
 const SESSION_DETAIL_CACHE_STALE_TIME_MS = 30_000;
+const TRANSCRIPT_INITIAL_RENDER_COUNT = 160;
+const TRANSCRIPT_SEARCH_RENDER_COUNT = 160;
+const TRANSCRIPT_PREPEND_COUNT = 100;
+const TRANSCRIPT_PREPEND_SCROLL_THRESHOLD_PX = 240;
 const WEBSOCKET_RECONNECT_MIN_DELAY_MS = 500;
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
@@ -707,6 +712,7 @@ function Shell() {
   const [projectId, setProjectId] = createSignal<string>();
   const [workspaceProjectId, setWorkspaceProjectId] = createSignal<string>();
   const [sessionId, setSessionId] = createSignal<string | undefined>(initialActiveSessionId);
+  const [requestedSessionId, setRequestedSessionId] = createSignal<string | undefined>(initialActiveSessionId);
   const [sessionWorkspaceId, setSessionWorkspaceId] = createSignal<string>();
   const [events, setEvents] = createSignal<string[]>([]);
   const [liveAgentActivity, setLiveAgentActivity] = createSignal<AgentActivity>(emptyAgentActivity());
@@ -834,7 +840,7 @@ function Shell() {
     return workspaceId ? workspaceLookup()[workspaceId] : undefined;
   });
   const workspacesError = createMemo(() => workspacesEnabled() && workspaces.error ? errorMessage(workspaces.error, 'Could not load workspaces') : undefined);
-  const workspaceModeActive = createMemo(() => workspacesEnabled() && !workspacesError());
+  const workspaceModeActive = createMemo(() => workspacesEnabled() && (!workspacesError() || Boolean(workspaces.data)));
   const activeWorkspace = createMemo(() => {
     const project = activeProject();
     if (!project) return undefined;
@@ -1062,6 +1068,7 @@ function Shell() {
   }
 
   function setActiveSession(id: string | undefined, workspaceId = workspaceProject()?.id) {
+    setRequestedSessionId(id);
     setSessionWorkspaceId(id ? workspaceId : undefined);
     setSessionId(id);
   }
@@ -1106,7 +1113,6 @@ function Shell() {
   function refreshCompletedSession(workspaceId: string, targetSessionId: string, operationId?: string) {
     if (!shouldRefreshCompletedSession(completedSessionRefreshes, workspaceId, targetSessionId, operationId)) return;
     queryClient.invalidateQueries({ queryKey: ['session', workspaceId, targetSessionId] });
-    queryClient.invalidateQueries({ queryKey: ['session-tree', workspaceId, targetSessionId] });
     queryClient.invalidateQueries({ queryKey: ['sessions', workspaceId] });
     queryClient.invalidateQueries({ queryKey: ['agent-status', workspaceId, targetSessionId] });
     invalidateProjectFileCaches(workspaceId);
@@ -1254,31 +1260,23 @@ function Shell() {
     });
   }
 
-  function cachedSessionKnown(workspaceId: string, id: string) {
-    if (queryClient.getQueryData<SessionDetail>(['session', workspaceId, id])) return true;
-    const sessionPages = queryClient.getQueryData<{ pages?: SessionListResponse[] }>(['sessions', workspaceId]);
-    return Boolean(sessionPages?.pages?.some((page) => page.sessions.some((session) => session.id === id)));
-  }
-
   async function restoreRememberedWorkspaceSession(workspaceId: string, id: string, request: number) {
     workspaceSessionRestoreTarget = { workspaceId, sessionId: id, request };
+    setActiveSession(id, workspaceId);
     try {
-      if (!cachedSessionKnown(workspaceId, id)) {
-        await queryClient.fetchQuery({
-          queryKey: ['session', workspaceId, id],
-          queryFn: ({ signal }) => api<SessionDetail>(`/api/projects/${workspaceId}/session?sessionId=${encodeURIComponent(id)}`, { signal }),
-          staleTime: SESSION_DETAIL_CACHE_STALE_TIME_MS,
-        });
-      }
+      await queryClient.fetchQuery({
+        queryKey: ['session', workspaceId, id],
+        queryFn: ({ signal }) => api<SessionDetail>(`/api/projects/${workspaceId}/session?sessionId=${encodeURIComponent(id)}`, { signal }),
+        staleTime: SESSION_DETAIL_CACHE_STALE_TIME_MS,
+      });
       if (workspaceSessionRestoreRequest !== request || workspaceProjectId() !== workspaceId) return;
       setActiveSession(id, workspaceId);
     } catch (error) {
       if (workspaceSessionRestoreRequest !== request || workspaceProjectId() !== workspaceId) return;
       if (apiErrorStatus(error) === 404) {
         forgetWorkspaceLastSession(workspaceId);
+        setActiveSession(undefined, workspaceId);
         if (toolPanel() === 'tree') setToolPanel(undefined);
-      } else {
-        setActiveSession(id, workspaceId);
       }
     } finally {
       if (workspaceSessionRestoreTarget?.request === request) workspaceSessionRestoreTarget = undefined;
@@ -1346,6 +1344,7 @@ function Shell() {
   function openWorkspaceNotification(notification: WorkspaceNotificationItem) {
     const workspace = workspaceLookup()[notification.workspaceId];
     if (workspace) {
+      setPendingActiveWorkspacePath(undefined);
       setActiveSession(undefined, workspace.workspace.id);
       setProjectId(workspace.rootProject.id);
       resetWorkspaceSelection(workspace.workspace.id);
@@ -1572,7 +1571,7 @@ function Shell() {
   });
 
   createEffect(() => {
-    writeActiveSessionId(activeSessionId());
+    writeActiveSessionId(requestedSessionId());
   });
 
   createEffect(() => {
@@ -1608,7 +1607,7 @@ function Shell() {
     const project = activeProject();
     if (!project) return;
     if (!workspaceModeActive()) {
-      if (pendingActiveWorkspacePath() && !workspacesError()) return;
+      if (pendingActiveWorkspacePath()) return;
       if (workspaceProjectId() !== project.id) resetWorkspaceSelection(project.id);
       return;
     }
@@ -1645,7 +1644,6 @@ function Shell() {
       initialSessionRestorePending = false;
       const restoreRequest = workspaceSessionRestoreRequest + 1;
       workspaceSessionRestoreRequest = restoreRequest;
-      setActiveSession(undefined, workspaceId);
       resetAgentEvents([]);
       if (initialActiveSessionId) void restoreRememberedWorkspaceSession(workspaceId, initialActiveSessionId, restoreRequest);
       return;
@@ -1655,10 +1653,12 @@ function Shell() {
     if (activeSessionId() === rememberedSessionId) return;
     const restoreRequest = workspaceSessionRestoreRequest + 1;
     workspaceSessionRestoreRequest = restoreRequest;
-    setActiveSession(undefined, workspaceId);
     resetAgentEvents([]);
     if (rememberedSessionId) void restoreRememberedWorkspaceSession(workspaceId, rememberedSessionId, restoreRequest);
-    else if (toolPanel() === 'tree') setToolPanel(undefined);
+    else {
+      setActiveSession(undefined, workspaceId);
+      if (toolPanel() === 'tree') setToolPanel(undefined);
+    }
   });
 
   createEffect(() => {
@@ -1736,7 +1736,6 @@ function Shell() {
       }
 
       queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
-      queryClient.invalidateQueries({ queryKey: ['session-tree', project.id, currentActiveSessionId] });
       const statusEventGeneration = agentSocketEventGeneration;
       const statusRequestGeneration = ++agentStatusRequestGeneration;
       void apiAgentRefresh<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
@@ -1959,6 +1958,7 @@ function Shell() {
         if (closedProject) forgetOpenProject(closedProject.path);
       }
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
+      setPendingActiveWorkspacePath(undefined);
       setActiveSession(undefined);
       setProjectId(project.id);
       resetWorkspaceSelection(project.id);
@@ -2008,6 +2008,7 @@ function Shell() {
       forgetOpenProject(project.path);
     }
     await queryClient.invalidateQueries({ queryKey: ['projects'] });
+    setPendingActiveWorkspacePath(undefined);
     setActiveSession(undefined);
     setProjectId(nextProject.id);
     resetWorkspaceSelection(nextProject.id);
@@ -2022,6 +2023,7 @@ function Shell() {
     await queryClient.invalidateQueries({ queryKey: ['projects'] });
     if (project.id === projectId()) {
       const nextProject = projects.data?.projects.find((item) => item.id !== project.id);
+      setPendingActiveWorkspacePath(undefined);
       setActiveSession(undefined);
       setProjectId(nextProject?.id);
       writeActiveProjectPath(nextProject?.path);
@@ -2036,6 +2038,7 @@ function Shell() {
 
   function selectProject(id: string) {
     if (id === projectId()) return;
+    setPendingActiveWorkspacePath(undefined);
     setActiveSession(undefined);
     setProjectId(id);
     const project = projects.data?.projects.find((item) => item.id === id);
@@ -2091,6 +2094,13 @@ function Shell() {
     if (toolPanel() === 'tree') setToolPanel(undefined);
   }
 
+  function handleSessionNotFound(id: string, workspaceId: string) {
+    if (workspaceProject()?.id !== workspaceId || activeSessionId() !== id) return;
+    handleSessionDeleted(id);
+    queryClient.removeQueries({ queryKey: ['session', workspaceId, id] });
+    queryClient.invalidateQueries({ queryKey: ['sessions', workspaceId] });
+  }
+
   function currentSessionName() {
     const project = workspaceProject();
     const id = activeSessionId();
@@ -2116,7 +2126,6 @@ function Shell() {
       setSessionDeleteOpen(false);
       handleSessionDeleted(id);
       queryClient.removeQueries({ queryKey: ['session', project.id, id] });
-      queryClient.removeQueries({ queryKey: ['session-tree', project.id, id] });
       queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
     } catch (error) {
       setSessionActionError(error instanceof Error ? error.message : 'Could not delete session');
@@ -2184,10 +2193,18 @@ function Shell() {
   }
 
   function resetWorkspaceSelection(id: string) {
+    if (
+      workspaceSessionRestoreTarget?.workspaceId === id
+      && workspaceSessionRestoreTarget.request === workspaceSessionRestoreRequest
+      && requestedSessionId() === workspaceSessionRestoreTarget.sessionId
+    ) {
+      setWorkspaceProjectId(id);
+      workspaceSessionRestoredForId = id;
+      return;
+    }
     if (initialSessionRestorePending && sessionId() === initialActiveSessionId) {
       const restoreRequest = workspaceSessionRestoreRequest + 1;
       workspaceSessionRestoreRequest = restoreRequest;
-      setActiveSession(undefined, id);
       resetAgentEvents([]);
       setWorkspaceProjectId(id);
       workspaceSessionRestoredForId = id;
@@ -2198,12 +2215,14 @@ function Shell() {
     const rememberedSessionId = lastWorkspaceSessions()[id];
     const restoreRequest = workspaceSessionRestoreRequest + 1;
     workspaceSessionRestoreRequest = restoreRequest;
-    setActiveSession(undefined, id);
     resetAgentEvents([]);
     setWorkspaceProjectId(id);
     workspaceSessionRestoredForId = id;
     if (rememberedSessionId) void restoreRememberedWorkspaceSession(id, rememberedSessionId, restoreRequest);
-    else setToolPanel((panel) => panel === 'tree' ? undefined : panel);
+    else {
+      setActiveSession(undefined, id);
+      setToolPanel((panel) => panel === 'tree' ? undefined : panel);
+    }
   }
 
   function selectWorkspace(id: string) {
@@ -2222,6 +2241,7 @@ function Shell() {
       }
     }
 
+    if (enabled && project.id === activeProject()?.id) setPendingActiveWorkspacePath(undefined);
     setWorkspacesEnabledByPath((current) => {
       const next = { ...current, [project.path]: !enabled };
       if (enabled) delete next[project.path];
@@ -2255,7 +2275,7 @@ function Shell() {
     if (!project || workspace.local) return;
     await api(`/api/projects/${project.id}/workspaces/${workspace.id}${options?.force ? '?force=true' : ''}`, { method: 'DELETE' });
     queryClient.removeQueries({ queryKey: ['sessions', workspace.id] });
-    queryClient.removeQueries({ queryKey: ['session-tree', workspace.id] });
+    queryClient.removeQueries({ queryKey: ['session', workspace.id] });
     queryClient.removeQueries({ queryKey: ['settings', workspace.id] });
     queryClient.removeQueries({ queryKey: ['settings-editor', workspace.id] });
     queryClient.removeQueries({ queryKey: ['git-status', workspace.id] });
@@ -2390,6 +2410,7 @@ function Shell() {
             onResizeStart={sessionSidebar.startResize}
             onResizeKeyDown={sessionSidebar.resizeWithKeyboard}
             onResizeReset={() => sessionSidebar.setClampedSize(SESSION_SIDEBAR_DEFAULT_WIDTH)}
+            onRetryWorkspaces={() => void workspaces.refetch()}
             onDisableWorkspaces={() => activeProject() && void toggleWorkspaces(activeProject()!)}
             onCreateWorkspace={createWorkspace}
             onDeleteWorkspace={deleteWorkspace}
@@ -2399,7 +2420,7 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onExtensionUiReply={replyExtensionUiRequest} beginAgentStatusRequest={beginAgentStatusRequest} invalidateAgentStatusRequests={invalidateAgentStatusRequests} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onSessionNotFound={handleSessionNotFound} onExtensionUiReply={replyExtensionUiRequest} beginAgentStatusRequest={beginAgentStatusRequest} invalidateAgentStatusRequests={invalidateAgentStatusRequests} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -2516,6 +2537,7 @@ function Shell() {
           onSession={selectSession}
           onNewSession={startNewSession}
           onDeleteSession={handleSessionDeleted}
+          onRetryWorkspaces={() => void workspaces.refetch()}
           onToggleWorkspaces={() => activeProject() && void toggleWorkspaces(activeProject()!)}
           onCreateWorkspace={createWorkspace}
           onDeleteWorkspace={deleteWorkspace}
@@ -3408,6 +3430,7 @@ function Sidebar(props: {
   onResizeStart: (event: PointerEvent) => void;
   onResizeKeyDown: (event: KeyboardEvent) => void;
   onResizeReset: () => void;
+  onRetryWorkspaces: () => void;
   onDisableWorkspaces: () => void;
   onCreateWorkspace: () => Promise<void> | void;
   onDeleteWorkspace: (workspace: ProjectWorkspace, options?: { force?: boolean }) => Promise<void> | void;
@@ -3449,7 +3472,6 @@ function Sidebar(props: {
       setSessionToDelete(undefined);
       props.onDeleteSession(session.id);
       queryClient.removeQueries({ queryKey: ['session', workspaceId, session.id] });
-      queryClient.removeQueries({ queryKey: ['session-tree', workspaceId, session.id] });
       queryClient.invalidateQueries({ queryKey: ['sessions', workspaceId] });
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : 'Could not delete session');
@@ -3518,19 +3540,22 @@ function Sidebar(props: {
           </div>
           <button class="ghost" title="Project options" onClick={(event) => props.project && props.onProjectMenu({ project: props.project, x: event.clientX, y: event.clientY })}><Ellipsis class="size-4" /></button>
         </div>
+        <Show when={props.workspacesError}>
+          {(message) => (
+            <div class="mb-4 rounded-2xl bg-destructive/10 p-3 text-sm text-destructive ring-1 ring-destructive/20">
+              <div class="font-medium">Could not load workspaces</div>
+              <div class="mt-1 text-xs leading-5">{message()}</div>
+              <div class="mt-3 flex gap-2">
+                <button class="button-secondary h-8 px-2 text-xs" onClick={props.onRetryWorkspaces}><RefreshCw class="size-3.5" />Retry</button>
+                <button class="button-danger h-8 px-2 text-xs" onClick={props.onDisableWorkspaces}>Disable workspaces</button>
+              </div>
+            </div>
+          )}
+        </Show>
         <Show
           when={props.workspacesEnabled}
           fallback={(
             <>
-              <Show when={props.workspacesError}>
-                {(message) => (
-                  <div class="mb-4 rounded-2xl bg-destructive/10 p-3 text-sm text-destructive ring-1 ring-destructive/20">
-                    <div class="font-medium">Could not load workspaces</div>
-                    <div class="mt-1 text-xs leading-5">{message()}</div>
-                    <button class="button-danger mt-3 h-8 px-2 text-xs" onClick={props.onDisableWorkspaces}>Disable workspaces</button>
-                  </div>
-                )}
-              </Show>
               <button class="button-secondary mb-5 w-full" title={`New session (${formatBinding(getShortcutBinding('newSession'))})`} onClick={() => newSession()}><SquarePen class="size-4" />New session</button>
               <div class="session-panel-scrollbar min-h-0 flex-1 overflow-auto pr-1">
                 <SessionList
@@ -4579,6 +4604,7 @@ function MobileMenu(props: {
   onSession: (id: string, workspaceId?: string) => void;
   onNewSession: (workspaceId?: string) => void;
   onDeleteSession: (id: string) => void;
+  onRetryWorkspaces: () => void;
   onToggleWorkspaces: () => void;
   onCreateWorkspace: () => Promise<void> | void;
   onDeleteWorkspace: (workspace: ProjectWorkspace, options?: { force?: boolean }) => Promise<void> | void;
@@ -4686,7 +4712,6 @@ function MobileMenu(props: {
       setSessionToDelete(undefined);
       props.onDeleteSession(session.id);
       queryClient.removeQueries({ queryKey: ['session', workspaceId, session.id] });
-      queryClient.removeQueries({ queryKey: ['session-tree', workspaceId, session.id] });
       queryClient.invalidateQueries({ queryKey: ['sessions', workspaceId] });
     } catch (error) {
       setDeleteError(error instanceof Error ? error.message : 'Could not delete session');
@@ -4773,7 +4798,10 @@ function MobileMenu(props: {
           <div class="mb-4 rounded-2xl bg-destructive/10 p-3 text-sm text-destructive ring-1 ring-destructive/20">
             <div class="font-medium">Could not load workspaces</div>
             <div class="mt-1 text-xs leading-5">{props.workspacesError}</div>
-            <button class="button-danger mt-3 h-8 px-2 text-xs" onClick={props.onToggleWorkspaces}>Disable workspaces</button>
+            <div class="mt-3 flex gap-2">
+              <button class="button-secondary h-8 px-2 text-xs" onClick={props.onRetryWorkspaces}><RefreshCw class="size-3.5" />Retry</button>
+              <button class="button-danger h-8 px-2 text-xs" onClick={props.onToggleWorkspaces}>Disable workspaces</button>
+            </div>
           </div>
         </Show>
         <Show when={!props.workspacesEnabled}>
@@ -4879,7 +4907,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -5018,14 +5046,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
                     class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
                     style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
                   >
-                    <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
+                    <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                     <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
                 <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
+                  <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
                   <div
                     class="terminal-resize-handle"
                     role="separator"
@@ -5059,7 +5087,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
 
 type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; attachments: UploadAsset[] };
 
-function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
@@ -5082,6 +5110,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let userScrollingTranscriptAwayFromBottom = false;
   let transcriptScrollFrame: number | undefined;
   let transcriptScrollFollowupFrame: number | undefined;
+  let transcriptPrependFrame: number | undefined;
   let transcriptScrollForce = false;
   let composerLayoutFrame: number | undefined;
   let composerLayoutPasses = 0;
@@ -5090,6 +5119,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let composerHistoryDraft: ComposerHistoryItem = { text: '', uploads: [] };
   const [text, setText] = createSignal('');
   const [stickToBottom, setStickToBottom] = createSignal(true);
+  const [transcriptWindow, setTranscriptWindow] = createSignal<{ key: string; start: number; leafId: string | null | undefined; expanded: boolean }>({ key: '', start: 0, leafId: undefined, expanded: false });
   const [uploads, setUploads] = createSignal<UploadAsset[]>([]);
   const [previewPath, setPreviewPath] = createSignal<string>();
   const [agent, setAgent] = createSignal('');
@@ -5207,13 +5237,17 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const showAgentSelect = createMemo(() => Boolean(agents.data?.supported && (agentExplicit() || agent() || agents.data.agents.length > 0)));
   const modelOptions = createMemo(() => composerModelOptions(effectiveSettings(), models.data?.models ?? [], model()));
   const thinkingLevelOptions = createMemo(() => composerThinkingLevelOptions(effectiveSettings(), models.data?.models ?? [], model()));
+  const activeSessionBranch = createMemo(() => {
+    const detail = session.data;
+    return detail ? branchForEntry(detail.entries, detail.leafId) : [];
+  });
   const transcriptEntries = createMemo(() => {
     const detail = session.data;
     if (!detail) return [];
     if (props.treeSelection) return branchForEntry(detail.entries, props.treeSelection.branchFromId);
-    return detail.branch;
+    return activeSessionBranch();
   });
-  const liveTurnTranscriptEntries = createMemo(() => session.data?.branch ?? transcriptEntries());
+  const liveTurnTranscriptEntries = createMemo(() => session.data ? activeSessionBranch() : transcriptEntries());
   const activePendingUserMessages = createMemo(() => {
     const sessionId = props.sessionId ?? commandSessionId();
     return pendingUserMessages().filter((pending) => pending.projectId === props.project.id && (!sessionId || pending.sessionId === sessionId));
@@ -5229,6 +5263,20 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (pendingUserMessageVisible() && !entries.some(isUserMessageEntry)) return [];
     return chatDisplayEntries(entries);
   });
+  const transcriptWindowKey = createMemo(() => `${props.project.id}\u0000${props.sessionId ?? ''}\u0000${props.treeSelection ? props.treeSelection.branchFromId ?? '<root>' : '<active>'}`);
+  const transcriptWindowLeafId = createMemo(() => props.treeSelection ? undefined : session.data?.leafId);
+  const transcriptHistoryStartIndex = createMemo(() => {
+    const entries = visibleTranscriptEntries();
+    const window = transcriptWindow();
+    const continuesCurrentBranch = window.key === transcriptWindowKey() && (
+      Boolean(props.treeSelection)
+      || window.leafId === transcriptWindowLeafId()
+      || (window.leafId !== null && window.leafId !== undefined && activeSessionBranch().some((entry) => entry.id === window.leafId))
+    );
+    return continuesCurrentBranch && window.expanded
+      ? Math.min(window.start, entries.length)
+      : Math.max(0, entries.length - TRANSCRIPT_INITIAL_RENDER_COUNT);
+  });
   const toolCalls = createMemo(() => toolCallMap(transcriptEntries()));
   const chatSearchMatches = createMemo(() => {
     const query = normalizedSearchQuery(props.searchQuery);
@@ -5239,6 +5287,17 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const chatSearchMatchIds = createMemo(() => new Set(chatSearchMatches().map((entry) => entry.id)));
   const [activeSearchIndex, setActiveSearchIndex] = createSignal(0);
   const activeSearchEntryId = createMemo(() => chatSearchMatches()[activeSearchIndex()]?.id);
+  const transcriptRenderRange = createMemo(() => {
+    const entries = visibleTranscriptEntries();
+    const activeSearchId = normalizedSearchQuery(props.searchQuery) ? activeSearchEntryId() : undefined;
+    const activeSearchEntryIndex = activeSearchId ? entries.findIndex((entry) => entry.id === activeSearchId) : -1;
+    if (activeSearchEntryIndex !== -1) return boundedRangeAroundIndex(entries.length, activeSearchEntryIndex, TRANSCRIPT_SEARCH_RENDER_COUNT);
+    return { start: transcriptHistoryStartIndex(), end: entries.length };
+  });
+  const renderedTranscriptEntries = createMemo(() => {
+    const range = transcriptRenderRange();
+    return visibleTranscriptEntries().slice(range.start, range.end);
+  });
   const filteredSlashCommands = createMemo(() => filterSlashCommands(slashCommands.data?.commands ?? [], slashCommandMention()?.query ?? ''));
   const commandCompletionOptions = createMemo(() => commandCompletions.data?.completions ?? []);
   const liveActivity = () => props.liveActivity;
@@ -5307,6 +5366,31 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   });
   const showEmptySessionPrompt = createMemo(() => Boolean(props.sessionId && !session.isLoading && !session.error && visibleTranscriptEntries().length === 0 && !busy() && !pendingUserMessageVisible()));
   const centerTranscript = createMemo(() => (!props.sessionId && !pendingUserMessageVisible()) || showEmptySessionPrompt());
+
+  createEffect(() => {
+    const entries = visibleTranscriptEntries();
+    const key = transcriptWindowKey();
+    const leafId = transcriptWindowLeafId();
+    const branch = activeSessionBranch();
+    if (props.sessionId && !session.data) return;
+    setTranscriptWindow((current) => {
+      const continuesCurrentBranch = current.key === key && (
+        Boolean(props.treeSelection)
+        || current.leafId === leafId
+        || (current.leafId !== null && current.leafId !== undefined && branch.some((entry) => entry.id === current.leafId))
+      );
+      const defaultStart = Math.max(0, entries.length - TRANSCRIPT_INITIAL_RENDER_COUNT);
+      if (!continuesCurrentBranch) return { key, start: defaultStart, leafId, expanded: false };
+      const start = current.expanded ? Math.min(current.start, entries.length) : defaultStart;
+      if (current.start === start && current.leafId === leafId) return current;
+      return { ...current, start, leafId };
+    });
+  });
+
+  createEffect(() => {
+    const id = props.sessionId;
+    if (id && apiErrorStatus(session.error) === 404) props.onSessionNotFound(id, props.project.id);
+  });
 
   createEffect(() => {
     const requestId = visibleExtensionUiRequests()[0]?.id;
@@ -5507,7 +5591,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   createEffect(() => {
     const detail = session.data;
     if (!props.sessionId || !detail) return;
-    const key = `${props.project.id}:${props.sessionId}:${detail.leafId ?? ''}:${detail.branch.length}`;
+    const key = `${props.project.id}:${props.sessionId}:${detail.leafId ?? ''}:${activeSessionBranch().length}`;
     if (sessionControlsHydratedKey() === key) return;
     const stored = readSessionComposerControls(props.project.id, props.sessionId);
     const hasStoredAgent = Boolean(stored && 'agent' in stored);
@@ -5637,6 +5721,18 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setStickToBottom(!userScrollingTranscriptAwayFromBottom && distance < 120);
   }
 
+  function loadEarlierTranscript(element: HTMLDivElement) {
+    const start = transcriptHistoryStartIndex();
+    if (normalizedSearchQuery(props.searchQuery) || start === 0 || element.scrollTop > TRANSCRIPT_PREPEND_SCROLL_THRESHOLD_PX || transcriptPrependFrame !== undefined) return;
+    const previousHeight = element.scrollHeight;
+    const previousTop = element.scrollTop;
+    setTranscriptWindow({ key: transcriptWindowKey(), start: Math.max(0, start - TRANSCRIPT_PREPEND_COUNT), leafId: transcriptWindowLeafId(), expanded: true });
+    transcriptPrependFrame = requestAnimationFrame(() => {
+      transcriptPrependFrame = undefined;
+      element.scrollTop = previousTop + element.scrollHeight - previousHeight;
+    });
+  }
+
   function handleTranscriptWheel(event: WheelEvent & { currentTarget: HTMLDivElement }) {
     if (event.deltaY < 0) {
       userScrollingTranscriptAwayFromBottom = true;
@@ -5644,6 +5740,11 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       return;
     }
     updateTranscriptStickiness(event.currentTarget);
+  }
+
+  function handleTranscriptScroll(element: HTMLDivElement) {
+    updateTranscriptStickiness(element);
+    loadEarlierTranscript(element);
   }
 
   function scrollTranscriptToBottom(force = false) {
@@ -5667,6 +5768,12 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       });
     });
   }
+
+  onCleanup(() => {
+    if (transcriptScrollFrame !== undefined) cancelAnimationFrame(transcriptScrollFrame);
+    if (transcriptScrollFollowupFrame !== undefined) cancelAnimationFrame(transcriptScrollFollowupFrame);
+    if (transcriptPrependFrame !== undefined) cancelAnimationFrame(transcriptPrependFrame);
+  });
 
   async function ensureCommandSession(draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId)) {
     const existing = autocompleteSessionId();
@@ -6173,7 +6280,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       const detail = await api<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}`);
       queryClient.setQueryData(['session', projectId, sessionId], detail);
       const retainedIds = new Set(pendingUserMessagesAfterTerminalRefresh(
-        detail.branch.filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
+        branchForEntry(detail.entries, detail.leafId).filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
         pendingAtTerminal,
       ).map(({ id }) => id));
       const terminalIds = new Set(pendingAtTerminal.map(({ id }) => id));
@@ -6226,7 +6333,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       body: JSON.stringify({ sessionId, instructions, mirrorActiveStream }),
     });
     await queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] });
-    await queryClient.invalidateQueries({ queryKey: ['session-tree', projectId, sessionId] });
     await queryClient.invalidateQueries({ queryKey: ['sessions', projectId] });
     await queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, sessionId] });
   }
@@ -6246,7 +6352,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
         body: JSON.stringify({ sessionId, command: command.command, excludeFromContext: command.excludeFromContext, mirrorActiveStream }),
       });
       await queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] });
-      await queryClient.invalidateQueries({ queryKey: ['session-tree', projectId, sessionId] });
       await queryClient.invalidateQueries({ queryKey: ['sessions', projectId] });
       await queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, sessionId] });
     } finally {
@@ -6635,7 +6740,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
         ref={transcriptScrollerRef}
         class={`chat-transcript min-h-0 overflow-y-auto overflow-x-hidden px-6 pb-6 pt-24 ${centerTranscript() ? 'grid place-items-center' : ''}`}
         onWheel={handleTranscriptWheel}
-        onScroll={(event) => updateTranscriptStickiness(event.currentTarget)}
+        onScroll={(event) => handleTranscriptScroll(event.currentTarget)}
       >
         <div class="mx-auto w-full max-w-5xl">
           <div class="min-w-0">
@@ -6649,9 +6754,12 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
               <div class="mb-4 rounded-2xl bg-card p-5 text-sm text-muted-foreground ring-1 ring-foreground/10">Loading session...</div>
             </Show>
             <Show when={props.sessionId && session.error}>
-              <div class="mb-4 rounded-2xl bg-card p-5 text-sm text-destructive ring-1 ring-destructive/20">{session.error instanceof Error ? session.error.message : 'Could not load session'}</div>
+              <div class="mb-4 flex items-center justify-between gap-4 rounded-2xl bg-card p-5 text-sm text-destructive ring-1 ring-destructive/20">
+                <span>{session.error instanceof Error ? session.error.message : 'Could not load session'}</span>
+                <button type="button" class="ghost shrink-0" onClick={() => void session.refetch()}><RefreshCw class="size-4" />Retry</button>
+              </div>
             </Show>
-            <For each={visibleTranscriptEntries()}>
+            <For each={renderedTranscriptEntries()}>
               {(item, index) => {
                 let element: HTMLDivElement | undefined;
                 onCleanup(() => {
@@ -6663,7 +6771,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
                       element = node;
                       setTranscriptEntryRef(item.id, node);
                     }}
-                    data-index={index()}
+                    data-index={transcriptRenderRange().start + index()}
                     class={`chat-search-entry ${chatSearchMatchIds().has(item.id) ? 'chat-search-entry-match' : ''} ${activeSearchEntryId() === item.id ? 'chat-search-entry-active' : ''}`}
                   >
                     <TranscriptEntry entry={item} project={props.project} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} toolCalls={toolCalls()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
@@ -7499,14 +7607,13 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
   const [search, setSearch] = createSignal('');
   const [filterMode, setFilterMode] = createSignal<TreeFilterMode>('default');
   const session = createQuery(() => ({
-    queryKey: ['session-tree', props.project.id, props.sessionId],
+    queryKey: ['session', props.project.id, props.sessionId],
     queryFn: ({ signal }) => api<SessionDetail>(`/api/projects/${props.project.id}/session?sessionId=${encodeURIComponent(props.sessionId)}`, { signal }),
-    placeholderData: () => queryClient.getQueryData<SessionDetail>(['session', props.project.id, props.sessionId]),
     select: sessionTreeViewFromDetail,
     reconcile: 'id',
     staleTime: SESSION_DETAIL_CACHE_STALE_TIME_MS,
   }));
-  const activePathIds = createMemo(() => new Set(session.data?.branch.map((entry) => entry.id) ?? []));
+  const activePathIds = createMemo(() => new Set(session.data ? branchForEntry(session.data.entries, session.data.leafId).map((entry) => entry.id) : []));
   const [collapsedIds, setCollapsedIds] = createSignal<Set<string>>(new Set());
   const [nodeMenu, setNodeMenu] = createSignal<TreeNodeMenuState>();
   const [labelEditor, setLabelEditor] = createSignal<LabelEditorState>();
@@ -7555,7 +7662,6 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ entryId, label }),
     });
-    queryClient.setQueryData(['session-tree', props.project.id, props.sessionId], nextSession);
     queryClient.setQueryData(['session', props.project.id, props.sessionId], nextSession);
     queryClient.invalidateQueries({ queryKey: ['sessions', props.project.id] });
   }
@@ -7589,7 +7695,6 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
       setSummaryTarget(undefined);
       setCustomSummaryTarget(undefined);
       props.onSelect(undefined);
-      await queryClient.invalidateQueries({ queryKey: ['session-tree', props.project.id, props.sessionId] });
       await queryClient.invalidateQueries({ queryKey: ['session', props.project.id, props.sessionId] });
       await queryClient.invalidateQueries({ queryKey: ['sessions', props.project.id] });
     } catch (error) {
@@ -11504,23 +11609,8 @@ function treeSummaryOptions(selection: TreeSelection) {
   return { mode: 'custom', instructions: selection.customInstructions, replace: selection.replaceInstructions };
 }
 
-function branchForEntry(entries: SessionEntry[], leafId: string | null | undefined) {
-  if (leafId === undefined) return entries;
-  if (leafId === null) return [];
-  const byId = new Map(entries.map((entry) => [entry.id, entry]));
-  const branch: SessionEntry[] = [];
-  const visited = new Set<string>();
-  let entry = byId.get(leafId);
-  while (entry && !visited.has(entry.id)) {
-    visited.add(entry.id);
-    branch.push(entry);
-    entry = entry.parentId ? byId.get(entry.parentId) : undefined;
-  }
-  return branch.reverse();
-}
-
 function sessionTreeViewFromDetail(detail: SessionDetail): SessionTreeView {
-  const tree = detail.tree?.length ? detail.tree : sessionTreeNodesFromEntries(detail.entries);
+  const tree = sessionTreeNodesFromEntries(detail.entries);
   const containsActive = treeActivePathMap(tree, detail.leafId);
   return { ...detail, tree: treeViewNodesFromSessionNodes(tree, containsActive) };
 }
@@ -11926,7 +12016,7 @@ function textareaNextWordEnd(value: string, position: number) {
 }
 
 function sessionModelReference(detail: SessionDetail) {
-  for (const entry of [...detail.branch].reverse()) {
+  for (const entry of branchForEntry(detail.entries, detail.leafId).reverse()) {
     if (entry.type === 'model_change' && typeof entry.provider === 'string' && typeof entry.modelId === 'string') return `${entry.provider}/${entry.modelId}`;
     const message = entry.type === 'message' && entry.message?.role === 'assistant' ? entry.message : undefined;
     if (message && typeof message.provider === 'string' && typeof message.model === 'string') return `${message.provider}/${message.model}`;
@@ -11935,7 +12025,7 @@ function sessionModelReference(detail: SessionDetail) {
 }
 
 function sessionThinkingLevel(detail: SessionDetail): ThinkingLevel | undefined {
-  for (const entry of [...detail.branch].reverse()) {
+  for (const entry of branchForEntry(detail.entries, detail.leafId).reverse()) {
     if (entry.type === 'thinking_level_change' && typeof entry.thinkingLevel === 'string' && isThinkingLevel(entry.thinkingLevel)) return entry.thinkingLevel;
   }
   return undefined;

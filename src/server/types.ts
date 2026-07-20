@@ -45,20 +45,11 @@ export interface SessionSummary {
 
 export type SessionEntry = PiSessionEntry;
 
-export interface SessionTreeNode {
-  entry: SessionEntry;
-  children: SessionTreeNode[];
-  label?: string;
-  labelTimestamp?: string;
-}
-
 export interface SessionDetail {
   sessionId: string;
   path: string;
   header: { id?: string; timestamp?: string; cwd?: string; type?: string; version?: number } | null;
   entries: SessionEntry[];
-  branch: SessionEntry[];
-  tree: SessionTreeNode[];
   leafId: string | null;
   name?: string;
 }

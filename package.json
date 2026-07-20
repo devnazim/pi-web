@@ -37,6 +37,7 @@
   "license": "MIT",
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@fastify/compress": "^9.1.0",
     "@fastify/cookie": "^11.0.0",
     "@fastify/multipart": "^10.0.0",
     "@fastify/static": "^9.1.3",

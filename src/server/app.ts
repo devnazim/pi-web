@@ -1,3 +1,4 @@
+import compress from '@fastify/compress';
 import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
@@ -36,6 +37,7 @@ export async function buildApp(options: ServerOptions) {
   });
 
   await app.register(websocket);
+  await app.register(compress, { global: true, threshold: 1024 });
 
   app.get('/healthz', async () => ({ ok: true }));
 
