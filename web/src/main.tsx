@@ -129,10 +129,14 @@ type GitFileDiff = { path: string; staged: boolean; original: string; modified: 
 type ReviewFileDiffState = { key: string; loading: boolean; data?: GitFileDiff; error?: unknown };
 type ReviewThreadAnchor = { path: string; staged?: boolean; startLine: number; endLine: number; selectedText: string; contextBefore: string[]; contextAfter: string[]; [key: string]: unknown };
 type ReviewMessage = { id: string; author: 'user' | 'agent'; body: string; createdAt?: string; updatedAt?: string; deletedAt?: string };
+type ReviewThreadLocation = 'changes' | 'committed' | 'outdated';
+type ReviewNotesFilter = 'relevant' | 'open' | 'resolved' | 'historical' | 'all' | 'hidden';
 type ReviewThread = {
   id: string;
   anchor: ReviewThreadAnchor;
   status: 'open' | 'resolved';
+  location: ReviewThreadLocation;
+  matchingBaselines: Array<'worktree' | 'index' | 'head'>;
   outdated: boolean;
   outdatedReason?: string;
   latestUserRevision?: unknown;
@@ -165,6 +169,8 @@ type ReviewWorkspaceState = {
   reviewReplyDrafts: Record<string, string>;
   reviewEditDrafts: Record<string, string>;
   reviewCollapsedThreads: Record<string, boolean>;
+  reviewNotesFilter: ReviewNotesFilter;
+  reviewOtherConversationsOpen: boolean;
 };
 type ProjectFileEntry = { name: string; type: 'directory' | 'file' };
 type ProjectFilesResponse = { path: string; entries: ProjectFileEntry[] };
@@ -264,6 +270,14 @@ type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: num
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
 type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; onDisconnect?: () => void; heartbeat?: boolean };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
+const REVIEW_NOTES_FILTER_OPTIONS: SelectOption[] = [
+  { value: 'relevant', label: 'Relevant' },
+  { value: 'open', label: 'All open' },
+  { value: 'resolved', label: 'Resolved' },
+  { value: 'historical', label: 'Outdated / committed' },
+  { value: 'all', label: 'All' },
+  { value: 'hidden', label: 'Hidden' },
+];
 type SessionComposerControls = { agent?: string; model?: string; thinking?: ThinkingLevel | '' };
 type ComposerDraft = { text: string; uploads: UploadAsset[]; commandSessionId?: string; treeSelection?: TreeSelection; agent?: string; agentExplicit?: boolean; model?: string; modelExplicit?: boolean; thinking?: ThinkingLevel | ''; thinkingExplicit?: boolean };
 type ChatSearchState = { activeIndex: number; total: number };
@@ -619,6 +633,8 @@ function createReviewWorkspaceState(): ReviewWorkspaceState {
     reviewReplyDrafts: {},
     reviewEditDrafts: {},
     reviewCollapsedThreads: {},
+    reviewNotesFilter: 'relevant',
+    reviewOtherConversationsOpen: false,
   };
 }
 
@@ -4132,7 +4148,7 @@ function NotificationVolumeControl(props: { value: number; onChange: (volume: nu
   );
 }
 
-function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; onOpen?: () => Promise<boolean> | void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean; searchable?: boolean }) {
+function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; onOpen?: () => Promise<boolean> | void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; contentAlign?: 'start' | 'end'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean; searchable?: boolean }) {
   const [open, setOpen] = createSignal(false);
   const [refreshing, setRefreshing] = createSignal(false);
   const [refreshFailed, setRefreshFailed] = createSignal(false);
@@ -4190,8 +4206,9 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
       contentRef.style.width = previousWidth;
     }
     const width = Math.min(naturalWidth, window.innerWidth - margin * 2);
+    const alignedLeft = props.contentAlign === 'end' ? rect.right - width : rect.left;
     setPosition({
-      left: Math.max(margin, Math.min(rect.left, window.innerWidth - width - margin)),
+      left: Math.max(margin, Math.min(alignedLeft, window.innerWidth - width - margin)),
       top: placement === 'top' ? rect.top - gap : rect.bottom + gap,
       width,
       maxHeight,
@@ -8550,7 +8567,9 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   const [actionMenu, setActionMenu] = createSignal<GitFileActionMenuState>();
   const [busyAction, setBusyAction] = createSignal('');
   const [actionError, setActionError] = createSignal('');
-  const [notesVisible, setNotesVisible] = createSignal(true);
+  const [notesFilter, setNotesFilter] = createSignal<ReviewNotesFilter>(props.state.reviewNotesFilter ?? 'relevant');
+  const [otherConversationsOpen, setOtherConversationsOpen] = createSignal(props.state.reviewOtherConversationsOpen ?? false);
+  const notesVisible = createMemo(() => notesFilter() !== 'hidden');
   const [reviewNoteError, setReviewNoteError] = createSignal('');
   const [reviewNoteBusy, setReviewNoteBusy] = createSignal('');
   const [newDrafts, setNewDrafts] = createSignal(props.state.reviewDrafts);
@@ -8595,7 +8614,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
     const path = selected()?.path;
     return path ? (reviewThreads.data?.threads ?? []).filter((thread) => thread.anchor.path === path) : [];
   });
-  const anchoredSelectedThreads = createMemo(() => {
+  const projectedSelectedThreads = createMemo(() => {
     const selection = selected();
     const diff = selectedDiff();
     if (!selection || !diff || diff.unavailable || diff.patch) return [];
@@ -8604,25 +8623,49 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
       return range ? [{
         ...thread,
         anchor: { ...thread.anchor, ...range, staged: selection.staged },
+        location: 'changes' as const,
+        matchingBaselines: [...new Set([...thread.matchingBaselines, selection.staged ? 'index' as const : 'worktree' as const])],
         outdated: false,
         outdatedReason: undefined,
       }] : [];
     });
   });
+  const anchoredSelectedThreads = createMemo(() => projectedSelectedThreads().filter((thread) => {
+    if (notesFilter() === 'relevant' || notesFilter() === 'open') return thread.status === 'open';
+    if (notesFilter() === 'resolved') return thread.status === 'resolved';
+    return notesFilter() === 'all';
+  }));
   const unanchoredSelectedThreads = createMemo(() => {
-    const anchoredIds = new Set(anchoredSelectedThreads().map((thread) => thread.id));
+    const anchoredIds = new Set(projectedSelectedThreads().map((thread) => thread.id));
     return selectedThreads().filter((thread) => !anchoredIds.has(thread.id));
   });
-  const detachedThreads = createMemo(() => {
-    const changedPaths = new Set((status.data?.status.files ?? []).map((file) => file.path));
-    return (reviewThreads.data?.threads ?? []).filter((thread) => !changedPaths.has(thread.anchor.path));
+  const otherPathThreads = createMemo(() => {
+    const selectedPath = selected()?.path;
+    return (reviewThreads.data?.threads ?? []).filter((thread) => thread.anchor.path !== selectedPath);
   });
-  const visibleFileLevelThreads = createMemo(() => [...unanchoredSelectedThreads(), ...detachedThreads()]);
-  const fileLevelThreadNotice = createMemo(() => {
-    if (unanchoredSelectedThreads().length && detachedThreads().length) return 'Some conversations cannot be anchored in this preview; others belong to paths no longer present in source control changes.';
-    if (detachedThreads().length) return 'These conversations belong to paths no longer present in staged or working tree changes.';
-    return 'These conversations are outdated or cannot be safely anchored in this preview.';
+  const visibleFileLevelThreads = createMemo(() => {
+    const filter = notesFilter();
+    if (filter === 'hidden') return [];
+    const selectedUnanchored = unanchoredSelectedThreads();
+    const candidates = filter === 'relevant' ? selectedUnanchored : [...selectedUnanchored, ...otherPathThreads()];
+    return candidates.filter((thread) => {
+      if (filter === 'relevant') return thread.status === 'open' && thread.location === 'changes';
+      if (filter === 'open') return thread.status === 'open';
+      if (filter === 'resolved') return thread.status === 'resolved';
+      if (filter === 'historical') return thread.location === 'committed' || thread.location === 'outdated' || thread.outdated;
+      return true;
+    });
   });
+  const otherBaselineThreads = createMemo(() => visibleFileLevelThreads().filter((thread) => thread.location === 'changes' && !thread.outdated && thread.anchor.path === selected()?.path));
+  const otherChangedFileThreads = createMemo(() => visibleFileLevelThreads().filter((thread) => thread.location === 'changes' && !thread.outdated && thread.anchor.path !== selected()?.path));
+  const committedThreads = createMemo(() => visibleFileLevelThreads().filter((thread) => thread.location === 'committed'));
+  const outdatedThreads = createMemo(() => visibleFileLevelThreads().filter((thread) => thread.location === 'outdated' || thread.outdated));
+  const fileLevelThreadGroups = createMemo(() => [
+    { key: 'other-baseline', label: 'Other baseline', threads: otherBaselineThreads() },
+    { key: 'other-files', label: 'Other changed files', threads: otherChangedFileThreads() },
+    { key: 'committed', label: 'Committed / no longer changed', threads: committedThreads() },
+    { key: 'outdated', label: 'Outdated', threads: outdatedThreads() },
+  ].filter((group) => group.threads.length > 0));
   const currentDraft = createMemo(() => {
     const sessionId = props.sessionId;
     const selection = selected();
@@ -8634,6 +8677,8 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   createEffect(() => { props.state.reviewReplyDrafts = replyDrafts(); });
   createEffect(() => { props.state.reviewEditDrafts = editDrafts(); });
   createEffect(() => { props.state.reviewCollapsedThreads = collapsedThreads(); });
+  createEffect(() => { props.state.reviewNotesFilter = notesFilter(); });
+  createEffect(() => { props.state.reviewOtherConversationsOpen = otherConversationsOpen(); });
   createEffect(() => {
     props.sessionId;
     selected()?.path;
@@ -8981,6 +9026,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
       const nextStatus = await api<{ status: GitStatus }>(`/api/projects/${props.project.id}/git/${action}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: file }) });
       queryClient.setQueryData(['git-status', props.project.id], nextStatus);
       refreshSelectedDiff({ force: true });
+      if (props.sessionId) await reviewThreads.refetch().catch(() => undefined);
     } catch (error) {
       setActionError(errorMessage(error, `Git ${action} failed`));
     } finally {
@@ -8998,6 +9044,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
       const nextStatus = await api<{ status: GitStatus }>(`/api/projects/${props.project.id}/git/commit`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: commitMessage }) });
       queryClient.setQueryData(['git-status', props.project.id], nextStatus);
       refreshSelectedDiff({ force: true });
+      if (props.sessionId) await reviewThreads.refetch().catch(() => undefined);
       setReviewCommitDialogOpen(false);
       setReviewCommitMessage('');
     } catch (error) {
@@ -9172,9 +9219,20 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
             </div>
           </div>
           <div class="flex shrink-0 items-center gap-1">
-            <Show when={!notesVisible() || (reviewThreads.data?.threads.length ?? 0) > 0 || Object.keys(newDrafts()).length > 0}>
-              <button class={`review-notes-toggle ${notesVisible() ? 'review-notes-toggle-active' : ''}`} type="button" title={notesVisible() ? 'Hide review notes' : 'Show review notes'} aria-pressed={notesVisible()} onClick={() => setNotesVisible((visible) => !visible)}><MessageSquare class="size-3.5" /><span>{notesVisible() ? 'Hide notes' : 'Show notes'}</span></button>
-            </Show>
+            <div class={`review-notes-filter ${notesVisible() ? 'review-notes-toggle-active' : ''}`} title="Filter review conversations">
+              <MessageSquare class="size-3.5 shrink-0" />
+              <UiSelect
+                value={notesFilter()}
+                options={REVIEW_NOTES_FILTER_OPTIONS}
+                onChange={(value) => setNotesFilter(value as ReviewNotesFilter)}
+                ariaLabel="Review conversation filter"
+                class="review-notes-filter-select"
+                triggerWidth="content"
+                contentWidth="content"
+                contentAlign="end"
+                compact
+              />
+            </div>
             <button class="project-modal-close shrink-0 review-close-desktop" title="Close reviewer" onClick={props.onClose}><X class="size-4" /></button>
           </div>
         </div>
@@ -9191,35 +9249,51 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
         <div class="review-unanchored-slot">
         <Show when={notesVisible() && visibleFileLevelThreads().length > 0}>
           <section class="review-unanchored-section" aria-label="Review conversations not anchored in the current diff">
-            <div class="review-unanchored-header">
-              <div class="font-semibold text-foreground">Review conversations</div>
-              <div>{fileLevelThreadNotice()}</div>
-            </div>
-            <div class="review-unanchored-list">
-              <For each={visibleFileLevelThreads()}>
-                {(thread) => (
-                  <ReviewThreadCard
-                    thread={thread}
-                    contextLabel={`${thread.anchor.path}, ${thread.anchor.startLine === thread.anchor.endLine ? `line ${thread.anchor.startLine}` : `lines ${thread.anchor.startLine}–${thread.anchor.endLine}`}`}
-                    showContext
-                    collapsed={Boolean(collapsedThreads()[thread.id])}
-                    busyAction={reviewNoteBusy()}
-                    replyDraft={replyDrafts()[thread.id] ?? ''}
-                    editDrafts={editDrafts()}
-                    syntaxTheme={syntaxTheme()}
-                    onToggle={() => setCollapsedThreads((threads) => ({ ...threads, [thread.id]: !threads[thread.id] }))}
-                    onReplyDraft={(body) => setReplyDrafts((drafts) => ({ ...drafts, [thread.id]: body }))}
-                    onReply={() => void replyToReviewThread(thread.id)}
-                    onStartEdit={(message) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${message.id}`]: message.body }))}
-                    onEditDraft={(messageId, body) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${messageId}`]: body }))}
-                    onCancelEdit={(messageId) => setEditDrafts((drafts) => { const next = { ...drafts }; delete next[`${thread.id}:${messageId}`]; return next; })}
-                    onEdit={(messageId) => void editReviewMessage(thread.id, messageId)}
-                    onDelete={(messageId) => void deleteReviewMessage(thread.id, messageId)}
-                    onStatus={() => void setReviewThreadStatus(thread)}
-                  />
-                )}
-              </For>
-            </div>
+            <button
+              type="button"
+              class="review-unanchored-toggle"
+              aria-expanded={otherConversationsOpen()}
+              onClick={() => setOtherConversationsOpen((open) => !open)}
+            >
+              <ChevronDown class={`size-4 shrink-0 transition-transform ${otherConversationsOpen() ? '' : '-rotate-90'}`} />
+              <MessageSquare class="size-4 shrink-0" />
+              <span class="min-w-0 flex-1 text-left font-semibold">Other conversations</span>
+              <span class="review-thread-count">{visibleFileLevelThreads().length}</span>
+            </button>
+            <Show when={otherConversationsOpen()}>
+              <div class="review-unanchored-list">
+                <For each={fileLevelThreadGroups()}>
+                  {(group) => (
+                    <section class="review-unanchored-group" aria-label={group.label}>
+                      <div class="review-unanchored-group-title">{group.label} <span>{group.threads.length}</span></div>
+                      <For each={group.threads}>
+                        {(thread) => (
+                          <ReviewThreadCard
+                            thread={thread}
+                            contextLabel={`${thread.anchor.path}, ${thread.anchor.startLine === thread.anchor.endLine ? `line ${thread.anchor.startLine}` : `lines ${thread.anchor.startLine}–${thread.anchor.endLine}`}`}
+                            showContext
+                            collapsed={Boolean(collapsedThreads()[thread.id])}
+                            busyAction={reviewNoteBusy()}
+                            replyDraft={replyDrafts()[thread.id] ?? ''}
+                            editDrafts={editDrafts()}
+                            syntaxTheme={syntaxTheme()}
+                            onToggle={() => setCollapsedThreads((threads) => ({ ...threads, [thread.id]: !threads[thread.id] }))}
+                            onReplyDraft={(body) => setReplyDrafts((drafts) => ({ ...drafts, [thread.id]: body }))}
+                            onReply={() => void replyToReviewThread(thread.id)}
+                            onStartEdit={(message) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${message.id}`]: message.body }))}
+                            onEditDraft={(messageId, body) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${messageId}`]: body }))}
+                            onCancelEdit={(messageId) => setEditDrafts((drafts) => { const next = { ...drafts }; delete next[`${thread.id}:${messageId}`]; return next; })}
+                            onEdit={(messageId) => void editReviewMessage(thread.id, messageId)}
+                            onDelete={(messageId) => void deleteReviewMessage(thread.id, messageId)}
+                            onStatus={() => void setReviewThreadStatus(thread)}
+                          />
+                        )}
+                      </For>
+                    </section>
+                  )}
+                </For>
+              </div>
+            </Show>
           </section>
         </Show>
         </div>
@@ -9479,6 +9553,7 @@ function ReviewThreadCard(props: {
           <Show when={props.showContext}><span class="review-thread-location">{props.contextLabel}</span></Show>
         </span>
         <span class="review-thread-count">{props.thread.messages.length}</span>
+        <Show when={props.thread.location === 'committed'}><span class="review-thread-badge">Committed</span></Show>
         <Show when={props.thread.outdated}><span class="review-thread-badge">Outdated</span></Show>
       </button>
       <Show when={!props.collapsed}>

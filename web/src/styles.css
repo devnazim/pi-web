@@ -2011,9 +2011,25 @@ body {
     @apply border-b border-border bg-card/80 px-4 py-2 text-xs text-muted-foreground;
   }
 
+  .review-unanchored-toggle {
+    @apply flex w-full items-center gap-2 border-b border-border bg-card/80 px-4 py-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground;
+  }
+
   .review-unanchored-list {
-    @apply flex min-h-0 flex-col gap-2 overflow-y-auto p-3;
+    @apply flex min-h-0 flex-col gap-3 overflow-y-auto p-3;
     overscroll-behavior: contain;
+  }
+
+  .review-unanchored-group {
+    @apply flex flex-col gap-2;
+  }
+
+  .review-unanchored-group-title {
+    @apply flex items-center gap-1.5 px-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground;
+  }
+
+  .review-unanchored-group-title span {
+    @apply rounded-full bg-muted px-1.5 py-0.5 text-[10px];
   }
 
   .review-unanchored-list .review-thread-card {
@@ -2039,6 +2055,18 @@ body {
 
   .review-notes-toggle {
     @apply inline-flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground;
+  }
+
+  .review-notes-filter {
+    @apply inline-flex h-8 items-center gap-1.5 rounded-xl px-2.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-within:ring-[3px] focus-within:ring-ring/50;
+  }
+
+  .review-notes-filter-select .select {
+    @apply max-w-44 border-0 bg-transparent px-0 py-0 pr-5 shadow-none focus-visible:ring-0;
+  }
+
+  .review-notes-filter-select .select-chevron {
+    @apply right-0;
   }
 
   .review-notes-toggle-active {

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import Fastify from 'fastify';
-import { getGitStatus } from '../../src/server/git.js';
+import { getGitHeadRevision, getGitStatus, getReviewableHeadFiles } from '../../src/server/git.js';
 import { ProjectRegistry } from '../../src/server/projects.js';
 import {
   addAgentReviewReply,
@@ -305,6 +305,8 @@ test('projects review anchors across staged and worktree baselines', async (t) =
   await execFileAsync('git', ['add', 'review.txt'], { cwd: projectPath });
   const afterStaging = await getReviewThreads(projectPath, sessionId);
   assert.equal(afterStaging.threads[0].outdated, false);
+  assert.equal(afterStaging.threads[0].location, 'changes');
+  assert.deepEqual(afterStaging.threads[0].matchingBaselines, ['index']);
   assert.equal(afterStaging.threads[0].anchor.staged, true);
 
   await writeFile(path.join(projectPath, 'review.txt'), 'alpha\nworktree beta\ngamma\n');
@@ -320,6 +322,7 @@ test('projects review anchors across staged and worktree baselines', async (t) =
   });
   const stagedCreated = stagedThread.threads.find((thread) => thread.messages[0].body === 'Created from the index')!;
   assert.equal(stagedCreated.outdated, false);
+  assert.deepEqual(stagedCreated.matchingBaselines, ['index']);
   assert.equal(stagedCreated.anchor.staged, true);
 
   const worktreeThread = await createAgentReviewThread(projectPath, sessionId, {
@@ -334,6 +337,8 @@ test('projects review anchors across staged and worktree baselines', async (t) =
   });
   const worktreeCreated = worktreeThread.threads.find((thread) => thread.messages[0].body === 'Created from the worktree baseline')!;
   assert.equal(worktreeCreated.outdated, false);
+  assert.equal(worktreeCreated.location, 'changes');
+  assert.deepEqual(worktreeCreated.matchingBaselines, ['worktree']);
   assert.equal(worktreeCreated.anchor.staged, false);
 
   await assert.rejects(createAgentReviewThread(projectPath, sessionId, {
@@ -346,6 +351,37 @@ test('projects review anchors across staged and worktree baselines', async (t) =
     contextAfter: ['gamma', ''],
     body: 'Wrong baseline',
   }), /context changed/);
+
+  await execFileAsync('git', ['add', 'review.txt'], { cwd: projectPath });
+  await execFileAsync('git', ['commit', '-qm', 'reviewed'], { cwd: projectPath });
+  const afterCommit = await getReviewThreads(projectPath, sessionId);
+  const committedThread = afterCommit.threads.find((thread) => thread.messages[0].body === 'Created from the worktree baseline')!;
+  assert.equal(committedThread.location, 'committed');
+  assert.deepEqual(committedThread.matchingBaselines, ['head']);
+  assert.equal(committedThread.outdated, false);
+  assert.equal(afterCommit.threads.find((thread) => thread.messages[0].body === 'Created from the index')!.location, 'outdated');
+});
+
+test('batch reads committed review files with unusual paths without desynchronizing', async (t) => {
+  const projectPath = await mkdtemp(path.join(tmpdir(), 'pi-web-review-batch-'));
+  t.after(() => rm(projectPath, { recursive: true, force: true }));
+  await execFileAsync('git', ['init', '-q'], { cwd: projectPath });
+  await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: projectPath });
+  await execFileAsync('git', ['config', 'user.name', 'Test'], { cwd: projectPath });
+  await Promise.all([
+    writeFile(path.join(projectPath, 'binary.dat'), Buffer.from([0, 1, 2, 3])),
+    writeFile(path.join(projectPath, 'line\nbreak.txt'), 'newline path\n'),
+    writeFile(path.join(projectPath, 'normal.txt'), 'normal path\n'),
+  ]);
+  await execFileAsync('git', ['add', '.'], { cwd: projectPath });
+  await execFileAsync('git', ['commit', '-qm', 'batch fixtures'], { cwd: projectPath });
+
+  const revision = await getGitHeadRevision(projectPath);
+  const contents = await getReviewableHeadFiles(projectPath, ['binary.dat', 'line\nbreak.txt', 'missing.txt', 'normal.txt'], revision);
+  assert.ok(contents.get('binary.dat') instanceof Error);
+  assert.equal(contents.get('line\nbreak.txt'), 'newline path\n');
+  assert.equal(contents.get('missing.txt'), '');
+  assert.equal(contents.get('normal.txt'), 'normal path\n');
 });
 
 test('retains the pending SessionManager and review UUID through first persistence', async (t) => {

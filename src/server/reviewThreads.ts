@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { link, lstat, mkdir, open, readFile, realpath, readdir, rename, rm, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
-import { getGitStatus, getReviewableFile } from './git.js';
+import { getGitHeadRevision, getGitStatus, getReviewableFile, getReviewableHeadFiles } from './git.js';
 import type { ProjectRegistry } from './projects.js';
 import { projectSessionDir, resolveSessionIdentity } from './sessions.js';
 import { resolveWithin } from './util.js';
@@ -24,6 +24,8 @@ const STORE_LOCK_STALE_MS = 60_000;
 
 export type ReviewAuthor = 'user' | 'agent';
 export type ReviewThreadStatus = 'open' | 'resolved';
+export type ReviewThreadLocation = 'changes' | 'committed' | 'outdated';
+export type ReviewThreadBaseline = 'worktree' | 'index' | 'head';
 
 export interface ReviewAnchor {
   path: string;
@@ -50,6 +52,8 @@ export interface ReviewThread {
   id: string;
   anchor: ReviewAnchor;
   status: ReviewThreadStatus;
+  location: ReviewThreadLocation;
+  matchingBaselines: ReviewThreadBaseline[];
   outdated: boolean;
   outdatedReason?: string;
   latestUserRevision: number;
@@ -71,7 +75,7 @@ export interface PendingReviewThreadOptions {
   path?: string;
 }
 
-interface StoredReviewThread extends Omit<ReviewThread, 'outdated' | 'outdatedReason'> {}
+interface StoredReviewThread extends Omit<ReviewThread, 'location' | 'matchingBaselines' | 'outdated' | 'outdatedReason'> {}
 interface ReviewThreadStore {
   version: typeof STORE_VERSION;
   revision: number;
@@ -117,8 +121,9 @@ export async function getPendingReviewThreads(
   projectPath: string,
   sessionId: string,
   options: PendingReviewThreadOptions = {},
+  existingCollection?: ReviewThreadCollection,
 ): Promise<ReviewThreadCollection & { total?: number; nextCursor?: string }> {
-  const collection = await getReviewThreads(projectPath, sessionId);
+  const collection = existingCollection ?? await getReviewThreads(projectPath, sessionId);
   const filtered = collection.threads.filter((thread) => {
     if (options.path && thread.anchor.path !== options.path) return false;
     if (!options.includeResolved && thread.status === 'resolved') return false;
@@ -402,12 +407,16 @@ async function mutateForSession(
   }));
 }
 
-type ReviewBaselineContent = { staged: boolean; content: string };
+type ReviewBaselineContent =
+  | { location: 'changes'; staged: boolean; content: string }
+  | { location: 'committed'; content: string };
 
 async function collectionFromStore(projectPath: string, store: ReviewThreadStore): Promise<ReviewThreadCollection> {
   if (!store.threads.length) return { revision: store.revision, threads: [] };
   const contents = new Map<string, ReviewBaselineContent[] | Error>();
+  const liveResultsByPath = new Map<string, Array<ReviewBaselineContent | Error>>();
   const status = await getGitStatus(projectPath);
+  const headRevision = await getGitHeadRevision(projectPath).catch(() => undefined);
   const filePaths = [...new Set(store.threads.map((thread) => thread.anchor.path))];
   for (let offset = 0; offset < filePaths.length; offset += MAX_FILE_READ_CONCURRENCY) {
     await Promise.all(filePaths.slice(offset, offset + MAX_FILE_READ_CONCURRENCY).map(async (filePath) => {
@@ -416,20 +425,41 @@ async function collectionFromStore(projectPath: string, store: ReviewThreadStore
         ...(file?.unstaged ? [{ staged: false }] : []),
         ...(file?.staged ? [{ staged: true }] : []),
       ];
-      if (!baselines.length) {
-        contents.set(filePath, new Error('File is no longer staged, unstaged, or untracked'));
-        return;
-      }
-      const results = await Promise.all(baselines.map(async ({ staged }) => {
+      liveResultsByPath.set(filePath, await Promise.all(baselines.map(async ({ staged }): Promise<ReviewBaselineContent | Error> => {
         try {
-          return { staged, content: await getReviewableFile(projectPath, filePath, staged, status) };
+          return { location: 'changes', staged, content: await getReviewableFile(projectPath, filePath, staged, status) };
         } catch (error) {
           return error instanceof Error ? error : new Error('File is unavailable');
         }
-      }));
-      const available = results.filter((result): result is ReviewBaselineContent => !(result instanceof Error));
-      contents.set(filePath, available.length ? available : results.find((result): result is Error => result instanceof Error) ?? new Error('File is unavailable'));
+      })));
     }));
+  }
+
+  const headPaths = headRevision ? filePaths.filter((filePath) => {
+    const liveContents = (liveResultsByPath.get(filePath) ?? []).filter((result): result is Extract<ReviewBaselineContent, { location: 'changes' }> => !(result instanceof Error));
+    return store.threads.some((thread) => thread.anchor.path === filePath && !liveContents.some((content) => (
+      projectReviewAnchor(thread.anchor, content.content, content.staged !== (thread.anchor.staged === true))
+    )));
+  }) : [];
+  const headPathSet = new Set(headPaths);
+  let headResults = new Map<string, string | Error>();
+  let headError: Error | undefined;
+  if (headRevision && headPaths.length) {
+    try {
+      headResults = await getReviewableHeadFiles(projectPath, headPaths, headRevision);
+    } catch (error) {
+      headError = error instanceof Error ? error : new Error('File is unavailable');
+    }
+  }
+  for (const filePath of filePaths) {
+    const liveResults = liveResultsByPath.get(filePath) ?? [];
+    const headResult = headPathSet.has(filePath) ? headResults.get(filePath) ?? headError ?? new Error('File is unavailable') : undefined;
+    const results: Array<ReviewBaselineContent | Error> = [
+      ...liveResults,
+      ...(typeof headResult === 'string' ? [{ location: 'committed', content: headResult } as const] : headResult ? [headResult] : []),
+    ];
+    const available = results.filter((result): result is ReviewBaselineContent => !(result instanceof Error));
+    contents.set(filePath, available.length ? available : results.find((result): result is Error => result instanceof Error) ?? new Error('File is unavailable'));
   }
   return {
     revision: store.revision,
@@ -439,15 +469,28 @@ async function collectionFromStore(projectPath: string, store: ReviewThreadStore
 
 function currentThread(thread: StoredReviewThread, contents: ReviewBaselineContent[] | Error | undefined): ReviewThread {
   if (contents instanceof Error || contents === undefined) {
-    return { ...cloneThread(thread), outdated: true, outdatedReason: contents?.message || 'File is unavailable' };
+    return { ...cloneThread(thread), location: 'outdated', matchingBaselines: [], outdated: true, outdatedReason: contents?.message || 'File is unavailable' };
   }
   const preferredBaseline = thread.anchor.staged === true;
-  const orderedContents = [...contents].sort((left, right) => Number(right.staged === preferredBaseline) - Number(left.staged === preferredBaseline));
-  for (const { staged, content } of orderedContents) {
-    const anchor = projectReviewAnchor(thread.anchor, content, staged !== preferredBaseline);
-    if (anchor) return { ...cloneThread(thread), anchor: { ...anchor, staged }, outdated: false };
-  }
-  return { ...cloneThread(thread), outdated: true, outdatedReason: 'Anchored text or its surrounding context changed' };
+  const orderedContents = [...contents].sort((left, right) => {
+    const score = (content: ReviewBaselineContent) => content.location === 'committed' ? 2 : content.staged === preferredBaseline ? 0 : 1;
+    return score(left) - score(right);
+  });
+  const projections = orderedContents.flatMap((content) => {
+    const anchor = projectReviewAnchor(thread.anchor, content.content, content.location === 'committed' || content.staged !== preferredBaseline);
+    if (!anchor) return [];
+    const baseline: ReviewThreadBaseline = content.location === 'committed' ? 'head' : content.staged ? 'index' : 'worktree';
+    return [{ content, anchor, baseline }];
+  });
+  const primary = projections[0];
+  if (!primary) return { ...cloneThread(thread), location: 'outdated', matchingBaselines: [], outdated: true, outdatedReason: 'Anchored text or its surrounding context changed' };
+  return {
+    ...cloneThread(thread),
+    anchor: primary.content.location === 'changes' ? { ...primary.anchor, staged: primary.content.staged } : primary.anchor,
+    location: primary.content.location,
+    matchingBaselines: [...new Set(projections.map((projection) => projection.baseline))],
+    outdated: false,
+  };
 }
 
 function projectReviewAnchor(anchor: ReviewAnchor, content: string, crossingBaseline: boolean): ReviewAnchor | undefined {

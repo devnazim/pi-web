@@ -1,5 +1,5 @@
 import type { FastifyInstance } from 'fastify';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { lstat, readFile, readlink } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -344,6 +344,110 @@ export async function getReviewableFile(cwd: string, filePath: string, staged: b
 
 export function getReviewableWorkingTreeFile(cwd: string, filePath: string, status?: GitStatus) {
   return getReviewableFile(cwd, filePath, false, status);
+}
+
+export async function getGitHeadRevision(cwd: string) {
+  const { stdout } = await runGit(cwd, ['rev-parse', '--verify', 'HEAD']);
+  const revision = stdout.trim();
+  if (!/^[a-f0-9]{40,64}$/i.test(revision)) throw new Error('Git HEAD is unavailable');
+  return revision;
+}
+
+export async function getReviewableHeadFile(cwd: string, filePath: string, revision = 'HEAD') {
+  const normalizedPath = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+  if (!normalizedPath || normalizedPath === '.' || path.isAbsolute(filePath)) throw new Error('Invalid review file path');
+  if (isReservedAppStatePath(normalizedPath)) throw new Error('Pi Web app state is not reviewable');
+  resolveWithin(cwd, normalizedPath);
+  const result = await gitBlob(cwd, revision, projectPathToGitPath(await gitProjectContext(cwd), normalizedPath));
+  if (result.unavailable !== undefined) throw new Error(result.unavailable);
+  return result.content;
+}
+
+export async function getReviewableHeadFiles(cwd: string, filePaths: string[], revision: string) {
+  const results = new Map<string, string | Error>();
+  if (!filePaths.length) return results;
+  const context = await gitProjectContext(cwd);
+  const requests = filePaths.map((filePath) => {
+    const normalizedPath = filePath.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!normalizedPath || normalizedPath === '.' || path.isAbsolute(filePath)) throw new Error('Invalid review file path');
+    if (isReservedAppStatePath(normalizedPath)) throw new Error('Pi Web app state is not reviewable');
+    resolveWithin(cwd, normalizedPath);
+    return { filePath, objectName: `${revision}:${projectPathToGitPath(context, normalizedPath)}` };
+  });
+  const child = spawn('git', ['cat-file', '--batch', '-Z'], { cwd, env: GIT_ENV, stdio: ['pipe', 'pipe', 'pipe'] });
+  const stderr: Buffer[] = [];
+  child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+  const completion = new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code) => code === 0 ? resolve() : reject(new Error(Buffer.concat(stderr).toString('utf8').trim() || `git cat-file exited with code ${code}`)));
+  });
+  child.stdin.on('error', () => undefined);
+  child.stdin.end(`${requests.map((request) => request.objectName).join('\0')}\0`);
+
+  const iterator = child.stdout[Symbol.asyncIterator]();
+  let buffered = Buffer.alloc(0);
+  const readMore = async () => {
+    const next = await iterator.next();
+    if (next.done) throw new Error('Unexpected end of git cat-file output');
+    buffered = buffered.length ? Buffer.concat([buffered, next.value]) : next.value;
+  };
+  const readHeader = async () => {
+    let delimiter = buffered.indexOf(0x00);
+    while (delimiter < 0) {
+      await readMore();
+      delimiter = buffered.indexOf(0x00);
+    }
+    const header = buffered.subarray(0, delimiter).toString('utf8');
+    buffered = buffered.subarray(delimiter + 1);
+    return header;
+  };
+  const readBytes = async (length: number) => {
+    while (buffered.length < length) await readMore();
+    const value = buffered.subarray(0, length);
+    buffered = buffered.subarray(length);
+    return value;
+  };
+  const skipBytes = async (length: number) => {
+    let remaining = length;
+    while (remaining > 0) {
+      if (!buffered.length) await readMore();
+      const consumed = Math.min(remaining, buffered.length);
+      buffered = buffered.subarray(consumed);
+      remaining -= consumed;
+    }
+  };
+
+  try {
+    for (const request of requests) {
+      const header = await readHeader();
+      if (header.endsWith(' missing')) {
+        results.set(request.filePath, '');
+        continue;
+      }
+      const match = header.match(/^([a-f0-9]+) ([^ ]+) ([0-9]+)$/i);
+      if (!match || match[2] !== 'blob') throw new Error('Invalid git cat-file response');
+      const size = Number(match[3]);
+      if (!Number.isSafeInteger(size) || size < 0) throw new Error('Invalid git object size');
+      if (size > MAX_GIT_FILE_DIFF_BYTES) {
+        await skipBytes(size);
+        const separator = await readBytes(1);
+        if (separator[0] !== 0x00) throw new Error('Invalid git cat-file response');
+        results.set(request.filePath, new Error(largeDiffMessage(size)));
+        continue;
+      }
+      const content = await readBytes(size);
+      const separator = await readBytes(1);
+      if (separator[0] !== 0x00) throw new Error('Invalid git cat-file response');
+      const text = textContent(content);
+      results.set(request.filePath, text.unavailable === undefined ? text.content : new Error(text.unavailable));
+    }
+    await completion;
+    return results;
+  } catch (error) {
+    child.kill();
+    await completion.catch(() => undefined);
+    throw error;
+  }
 }
 
 async function workingTreeFile(cwd: string, filePath: string) {

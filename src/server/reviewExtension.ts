@@ -28,7 +28,7 @@ type ReviewExtensionDependencies = {
   resolveAgentReviewThread: typeof resolveAgentReviewThread;
 };
 
-type ListParams = { cursor?: string; limit?: number; path?: string; includeHandled?: boolean };
+type ListParams = { cursor?: string; limit?: number; path?: string; includeHandled?: boolean; scope?: 'relevant' | 'all' };
 type ReplyParams = { threadId: string; body: string; handlesUserRevision: number; resolve?: boolean };
 type CreateParams = { path: string; staged?: boolean; startLine: number; endLine: number; selectedText: string; contextBefore: string[]; contextAfter: string[]; body: string };
 type ResolveParams = { threadId: string; handlesUserRevision: number; body?: string };
@@ -61,7 +61,7 @@ function registerReviewExtension(pi: ExtensionAPI, projectPath: string, sessionI
   pi.registerTool({
     name: 'pi_web_review_list',
     label: 'List Pi Web review threads',
-    description: 'List review threads for this Pi Web project and durable session. Use cursors to paginate and includeHandled only when prior handled revisions are relevant.',
+    description: 'List review threads for this Pi Web project and durable session. Defaults to open threads relevant to current unstaged/untracked changes; use scope=all for committed, outdated, staged-only, or otherwise historical conversations.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -70,6 +70,7 @@ function registerReviewExtension(pi: ExtensionAPI, projectPath: string, sessionI
         limit: { type: 'integer', minimum: 1, maximum: 100 },
         path: stringProperty,
         includeHandled: { type: 'boolean' },
+        scope: { type: 'string', enum: ['relevant', 'all'] },
       },
     } as any,
     execute: async (_toolCallId, params) => toolResult(await listReviewThreads(projectPath, sessionId, params as ListParams, deps)),
@@ -142,11 +143,11 @@ function registerReviewExtension(pi: ExtensionAPI, projectPath: string, sessionI
     description: 'Review unstaged changes and session review threads',
     handler: async () => {
       pi.setActiveTools([...new Set([...pi.getActiveTools(), ...REVIEW_TOOL_NAMES])]);
-      const [status, pending, allThreads] = await Promise.all([
+      const [status, allThreads] = await Promise.all([
         deps.getGitStatus(projectPath),
-        deps.getPendingReviewThreads(projectPath, sessionId),
         deps.getReviewThreads(projectPath, sessionId),
       ]);
+      const pending = await deps.getPendingReviewThreads(projectPath, sessionId, {}, allThreads);
       pi.sendUserMessage(buildReviewPrompt(status, pending, allThreads));
     },
   });
@@ -161,9 +162,13 @@ async function listReviewThreads(
   const result = params.includeHandled
     ? await deps.getReviewThreads(projectPath, sessionId)
     : await deps.getPendingReviewThreads(projectPath, sessionId);
+  const relevantPaths = params.scope === 'all'
+    ? undefined
+    : new Set((await deps.getGitStatus(projectPath)).files.filter((file) => file.unstaged).map((file) => file.path));
   const threads = reviewItems(result).filter((thread) => {
     if (params.includeHandled && reviewItemStatus(thread) === 'resolved') return false;
-    return !params.path || reviewItemPath(thread) === params.path;
+    if (params.path && reviewItemPath(thread) !== params.path) return false;
+    return !relevantPaths || (relevantPaths.has(reviewItemPath(thread) ?? '') && reviewItemMatchesWorktree(thread));
   });
   const offset = Number.parseInt(params.cursor ?? '0', 10);
   const limit = params.limit ?? 20;
@@ -220,8 +225,10 @@ function buildReviewPrompt(
   allThreadsResult: unknown,
 ) {
   const unstagedFiles = status.files.filter((file) => file.unstaged);
-  const pending = reviewItems(pendingResult);
-  const allThreads = reviewItems(allThreadsResult);
+  const unstagedPaths = new Set(unstagedFiles.map((file) => file.path));
+  const relevantThread = (thread: unknown) => unstagedPaths.has(reviewItemPath(thread) ?? '') && reviewItemMatchesWorktree(thread);
+  const pending = reviewItems(pendingResult).filter(relevantThread);
+  const allThreads = reviewItems(allThreadsResult).filter(relevantThread);
   const pendingIds = new Set(pending.map(reviewItemId).filter((id): id is string => Boolean(id)));
   const otherThreads = allThreads.filter((thread) => {
     const id = reviewItemId(thread);
@@ -235,7 +242,8 @@ function buildReviewPrompt(
     '- Review only current unstaged and untracked changes. Do not review staged-only changes; for partially staged files, inspect only the unstaged diff.',
     '- Use the normal configured workspace tools to inspect diffs and files. This snapshot deliberately does not inline file contents.',
     '- Respond primarily in chat with concise, prioritized, actionable findings. Use Pi Web inline review tools only when a location-specific discussion is more useful than chat.',
-    '- Check existing threads before creating a finding so you do not duplicate one. Address pending user revisions with a reply or resolution only when useful.',
+    '- Check existing relevant threads before creating a finding so you do not duplicate one. Address pending user revisions with a reply or resolution only when useful.',
+    '- By default, thread context and pi_web_review_list include only conversations attached to current unstaged/untracked changes. Use scope=all only when committed, outdated, staged-only, or otherwise historical conversations are explicitly needed.',
     '- Set handlesUserRevision to the exact latestUserRevision shown by pi_web_review_list; backend conflict validation will reject stale revisions or invalid anchors.',
     '- When using pi_web_review_create, pass the exact selectedText plus up to three immediately preceding and following context lines from the file version you inspected.',
     '- Your normal configured model, agent profile, tools, actions, and optional delegation remain available. You may delegate if configured, but do not assume or force a reviewer subagent.',
@@ -335,6 +343,21 @@ function reviewItemStatus(item: unknown) {
   return typeof status === 'string' ? status : undefined;
 }
 
+function reviewItemLocation(item: unknown) {
+  if (!item || typeof item !== 'object') return 'outdated';
+  const record = item as Record<string, unknown>;
+  if (record.location === 'changes' || record.location === 'committed' || record.location === 'outdated') return record.location;
+  return record.outdated === true ? 'outdated' : 'changes';
+}
+
+function reviewItemMatchesWorktree(item: unknown) {
+  if (!item || typeof item !== 'object') return false;
+  const record = item as Record<string, unknown>;
+  if (Array.isArray(record.matchingBaselines)) return record.matchingBaselines.includes('worktree');
+  const anchor = record.anchor && typeof record.anchor === 'object' ? record.anchor as Record<string, unknown> : undefined;
+  return reviewItemLocation(item) === 'changes' && anchor?.staged !== true;
+}
+
 function boundedReviewItem(item: unknown): unknown {
   const serialized = stringify(item);
   if (serialized.length <= MAX_THREAD_CHARS) return item;
@@ -361,6 +384,8 @@ function boundedReviewItem(item: unknown): unknown {
       selectedText: boundedText(anchor.selectedText, 1_500),
     },
     status: record.status,
+    location: reviewItemLocation(item),
+    matchingBaselines: record.matchingBaselines,
     outdated: record.outdated,
     outdatedReason: record.outdatedReason,
     latestUserRevision: record.latestUserRevision,
