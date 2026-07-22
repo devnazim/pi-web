@@ -168,6 +168,28 @@ describe('live agent activity', () => {
     assert.equal(activity.running, false);
   });
 
+  test('tracks summarization retry lifecycle events', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'compaction_start' } });
+    activity = reduceAgentActivityEvent(activity, {
+      type: 'agent:event',
+      data: { type: 'summarization_retry_scheduled', attempt: 1, maxAttempts: 3, delayMs: 2_000, errorMessage: 'stream closed' },
+    });
+
+    assert.deepEqual(activity.retry, { attempt: 1, maxAttempts: 3, delayMs: 2_000, errorMessage: 'stream closed' });
+    assert.equal(activity.notices.at(-1), 'retrying summary (1/3) in 2s after stream closed');
+
+    activity = reduceAgentActivityEvent(activity, {
+      type: 'agent:event',
+      data: { type: 'summarization_retry_attempt_start', source: 'compaction', reason: 'threshold' },
+    });
+    assert.equal(activity.retry, undefined);
+    assert.equal(activity.notices.at(-1), 'retrying compaction');
+
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'summarization_retry_finished' } });
+    assert.equal(activity.running, true);
+    assert.equal(activity.retry, undefined);
+  });
+
   test('keeps post-response compaction active after retiring persisted content', () => {
     let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
     activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Final answer', contentIndex: 0 }));

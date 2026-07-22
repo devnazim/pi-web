@@ -1041,7 +1041,7 @@ test('dispose closes sockets and cached SDK sessions', async () => {
   await assert.rejects((bridge as any).getSession(process.cwd(), 'closed-session'), /shutting down/i);
 });
 
-test('lists refreshed models from the session registry', async () => {
+test('lists config-refreshed model snapshots from the session runtime', async () => {
   let refreshes = 0;
   let refreshFinished = false;
   const calls: Array<[string, string | undefined]> = [];
@@ -1049,20 +1049,20 @@ test('lists refreshed models from the session registry', async () => {
   (bridge as any).getCommandSession = async (projectPath: string, sessionId?: string) => {
     calls.push([projectPath, sessionId]);
     return {
-      modelRegistry: {
-        refresh: async () => {
+      modelRuntime: {
+        reloadConfig: async () => {
           await Promise.resolve();
           refreshes += 1;
           refreshFinished = true;
         },
-        getAvailable: () => {
+        getAvailableSnapshot: () => {
           assert.equal(refreshFinished, true);
           return [
             { provider: 'openai', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh', max: 'max' } },
             { provider: 'ollama', id: 'llama3.1:8b', reasoning: false },
           ];
         },
-        getProviderDisplayName: (provider: string) => provider.toUpperCase(),
+        getProvider: (provider: string) => ({ name: provider.toUpperCase() }),
       },
     };
   };
@@ -1089,4 +1089,56 @@ test('lists refreshed models from the session registry', async () => {
       thinkingLevels: ['off'],
     },
   ]);
+});
+
+test('resolves selected models through the session runtime', async () => {
+  const bridge = new PiBridge();
+  const selected: unknown[] = [];
+  const model = { provider: 'openai-codex', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' };
+  const session = {
+    modelRuntime: {
+      getModels: () => [model],
+      getModel: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+      getAvailable: async () => [model],
+    },
+    setModel: async (next: unknown) => { selected.push(next); },
+  };
+
+  await (bridge as any).setSessionModel(session, 'openai-codex/gpt-5.6-sol:max');
+
+  assert.deepEqual(selected, [model]);
+});
+
+test('uses SDK session totals and provider subscription state in status', () => {
+  const bridge = new PiBridge();
+  const oauthChecks: string[] = [];
+  const status = (bridge as any).agentStatus({
+    model: { provider: 'openai-codex', contextWindow: 272_000 },
+    modelRuntime: {
+      isUsingOAuth: (provider: string) => {
+        oauthChecks.push(provider);
+        return true;
+      },
+    },
+    getSessionStats: () => ({
+      tokens: { input: 100, output: 20, cacheRead: 30, cacheWrite: 4, total: 154 },
+      cost: 1.25,
+      contextUsage: { tokens: 68_000, contextWindow: 272_000, percent: 25 },
+    }),
+    sessionManager: { getSessionName: () => 'SDK migration' },
+    autoCompactionEnabled: true,
+  }, 'main');
+
+  assert.deepEqual(oauthChecks, ['openai-codex']);
+  assert.deepEqual(status.usage, { input: 100, output: 20, cacheRead: 30, cacheWrite: 4, total: 154, cost: 1.25, subscription: true });
+  assert.deepEqual(status.context, { tokens: 68_000, contextWindow: 272_000, percent: 25, autoCompact: true });
+  assert.equal(status.sessionName, 'SDK migration');
+
+  const kimiStatus = (bridge as any).agentStatus({
+    model: { provider: 'kimi-coding' },
+    modelRuntime: { isUsingOAuth: () => false },
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    sessionManager: { getSessionName: () => undefined },
+  });
+  assert.equal(kimiStatus.usage.subscription, true);
 });

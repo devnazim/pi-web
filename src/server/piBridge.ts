@@ -1,4 +1,4 @@
-import { getAgentDir, parseFrontmatter, resizeImage } from '@earendil-works/pi-coding-agent';
+import { getAgentDir, parseFrontmatter, resizeImage, type ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, type Dirent, type Stats } from 'node:fs';
@@ -223,8 +223,8 @@ export class PiBridge {
     this.sessionCreateTimeoutMs = options.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
   }
 
-  async loadSdk() {
-    return import('@earendil-works/pi-coding-agent') as Promise<Record<string, any>>;
+  async loadSdk(): Promise<typeof import('@earendil-works/pi-coding-agent')> {
+    return import('@earendil-works/pi-coding-agent');
   }
 
   async dispose(options: { timeoutMs?: number } = {}) {
@@ -740,13 +740,13 @@ export class PiBridge {
 
   async models(projectPath: string, sessionId?: string): Promise<ModelInfo[]> {
     const session = await this.getCommandSession(projectPath, sessionId);
-    const registry = session?.modelRegistry;
-    if (!registry || typeof registry.getAvailable !== 'function') throw new Error('Loaded pi SDK session does not expose a model registry');
-    if (typeof registry.refresh === 'function') await registry.refresh();
-    return (await registry.getAvailable() as any[])
+    const runtime: ModelRuntime | undefined = session?.modelRuntime;
+    if (!runtime) throw new Error('Loaded pi SDK session does not expose a model runtime');
+    await runtime.reloadConfig();
+    return runtime.getAvailableSnapshot()
       .map((model): ModelInfo => ({
         value: `${model.provider}/${model.id}`,
-        label: [model.name || model.id, registry.getProviderDisplayName(model.provider)].filter(Boolean).join(' · '),
+        label: [model.name || model.id, runtime.getProvider?.(model.provider)?.name ?? model.provider].filter(Boolean).join(' · '),
         provider: model.provider,
         id: model.id,
         reasoning: Boolean(model.reasoning),
@@ -1521,24 +1521,35 @@ export class PiBridge {
 
   private agentStatus(session: any, branch?: string, running = false): AgentStatus {
     const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0, subscription: false };
-    for (const entry of typeof session?.sessionManager?.getEntries === 'function' ? session.sessionManager.getEntries() : []) {
-      const message = entry?.type === 'message' ? entry.message : undefined;
-      if (message?.role !== 'assistant' || !message.usage) continue;
-      usage.input += this.finiteNumber(message.usage.input) ?? 0;
-      usage.output += this.finiteNumber(message.usage.output) ?? 0;
-      usage.cacheRead += this.finiteNumber(message.usage.cacheRead) ?? 0;
-      usage.cacheWrite += this.finiteNumber(message.usage.cacheWrite) ?? 0;
-      usage.cost += this.finiteNumber(message.usage.cost?.total) ?? 0;
+    const stats = typeof session?.getSessionStats === 'function' ? session.getSessionStats() : undefined;
+    if (stats?.tokens) {
+      usage.input = this.finiteNumber(stats.tokens.input) ?? 0;
+      usage.output = this.finiteNumber(stats.tokens.output) ?? 0;
+      usage.cacheRead = this.finiteNumber(stats.tokens.cacheRead) ?? 0;
+      usage.cacheWrite = this.finiteNumber(stats.tokens.cacheWrite) ?? 0;
+      usage.total = this.finiteNumber(stats.tokens.total) ?? usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+      usage.cost = this.finiteNumber(stats.cost) ?? 0;
+    } else {
+      for (const entry of typeof session?.sessionManager?.getEntries === 'function' ? session.sessionManager.getEntries() : []) {
+        const message = entry?.type === 'message' ? entry.message : undefined;
+        if (message?.role !== 'assistant' || !message.usage) continue;
+        usage.input += this.finiteNumber(message.usage.input) ?? 0;
+        usage.output += this.finiteNumber(message.usage.output) ?? 0;
+        usage.cacheRead += this.finiteNumber(message.usage.cacheRead) ?? 0;
+        usage.cacheWrite += this.finiteNumber(message.usage.cacheWrite) ?? 0;
+        usage.cost += this.finiteNumber(message.usage.cost?.total) ?? 0;
+      }
+      usage.total = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
     }
-    usage.total = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
     try {
-      usage.subscription = Boolean(session?.state?.model && session?.modelRegistry?.isUsingOAuth?.(session.state.model));
+      const provider = session?.model?.provider ?? session?.state?.model?.provider;
+      usage.subscription = provider === 'kimi-coding' || Boolean(provider && session?.modelRuntime?.isUsingOAuth?.(provider));
     } catch {
       usage.subscription = false;
     }
 
-    const contextUsage = typeof session?.getContextUsage === 'function' ? session.getContextUsage() : undefined;
-    const contextWindow = this.finiteNumber(contextUsage?.contextWindow) ?? this.finiteNumber(session?.state?.model?.contextWindow) ?? 0;
+    const contextUsage = stats?.contextUsage ?? (typeof session?.getContextUsage === 'function' ? session.getContextUsage() : undefined);
+    const contextWindow = this.finiteNumber(contextUsage?.contextWindow) ?? this.finiteNumber(session?.model?.contextWindow) ?? this.finiteNumber(session?.state?.model?.contextWindow) ?? 0;
     const context = contextWindow > 0
       ? {
           tokens: contextUsage?.tokens === null ? null : this.finiteNumber(contextUsage?.tokens) ?? 0,
@@ -1868,14 +1879,25 @@ export class PiBridge {
   }
 
   private async resolveModelReference(session: any, reference: string) {
-    const modelReference = this.stripThinkingSuffix(reference.trim());
+    const runtime: ModelRuntime | undefined = session?.modelRuntime;
+    if (!runtime) return undefined;
+    const requestedReference = reference.trim();
+    if (!requestedReference) return undefined;
+
+    const allModels = [...runtime.getModels()];
+    const directMatch = this.findModelReferenceMatch(requestedReference, allModels);
+    if (directMatch) return directMatch;
+
+    const modelReference = this.stripThinkingSuffix(requestedReference);
     if (!modelReference) return undefined;
-    const registry = session?.modelRegistry;
-    const availableModels = typeof registry?.getAvailable === 'function' ? await registry.getAvailable() : [];
-    const match = this.findModelReferenceMatch(modelReference, availableModels);
-    if (match) return match;
-    const allModels = typeof registry?.getAll === 'function' ? registry.getAll() : [];
-    return this.findModelReferenceMatch(modelReference, allModels);
+    const slashIndex = modelReference.indexOf('/');
+    if (slashIndex !== -1) {
+      const exactMatch = runtime.getModel(modelReference.slice(0, slashIndex), modelReference.slice(slashIndex + 1));
+      if (exactMatch) return exactMatch;
+    }
+    const availableModels = [...await runtime.getAvailable()];
+    return this.findModelReferenceMatch(modelReference, availableModels)
+      ?? this.findModelReferenceMatch(modelReference, allModels);
   }
 
   private findModelReferenceMatch(reference: string, models: any[]) {
@@ -2588,7 +2610,13 @@ function agentEventType(event: unknown) {
 }
 
 function isCommandActivityStartEvent(type: string | undefined) {
-  return type === 'agent_start' || type === 'compaction_start' || type === 'auto_retry_start' || type === 'message_update' || type === 'tool_execution_start';
+  return type === 'agent_start'
+    || type === 'compaction_start'
+    || type === 'auto_retry_start'
+    || type === 'summarization_retry_scheduled'
+    || type === 'summarization_retry_attempt_start'
+    || type === 'message_update'
+    || type === 'tool_execution_start';
 }
 
 function isAgentAlreadyProcessingMessage(message: string) {
@@ -2605,7 +2633,7 @@ function isWorkspaceNotificationEvent(event: AgentEvent) {
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return false;
   const type = (event.data as { type?: unknown }).type;
   if (typeof type !== 'string') return false;
-  return ['notice', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end', 'extension_ui_request'].includes(type)
+  return ['notice', 'auto_retry_start', 'auto_retry_end', 'summarization_retry_scheduled', 'compaction_start', 'compaction_end', 'extension_ui_request'].includes(type)
     || /approval|permission|confirm|input|select|notify|review/i.test(type);
 }
 

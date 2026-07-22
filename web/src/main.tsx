@@ -1810,6 +1810,8 @@ function Shell() {
           || parsed.type === 'bash:start'
           || dataType === 'agent_start'
           || dataType === 'compaction_start'
+          || dataType === 'summarization_retry_scheduled'
+          || dataType === 'summarization_retry_attempt_start'
           || agentEndWillRetry;
         const stopsRunning = parsed.type === 'agent:finish'
           || parsed.type === 'agent:error'
@@ -10810,7 +10812,7 @@ function shouldShowAgentEvent(payload: string) {
 function shouldHandleAgentEvent(event: AgentServerEvent) {
   if (event.type !== 'agent:event') return ['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'bash:start', 'bash:update', 'bash:finish', 'bash:error', 'error'].includes(event.type ?? '');
   const dataType = agentEventDataType(event.data);
-  return ['agent_start', 'agent_end', 'message_start', 'message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
+  return ['agent_start', 'agent_end', 'message_start', 'message_update', 'tool_execution_start', 'tool_execution_update', 'tool_execution_end', 'auto_retry_start', 'auto_retry_end', 'summarization_retry_scheduled', 'summarization_retry_attempt_start', 'summarization_retry_finished', 'compaction_start', 'compaction_end'].includes(dataType ?? '');
 }
 
 function shouldStoreAgentEvent(event: AgentServerEvent) {
@@ -10846,6 +10848,9 @@ function agentEventSummary(event: { type?: string; message?: string; data?: unkn
   if (type === 'tool_execution_end') return { label: data.isError ? 'tool error' : 'tool', text: `finished ${toolName}` };
   if (type === 'auto_retry_start') return { label: 'retry', text: `attempt ${data.attempt ?? ''} after ${data.errorMessage ?? 'provider error'}` };
   if (type === 'auto_retry_end') return { label: 'retry', text: data.success ? 'succeeded' : `failed ${data.finalError ?? ''}` };
+  if (type === 'summarization_retry_scheduled') return { label: 'summary retry', text: `attempt ${data.attempt ?? ''} after ${data.errorMessage ?? 'provider error'}` };
+  if (type === 'summarization_retry_attempt_start') return { label: 'summary retry', text: `started ${data.source === 'branchSummary' ? 'branch summary' : 'compaction'}` };
+  if (type === 'summarization_retry_finished') return { label: 'summary retry', text: 'finished' };
   if (type === 'compaction_start') return { label: 'compaction', text: 'started' };
   if (type === 'compaction_end') return { label: 'compaction', text: data.aborted ? 'aborted' : 'finished' };
   return { label: 'agent', text: type.replace(/_/g, ' ') };
@@ -11394,6 +11399,7 @@ function workspaceNotificationFromEvent(event: WorkspaceNotificationServerEvent,
   if (type === 'notice') return { ...base, title: 'Pi notice', message: singleLine(String(data.message ?? 'Notice')), level: notificationLevelFromUnknown(data.level), kind: 'notice' };
   if (type === 'auto_retry_start') return { ...base, title: 'Retrying request', message: singleLine(String(data.errorMessage ?? 'Provider error')), level: 'warning', kind: 'retry' };
   if (type === 'auto_retry_end') return data.success ? undefined : { ...base, title: 'Retry failed', message: singleLine(String(data.finalError ?? 'Provider error')), level: 'error', kind: 'retry' };
+  if (type === 'summarization_retry_scheduled') return { ...base, title: 'Retrying summary', message: singleLine(String(data.errorMessage ?? 'Provider error')), level: 'warning', kind: 'retry' };
   if (type === 'compaction_end') return data.aborted ? { ...base, title: 'Compaction aborted', message: 'Context compaction was aborted.', level: 'warning', kind: 'compaction' } : undefined;
   if (/approval|permission|confirm/i.test(type)) return { ...base, title: 'Approval needed', message: singleLine(String(data.message ?? type.replace(/_/g, ' '))), level: 'warning', kind: 'notice' };
   if (/input/i.test(type)) return { ...base, title: 'Input needed', message: singleLine(String(data.message ?? type.replace(/_/g, ' '))), level: 'warning', kind: 'notice' };

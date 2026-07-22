@@ -177,6 +177,20 @@ export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentSe
     const failed = data.success !== true;
     return { ...activity, retry: undefined, notices: [...activity.notices, data.success ? 'retry succeeded' : `retry failed ${data.finalError ?? ''}`], running: true, streaming: failed ? false : activity.streaming };
   }
+  if (type === 'summarization_retry_scheduled') {
+    const attempt = typeof data.attempt === 'number' && Number.isFinite(data.attempt) ? data.attempt : undefined;
+    const maxAttempts = typeof data.maxAttempts === 'number' && Number.isFinite(data.maxAttempts) ? data.maxAttempts : undefined;
+    const delayMs = typeof data.delayMs === 'number' && Number.isFinite(data.delayMs) ? data.delayMs : undefined;
+    const errorMessage = String(data.errorMessage ?? 'provider error');
+    const attemptText = attempt && maxAttempts ? ` (${attempt}/${maxAttempts})` : attempt ? ` (${attempt})` : '';
+    const delayText = delayMs ? ` in ${Math.ceil(delayMs / 1000)}s` : '';
+    return { ...activity, running: true, retry: { attempt, maxAttempts, delayMs, errorMessage }, notices: [...activity.notices, `retrying summary${attemptText}${delayText} after ${errorMessage}`] };
+  }
+  if (type === 'summarization_retry_attempt_start') {
+    const source = data.source === 'branchSummary' ? 'branch summary' : 'compaction';
+    return { ...activity, running: true, retry: undefined, notices: [...activity.notices, `retrying ${source}`] };
+  }
+  if (type === 'summarization_retry_finished') return { ...activity, running: true, retry: undefined };
   if (type === 'compaction_start') return { ...activity, running: true, notices: [...activity.notices, 'compacting context'] };
   if (type === 'compaction_end') {
     const willRetry = data.willRetry === true;
