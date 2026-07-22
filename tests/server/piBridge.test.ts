@@ -1043,17 +1043,25 @@ test('dispose closes sockets and cached SDK sessions', async () => {
 
 test('lists refreshed models from the session registry', async () => {
   let refreshes = 0;
+  let refreshFinished = false;
   const calls: Array<[string, string | undefined]> = [];
   const bridge = new PiBridge();
   (bridge as any).getCommandSession = async (projectPath: string, sessionId?: string) => {
     calls.push([projectPath, sessionId]);
     return {
       modelRegistry: {
-        refresh: () => { refreshes += 1; },
-        getAvailable: () => [
-          { provider: 'openai', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh', max: 'max' } },
-          { provider: 'ollama', id: 'llama3.1:8b', reasoning: false },
-        ],
+        refresh: async () => {
+          await Promise.resolve();
+          refreshes += 1;
+          refreshFinished = true;
+        },
+        getAvailable: () => {
+          assert.equal(refreshFinished, true);
+          return [
+            { provider: 'openai', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh', max: 'max' } },
+            { provider: 'ollama', id: 'llama3.1:8b', reasoning: false },
+          ];
+        },
         getProviderDisplayName: (provider: string) => provider.toUpperCase(),
       },
     };

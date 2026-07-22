@@ -36,7 +36,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@earendil-works/pi-coding-agent": "^0.81.1",
     "@fastify/compress": "^9.1.0",
     "@fastify/cookie": "^11.0.0",
     "@fastify/multipart": "^10.0.0",
@@ -58,7 +58,7 @@
     "sortablejs": "^1.15.7"
   },
   "overrides": {
-    "dompurify": "^3.4.11"
+    "dompurify": "^3.4.12"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.1",

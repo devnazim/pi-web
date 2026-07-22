@@ -742,7 +742,7 @@ export class PiBridge {
     const session = await this.getCommandSession(projectPath, sessionId);
     const registry = session?.modelRegistry;
     if (!registry || typeof registry.getAvailable !== 'function') throw new Error('Loaded pi SDK session does not expose a model registry');
-    if (typeof registry.refresh === 'function') registry.refresh();
+    if (typeof registry.refresh === 'function') await registry.refresh();
     return (await registry.getAvailable() as any[])
       .map((model): ModelInfo => ({
         value: `${model.provider}/${model.id}`,
