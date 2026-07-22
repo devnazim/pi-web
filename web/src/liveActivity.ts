@@ -7,7 +7,7 @@ export type AgentActivityDelta = AgentActivityContentItem & { contentIndex?: num
 export type AgentActivityToolItem = { type: 'tool'; tool: AgentToolActivity };
 export type AgentActivityItem = AgentActivityContentItem | AgentActivityToolItem;
 export type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
-export type AgentActivity = { running: boolean; streaming: boolean; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; items: AgentActivityItem[]; notices: string[]; deltaContentKeys: string[]; retry?: AgentRetryActivity };
+export type AgentActivity = { running: boolean; streaming: boolean; operationId?: string; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; items: AgentActivityItem[]; notices: string[]; deltaContentKeys: string[]; retry?: AgentRetryActivity };
 export type AgentServerEvent = { type?: string; operationId?: string; message?: string; data?: unknown };
 
 const LIVE_ACTIVITY_TEXT_MAX_LENGTH = 8_000;
@@ -93,6 +93,7 @@ export function persistedTranscriptMatchesLiveActivity(
   preview: { userMessageCount: number; latestAssistantId?: string; text: string; thinking: string; error: string },
   snapshot: { userMessageCount: number; assistantAfterLastUserId?: string; assistantAfterLastUserText?: string } | undefined,
   hideThinking: boolean,
+  activityPreview: { text: string; thinking: string } = preview,
 ) {
   if (!preview.latestAssistantId) return false;
   if (snapshot) {
@@ -102,7 +103,7 @@ export function persistedTranscriptMatchesLiveActivity(
     if (preview.userMessageCount < snapshot.userMessageCount) return false;
     if (preview.userMessageCount === snapshot.userMessageCount && snapshot.assistantAfterLastUserId && !sameAssistant && (!snapshotText || !currentText.includes(snapshotText))) return false;
   }
-  return liveActivityMatchesPersistedPreview(activity, preview, hideThinking);
+  return liveActivityMatchesPersistedPreview(activity, activityPreview, hideThinking);
 }
 
 function textContainsPreview(fullText: string, previewText: string) {
@@ -119,7 +120,7 @@ function comparablePreviewText(value: string) {
 }
 
 export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEvent): AgentActivity {
-  if (event.type === 'agent:start') return { ...emptyAgentActivity(), running: true };
+  if (event.type === 'agent:start') return { ...emptyAgentActivity(), running: true, operationId: event.operationId };
   if (event.type === 'agent:finish') return { ...activity, running: false, streaming: false, retry: undefined };
   if (event.type === 'agent:error' || event.type === 'error') {
     const message = event.message ?? 'Agent failed';
@@ -131,7 +132,7 @@ export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentSe
 
   const data = event.data as Record<string, unknown>;
   const type = typeof data.type === 'string' ? data.type : '';
-  if (type === 'agent_start') return { ...emptyAgentActivity(), running: true, streaming: true };
+  if (type === 'agent_start') return { ...emptyAgentActivity(), running: true, streaming: true, operationId: event.operationId };
   if (type === 'message_start') {
     const message = data.message && typeof data.message === 'object' ? data.message as { role?: unknown } : undefined;
     return message?.role === 'assistant' ? { ...activity, deltaContentKeys: [] } : activity;

@@ -264,7 +264,7 @@ type PiSettings = {
 type PiSettingsResponse = { global: PiSettings; project: PiSettings; effective: PiSettings };
 type ChatContentPart = { type: 'text' | 'thinking' | 'tool' | 'image' | 'error'; text: string };
 type ToolCallInfo = { id?: string; name: string; args: Record<string, unknown> };
-type LiveTranscriptSnapshot = { userMessageCount: number; assistantAfterLastUserId?: string; assistantAfterLastUserText?: string };
+type LiveTranscriptSnapshot = { entryIds: string[]; userMessageCount: number; assistantAfterLastUserId?: string; assistantAfterLastUserText?: string };
 type AssistantEntryPreview = { text: string; thinking: string; error: string };
 type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: number; latestAssistantId?: string };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
@@ -1008,6 +1008,7 @@ function Shell() {
   function applyLiveEvent(event: AgentServerEvent, options: { skipSchedule?: boolean } = {}) {
     const delta = agentActivityMessageDelta(event);
     if (delta) {
+      if (event.operationId && !liveAgentActivityValue.operationId) liveAgentActivityValue = { ...liveAgentActivityValue, operationId: event.operationId };
       queueLiveActivityDelta(delta);
       if (!options.skipSchedule) scheduleLiveActivityPublish();
       return;
@@ -1751,7 +1752,6 @@ function Shell() {
         return;
       }
 
-      queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
       const statusEventGeneration = agentSocketEventGeneration;
       const statusRequestGeneration = ++agentStatusRequestGeneration;
       void apiAgentRefresh<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
@@ -1762,7 +1762,10 @@ function Shell() {
             && statusEventGeneration === agentSocketEventGeneration
             && statusRequestGeneration === agentStatusRequestGeneration
             && connectionGeneration === agentConnectionGeneration
-          ) reconcileAuthoritativeAgentStatus(project.id, currentActiveSessionId, status);
+          ) {
+            if (!status.running || status.recovery) queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
+            reconcileAuthoritativeAgentStatus(project.id, currentActiveSessionId, status);
+          }
         })
         .catch((error) => console.warn('Could not refresh agent status', error));
 
@@ -5104,7 +5107,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
   );
 }
 
-type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; attachments: UploadAsset[] };
+type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; attachments: UploadAsset[]; steering: boolean };
 
 function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
@@ -5125,12 +5128,19 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let terminalSubmissionGeneration = 0;
   let handledPendingTerminalError = '';
   let liveTurnActivityActive = false;
+  let liveTurnActivityOperationId: string | undefined;
+  let liveTurnRenderStateProvisional = false;
+  const liveTurnRenderStates = new Map<string, { pendingBoundary: number; transcriptEntries: SessionEntry[]; transcriptSnapshot: LiveTranscriptSnapshot }>();
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
+  const pendingUserMessageRefs = new Map<number, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
   let transcriptScrollFrame: number | undefined;
   let transcriptScrollFollowupFrame: number | undefined;
   let transcriptPrependFrame: number | undefined;
   let transcriptScrollForce = false;
+  let pendingUserMessageAnchorFrame: number | undefined;
+  let pendingUserMessageAnchorFollowupFrame: number | undefined;
+  let pendingUserMessageAnchorScrollForce = false;
   let composerLayoutFrame: number | undefined;
   let composerLayoutPasses = 0;
   let composerHistoryIndex: number | undefined;
@@ -5157,6 +5167,10 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [runningCommand, setRunningCommand] = createSignal<string>();
   const [commandSessionId, setCommandSessionId] = createSignal<string>();
   const [pendingUserMessages, setPendingUserMessages] = createSignal<PendingUserMessage[]>([]);
+  const [liveActivityPendingBoundary, setLiveActivityPendingBoundary] = createSignal(0);
+  const [pendingUserMessageAnchorId, setPendingUserMessageAnchorId] = createSignal<number>();
+  const [pendingUserMessageAnchorSpace, setPendingUserMessageAnchorSpace] = createSignal(0);
+  const [liveTurnDisplayEntries, setLiveTurnDisplayEntries] = createSignal<SessionEntry[]>();
   const [liveTurnTranscriptSnapshot, setLiveTurnTranscriptSnapshot] = createSignal<LiveTranscriptSnapshot>();
   const [liveTurnRetired, setLiveTurnRetired] = createSignal(false);
   const [mobileStatusOpen, setMobileStatusOpen] = createSignal(false);
@@ -5266,19 +5280,26 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (props.treeSelection) return branchForEntry(detail.entries, props.treeSelection.branchFromId);
     return activeSessionBranch();
   });
+  const displayTranscriptEntries = createMemo(() => {
+    const frozenEntries = liveTurnDisplayEntries();
+    return !props.treeSelection && frozenEntries && !liveTurnRetired() ? frozenEntries : transcriptEntries();
+  });
   const liveTurnTranscriptEntries = createMemo(() => session.data ? activeSessionBranch() : transcriptEntries());
   const activePendingUserMessages = createMemo(() => {
     const sessionId = props.sessionId ?? commandSessionId();
     return pendingUserMessages().filter((pending) => pending.projectId === props.project.id && (!sessionId || pending.sessionId === sessionId));
   });
   const unresolvedActivePendingUserMessages = createMemo(() => unresolvedPendingUserMessages(
-    transcriptEntries().filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
+    displayTranscriptEntries().filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
     activePendingUserMessages(),
   ));
+  const pendingUserMessagesBeforeLiveActivity = createMemo(() => unresolvedActivePendingUserMessages().filter(({ id }) => id <= liveActivityPendingBoundary()));
+  const pendingUserMessagesAfterLiveActivity = createMemo(() => unresolvedActivePendingUserMessages().filter(({ id }) => id > liveActivityPendingBoundary()));
+  const pendingUserMessageAnchorCandidate = createMemo(() => pendingUserMessagesAfterLiveActivity().filter((pending) => pending.steering).at(-1));
   const pendingUserMessageVisible = createMemo(() => unresolvedActivePendingUserMessages().length > 0);
   const visibleTranscriptEntries = createMemo(() => {
     const options = { hideThinking: hideThinking(), toolOutputMode: toolOutputMode() };
-    const entries = transcriptEntries().filter((entry) => shouldDisplayTranscriptEntry(entry, options));
+    const entries = displayTranscriptEntries().filter((entry) => shouldDisplayTranscriptEntry(entry, options));
     if (pendingUserMessageVisible() && !entries.some(isUserMessageEntry)) return [];
     return chatDisplayEntries(entries);
   });
@@ -5296,7 +5317,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       ? Math.min(window.start, entries.length)
       : Math.max(0, entries.length - TRANSCRIPT_INITIAL_RENDER_COUNT);
   });
-  const toolCalls = createMemo(() => toolCallMap(transcriptEntries()));
+  const toolCalls = createMemo(() => toolCallMap(displayTranscriptEntries()));
   const chatSearchMatches = createMemo(() => {
     const query = normalizedSearchQuery(props.searchQuery);
     if (!query) return [];
@@ -5437,21 +5458,49 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   createEffect(() => {
     const activity = liveActivity();
     const active = activity.running || activity.streaming;
+    const detail = session.data;
     const options = { hideThinking: hideThinking(), toolOutputMode: toolOutputMode() };
-    if (active && !liveTurnActivityActive) {
-      setLiveTurnTranscriptSnapshot(liveTranscriptSnapshot(untrack(liveTurnTranscriptEntries), options));
+    const operationChanged = Boolean(activity.operationId && activity.operationId !== liveTurnActivityOperationId);
+    if (active && (!liveTurnActivityActive || operationChanged || (liveTurnRenderStateProvisional && Boolean(detail)))) {
+      const existingState = activity.operationId ? liveTurnRenderStates.get(activity.operationId) : undefined;
+      const provisional = !existingState && Boolean(props.sessionId && !detail);
+      const preserveLiveTurnBaseline = liveTurnActivityActive && (liveTurnRenderStateProvisional || liveTurnActivityOperationId === undefined);
+      const preservedTranscriptSnapshot = preserveLiveTurnBaseline ? untrack(liveTurnTranscriptSnapshot) : undefined;
+      const firstPendingSteeringId = untrack(activePendingUserMessages).find((pending) => pending.steering)?.id;
+      const nextState = existingState ?? {
+        pendingBoundary: preserveLiveTurnBaseline ? untrack(liveActivityPendingBoundary) : (activity.operationId || firstPendingSteeringId === undefined ? pendingUserMessageSequence : firstPendingSteeringId - 1),
+        transcriptEntries: detail ? untrack(activeSessionBranch) : untrack(transcriptEntries),
+        transcriptSnapshot: preservedTranscriptSnapshot ?? liveTranscriptSnapshot(untrack(liveTurnTranscriptEntries), options),
+      };
+      if (activity.operationId && !existingState && !provisional) {
+        liveTurnRenderStates.set(activity.operationId, nextState);
+        while (liveTurnRenderStates.size > 20) {
+          const oldestOperationId = liveTurnRenderStates.keys().next().value;
+          if (oldestOperationId === undefined) break;
+          liveTurnRenderStates.delete(oldestOperationId);
+        }
+      }
+      liveTurnRenderStateProvisional = provisional;
+      setLiveActivityPendingBoundary(nextState.pendingBoundary);
+      setLiveTurnDisplayEntries(nextState.transcriptEntries);
+      setLiveTurnTranscriptSnapshot(nextState.transcriptSnapshot);
       setLiveTurnRetired(false);
     }
     if (!active && liveTurnActivityActive) terminalSubmissionGeneration += 1;
     if (!active && !activity.error) {
       if (liveAgentActivityHasPreviewText(activity, options)) {
         if (transcriptHasCaughtUpToLiveActivity(liveTurnTranscriptEntries(), options, liveTurnTranscriptSnapshot(), activity)) setLiveTurnRetired(true);
-      } else if (!liveAgentActivityHasDisplayContent(activity, options)) {
+      } else if (activity.tools.length) {
+        setLiveTurnRetired(true);
+      } else {
+        setLiveTurnDisplayEntries(undefined);
         setLiveTurnTranscriptSnapshot(undefined);
         setLiveTurnRetired(false);
       }
     }
     liveTurnActivityActive = active;
+    liveTurnActivityOperationId = active ? activity.operationId ?? liveTurnActivityOperationId : undefined;
+    if (!active) liveTurnRenderStateProvisional = false;
   });
 
   createEffect(() => {
@@ -5459,6 +5508,14 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (!activePending.length || unresolvedActivePendingUserMessages().length) return;
     const resolvedIds = new Set(activePending.map(({ id }) => id));
     setPendingUserMessages((pending) => pending.filter(({ id }) => !resolvedIds.has(id)));
+  });
+
+  createEffect(() => {
+    const anchorId = pendingUserMessageAnchorId();
+    const candidateId = pendingUserMessageAnchorCandidate()?.id;
+    if (anchorId === candidateId) return;
+    if (candidateId === undefined) clearPendingUserMessageAnchor();
+    else anchorPendingUserMessage(candidateId, false);
   });
 
   createEffect(() => {
@@ -5473,7 +5530,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     handledPendingTerminalError = key;
     terminalSubmissionGeneration += 1;
     const pendingAtTerminal = activePendingUserMessages();
-    if (pendingAtTerminal.length) void reconcilePendingUserMessagesAfterTerminal(props.project.id, sessionId, pendingAtTerminal);
+    void reconcilePendingUserMessagesAfterTerminal(props.project.id, sessionId, pendingAtTerminal);
   });
 
   createEffect(() => {
@@ -5693,9 +5750,15 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
 
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => syncComposerLayout());
     if (observer && composerRef) observer.observe(composerRef);
+    const transcriptObserver = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => {
+      const anchorId = untrack(pendingUserMessageAnchorId);
+      if (anchorId !== undefined) scrollPendingUserMessageAnchor(anchorId);
+    });
+    if (transcriptObserver && transcriptScrollerRef) transcriptObserver.observe(transcriptScrollerRef);
     onCleanup(() => {
       window.removeEventListener('keydown', onKeyDown);
       observer?.disconnect();
+      transcriptObserver?.disconnect();
     });
   });
 
@@ -5728,6 +5791,14 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
 
   function deleteTranscriptEntryRef(id: string, element: HTMLDivElement) {
     if (transcriptEntryRefs.get(id) === element) transcriptEntryRefs.delete(id);
+  }
+
+  function setPendingUserMessageRef(id: number, element: HTMLDivElement) {
+    pendingUserMessageRefs.set(id, element);
+  }
+
+  function deletePendingUserMessageRef(id: number, element: HTMLDivElement) {
+    if (pendingUserMessageRefs.get(id) === element) pendingUserMessageRefs.delete(id);
   }
 
   function transcriptDistanceFromBottom(element: HTMLElement) {
@@ -5766,7 +5837,72 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     loadEarlierTranscript(element);
   }
 
+  function cancelPendingUserMessageAnchorScroll() {
+    if (pendingUserMessageAnchorFrame !== undefined) cancelAnimationFrame(pendingUserMessageAnchorFrame);
+    if (pendingUserMessageAnchorFollowupFrame !== undefined) cancelAnimationFrame(pendingUserMessageAnchorFollowupFrame);
+    pendingUserMessageAnchorFrame = undefined;
+    pendingUserMessageAnchorFollowupFrame = undefined;
+    pendingUserMessageAnchorScrollForce = false;
+  }
+
+  function clearPendingUserMessageAnchor() {
+    cancelPendingUserMessageAnchorScroll();
+    setPendingUserMessageAnchorId(undefined);
+    setPendingUserMessageAnchorSpace(0);
+  }
+
+  function anchorPendingUserMessage(id: number, force = true) {
+    cancelPendingUserMessageAnchorScroll();
+    setPendingUserMessageAnchorId(id);
+    setPendingUserMessageAnchorSpace(0);
+    scrollPendingUserMessageAnchor(id, force);
+  }
+
+  function scrollPendingUserMessageAnchor(id: number, force = false, retry = true) {
+    if (force) {
+      userScrollingTranscriptAwayFromBottom = false;
+      pendingUserMessageAnchorScrollForce = true;
+    }
+    if (pendingUserMessageAnchorFrame !== undefined || pendingUserMessageAnchorFollowupFrame !== undefined) return;
+    pendingUserMessageAnchorFrame = requestAnimationFrame(() => {
+      pendingUserMessageAnchorFrame = undefined;
+      if (pendingUserMessageAnchorId() !== id) {
+        pendingUserMessageAnchorScrollForce = false;
+        return;
+      }
+      const scroller = transcriptScrollerRef;
+      const target = pendingUserMessageRefs.get(id);
+      if (!scroller || !target) {
+        if (!retry) {
+          pendingUserMessageAnchorScrollForce = false;
+          return;
+        }
+        pendingUserMessageAnchorFollowupFrame = requestAnimationFrame(() => {
+          pendingUserMessageAnchorFollowupFrame = undefined;
+          scrollPendingUserMessageAnchor(id, force, false);
+        });
+        return;
+      }
+      setPendingUserMessageAnchorSpace(Math.max(0, scroller.clientHeight - target.getBoundingClientRect().height - 48));
+      pendingUserMessageAnchorFollowupFrame = requestAnimationFrame(() => {
+        pendingUserMessageAnchorFollowupFrame = undefined;
+        const shouldForce = pendingUserMessageAnchorScrollForce;
+        pendingUserMessageAnchorScrollForce = false;
+        if (pendingUserMessageAnchorId() !== id || (!shouldForce && !stickToBottom())) return;
+        const currentScroller = transcriptScrollerRef;
+        const currentTarget = pendingUserMessageRefs.get(id);
+        if (!currentScroller || !currentTarget) return;
+        currentScroller.scrollTop += currentTarget.getBoundingClientRect().top - currentScroller.getBoundingClientRect().top - 24;
+      });
+    });
+  }
+
   function scrollTranscriptToBottom(force = false) {
+    const anchorId = pendingUserMessageAnchorId();
+    if (anchorId !== undefined) {
+      scrollPendingUserMessageAnchor(anchorId, force);
+      return;
+    }
     if (force) {
       userScrollingTranscriptAwayFromBottom = false;
       transcriptScrollForce = true;
@@ -5792,6 +5928,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (transcriptScrollFrame !== undefined) cancelAnimationFrame(transcriptScrollFrame);
     if (transcriptScrollFollowupFrame !== undefined) cancelAnimationFrame(transcriptScrollFollowupFrame);
     if (transcriptPrependFrame !== undefined) cancelAnimationFrame(transcriptPrependFrame);
+    cancelPendingUserMessageAnchorScroll();
   });
 
   async function ensureCommandSession(draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId)) {
@@ -6304,8 +6441,10 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       ).map(({ id }) => id));
       const terminalIds = new Set(pendingAtTerminal.map(({ id }) => id));
       setPendingUserMessages((pending) => pending.filter(({ id }) => !terminalIds.has(id) || retainedIds.has(id)));
+      if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId && liveActivity().error) setLiveTurnRetired(true);
     } catch {
-      queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] }).catch(() => undefined);
+      if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId && liveActivity().error) setLiveTurnRetired(true);
     } finally {
       pendingTerminalRefreshCount -= 1;
       if (pendingTerminalRefreshCount === 0) setPendingTerminalRefreshActive(false);
@@ -6662,7 +6801,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       setSlashCommandMention(undefined);
       setCommandArgumentMention(undefined);
       setStickToBottom(true);
-      scrollTranscriptToBottom(true);
+      if (!steeringSubmit) scrollTranscriptToBottom(true);
     }
     if (submittedDraftKey) {
       clearedComposerDraftKeys.add(submittedDraftKey);
@@ -6708,7 +6847,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           attachments: attachmentAssets,
           previousUserEntryIds: (session.data?.entries ?? transcriptEntries()).filter(isUserMessageEntry).map((entry) => entry.id),
           accepted: false,
+          steering: steeringSubmit,
         }]);
+        if (steeringSubmit) anchorPendingUserMessage(pendingMessageId);
       }
       if (aborting() || pendingTerminalRefreshActive() || submissionTerminalGeneration !== terminalSubmissionGeneration) {
         submissionInterruptedByTerminalRefresh = true;
@@ -6737,7 +6878,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       selectSubmittedSession();
       if (submittedComposerStillActive()) {
         props.onTreeSelection(undefined);
-        scrollTranscriptToBottom(true);
+        if (!steeringSubmit) scrollTranscriptToBottom(true);
       }
     } catch (error) {
       if (submittedDraftKey) clearedComposerDraftKeys.delete(submittedDraftKey);
@@ -6798,10 +6939,25 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
                 );
               }}
             </For>
-            <For each={unresolvedActivePendingUserMessages()}>
+            <For each={pendingUserMessagesBeforeLiveActivity()}>
               {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
             </For>
             <LiveAgentActivity activity={displayedLiveActivity()} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
+            <For each={pendingUserMessagesAfterLiveActivity()}>
+              {(pending) => {
+                let element: HTMLDivElement | undefined;
+                onCleanup(() => {
+                  if (element) deletePendingUserMessageRef(pending.id, element);
+                });
+                return <UserMessage elementRef={(node) => {
+                  element = node;
+                  setPendingUserMessageRef(pending.id, node);
+                }} project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />;
+              }}
+            </For>
+            <Show when={pendingUserMessageAnchorSpace() > 0}>
+              <div aria-hidden="true" class="pointer-events-none" style={{ height: `${pendingUserMessageAnchorSpace()}px` }} />
+            </Show>
             <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
           </div>
         </div>
@@ -10208,9 +10364,9 @@ function PanelSection(props: { title: string; children: JSX.Element; open?: bool
   );
 }
 
-function UserMessage(props: { project: Project; parts: ChatContentPart[]; attachments?: UploadAsset[]; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; onPreviewAttachment: (path: string) => void }) {
+function UserMessage(props: { project: Project; parts: ChatContentPart[]; attachments?: UploadAsset[]; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; elementRef?: (element: HTMLDivElement) => void; onPreviewAttachment: (path: string) => void }) {
   return (
-    <div class="chat-row chat-row-user">
+    <div ref={props.elementRef} class="chat-row chat-row-user">
       <div class="chat-user-message">
         <Show when={(props.attachments?.length ?? 0) > 0}>
           <ChatAttachmentPreviews project={props.project} attachments={props.attachments ?? []} onPreviewAttachment={props.onPreviewAttachment} />
@@ -10955,14 +11111,17 @@ function userMessageCount(entries: SessionEntry[]) {
 
 function liveTranscriptSnapshot(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): LiveTranscriptSnapshot {
   const preview = assistantAggregatePreviewAfterLastUser(entries, options);
-  return { userMessageCount: preview.userMessageCount, assistantAfterLastUserId: preview.latestAssistantId, assistantAfterLastUserText: assistantPreviewText(preview) };
+  return { entryIds: entries.map(({ id }) => id), userMessageCount: preview.userMessageCount, assistantAfterLastUserId: preview.latestAssistantId, assistantAfterLastUserText: assistantPreviewText(preview) };
 }
 
 function displayLiveAgentActivity(activity: AgentActivity, entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined, retired: boolean): AgentActivity {
   if (activity.streaming) return activity;
   if (activity.error === 'Operation aborted') return emptyAgentActivity();
+  if (retired) {
+    const retiredActivity = retireAgentActivityPreview(activity);
+    return activity.error ? { ...retiredActivity, error: activity.error } : retiredActivity;
+  }
   if (activity.error) return activity;
-  if (retired) return retireAgentActivityPreview(activity);
   if (!liveAgentActivityHasDisplayContent(activity, options)) return activity;
   if (!liveAgentActivityHasPreviewText(activity, options)) return retireAgentActivityPreview(activity);
   return transcriptHasCaughtUpToLiveActivity(entries, options, snapshot, activity) ? retireAgentActivityPreview(activity) : activity;
@@ -10986,7 +11145,34 @@ function liveAgentActivityHasPreviewText(activity: AgentActivity, options: { hid
 }
 
 function transcriptHasCaughtUpToLiveActivity(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined, activity: AgentActivity) {
-  return persistedTranscriptMatchesLiveActivity(activity, assistantAggregatePreviewAfterLastUser(entries, options), snapshot, options.hideThinking);
+  return persistedTranscriptMatchesLiveActivity(
+    activity,
+    assistantAggregatePreviewAfterLastUser(entries, options),
+    snapshot,
+    options.hideThinking,
+    assistantAggregatePreviewSinceSnapshot(entries, options, snapshot),
+  );
+}
+
+function assistantAggregatePreviewSinceSnapshot(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined): AssistantEntryPreview {
+  if (!snapshot) return assistantAggregatePreviewAfterLastUser(entries, options);
+  const snapshotEntryIds = new Set(snapshot.entryIds);
+  let start = 0;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    if (!snapshotEntryIds.has(entries[index].id)) continue;
+    start = index + 1;
+    break;
+  }
+  const preview: AssistantEntryPreview = { text: '', thinking: '', error: '' };
+  for (let index = start; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.type !== 'message' || entry.message?.role !== 'assistant' || !shouldDisplayTranscriptEntry(entry, options)) continue;
+    const entryPreview = assistantEntryPreview(entry, options);
+    preview.text = joinPreviewSegments(preview.text, entryPreview.text);
+    preview.thinking = joinPreviewSegments(preview.thinking, entryPreview.thinking);
+    preview.error = joinPreviewSegments(preview.error, entryPreview.error);
+  }
+  return preview;
 }
 
 function assistantAggregatePreviewAfterLastUser(entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }): AssistantAggregatePreview {

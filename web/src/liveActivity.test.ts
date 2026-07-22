@@ -20,6 +20,14 @@ function assistantMessageStart(): AgentServerEvent {
 }
 
 describe('live agent activity', () => {
+  test('retains the operation identity for the live turn', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:start', operationId: 'operation-1' });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', operationId: 'operation-1', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Hello', contentIndex: 0 }));
+
+    assert.equal(activity.operationId, 'operation-1');
+  });
+
   test('stops optimized streaming at agent_end but stays running until the bridge settles', () => {
     let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
     activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Final answer', contentIndex: 0 }));
@@ -118,6 +126,23 @@ describe('live agent activity', () => {
 
     assert.equal(persistedTranscriptMatchesLiveActivity({ ...emptyAgentActivity(), text: 'Final answer' }, preview, snapshot, false), true);
     assert.equal(persistedTranscriptMatchesLiveActivity({ ...emptyAgentActivity(), text: 'Different answer' }, preview, snapshot, false), false);
+  });
+
+  test('matches cumulative activity persisted across a steering message', () => {
+    const activity = { ...emptyAgentActivity(), text: 'Before steering. After steering.' };
+    const latestResponse = { userMessageCount: 2, latestAssistantId: 'assistant-2', text: 'After steering.', thinking: '', error: '' };
+    const cumulativeResponse = { text: 'Before steering. After steering.', thinking: '' };
+
+    assert.equal(persistedTranscriptMatchesLiveActivity(activity, latestResponse, {
+      userMessageCount: 1,
+      assistantAfterLastUserId: 'assistant-1',
+      assistantAfterLastUserText: '',
+    }, false, cumulativeResponse), true);
+    assert.equal(persistedTranscriptMatchesLiveActivity(activity, latestResponse, {
+      userMessageCount: 1,
+      assistantAfterLastUserId: 'assistant-1',
+      assistantAfterLastUserText: '',
+    }, false), false);
   });
 
   test('does not retire against a regressed or unrelated transcript branch', () => {
