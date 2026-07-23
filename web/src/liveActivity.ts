@@ -211,6 +211,6 @@ function toolActivitySummary(data: Record<string, unknown>) {
   if (args && 'command' in args && typeof (args as { command?: unknown }).command === 'string') return (args as { command: string }).command;
   if (args && 'path' in args && typeof (args as { path?: unknown }).path === 'string') return (args as { path: string }).path;
   if (args && 'file_path' in args && typeof (args as { file_path?: unknown }).file_path === 'string') return (args as { file_path: string }).file_path;
-  if (args) return JSON.stringify(args).slice(0, 160);
+  if (args) return JSON.stringify(args);
   return undefined;
 }

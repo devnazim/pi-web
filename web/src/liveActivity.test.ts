@@ -76,6 +76,23 @@ describe('live agent activity', () => {
     assert.equal(shouldUseOptimizedStreamingRender(activity, true), false);
   });
 
+  test('keeps complete tool arguments available for expanded live activity', () => {
+    const prompt = 'Investigate '.repeat(30).trim();
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), {
+      type: 'agent:event',
+      data: { type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'run_subagent', args: { agentId: 'Explorer', prompt } },
+    });
+
+    assert.equal(activity.tools[0]?.summary, JSON.stringify({ agentId: 'Explorer', prompt }));
+    assert.ok((activity.tools[0]?.summary.length ?? 0) > 160);
+
+    activity = reduceAgentActivityEvent(activity, {
+      type: 'agent:event',
+      data: { type: 'tool_execution_end', toolCallId: 'tool-1', toolName: 'run_subagent' },
+    });
+    assert.equal(activity.tools[0]?.summary, JSON.stringify({ agentId: 'Explorer', prompt }));
+  });
+
   test('does not duplicate text already received in deltas', () => {
     let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
     activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Hello', contentIndex: 0 }));

@@ -11172,6 +11172,22 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
   const error = createMemo(() => props.activity.error === 'Operation aborted' ? undefined : props.activity.error);
   const contentVisible = createMemo(() => liveAgentActivityHasDisplayContent(props.activity, { hideThinking: props.hideThinking, toolOutputMode: props.toolOutputMode }));
   const orderedItems = createMemo(() => liveAgentActivityRenderItems(props.activity));
+  const [expandedToolIds, setExpandedToolIds] = createSignal<Set<string>>(new Set<string>());
+  let expandedToolsOperationId = props.activity.operationId;
+  createEffect(() => {
+    if (props.activity.operationId === expandedToolsOperationId) return;
+    expandedToolsOperationId = props.activity.operationId;
+    setExpandedToolIds(new Set<string>());
+  });
+  const setToolExpanded = (id: string, open: boolean) => {
+    setExpandedToolIds((current) => {
+      if (current.has(id) === open) return current;
+      const next = new Set(current);
+      if (open) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
   const statusText = createMemo(() => {
     const retry = props.activity.retry;
     if (!retry) return props.activity.running ? 'working' : 'pi';
@@ -11182,7 +11198,7 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
     <Show when={props.activity.running || error() || props.activity.notices.length || contentVisible()}>
       <div class="live-agent">
         <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
-        <For each={orderedItems()}>{(item) => <LiveAgentActivityItem item={item} hideThinking={props.hideThinking} optimizeStreamingRender={shouldUseOptimizedStreamingRender(props.activity, props.optimizeStreamingRender)} toolOutputMode={props.toolOutputMode} syntaxTheme={props.syntaxTheme} />}</For>
+        <For each={orderedItems()}>{(item) => <LiveAgentActivityItem item={item} hideThinking={props.hideThinking} optimizeStreamingRender={shouldUseOptimizedStreamingRender(props.activity, props.optimizeStreamingRender)} toolOutputMode={props.toolOutputMode} syntaxTheme={props.syntaxTheme} toolExpanded={item.type === 'tool' && expandedToolIds().has(item.tool.id)} onToolExpandedChange={(open) => item.type === 'tool' && setToolExpanded(item.tool.id, open)} />}</For>
         <Show when={props.activity.notices.length}>
           <div class="live-agent-tools">
             <For each={props.activity.notices}>{(notice) => <div class="chat-meta"><span>agent</span><span>{notice}</span></div>}</For>
@@ -11193,11 +11209,11 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
   );
 }
 
-function LiveAgentActivityItem(props: { item: AgentActivityItem; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
+function LiveAgentActivityItem(props: { item: AgentActivityItem; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme; toolExpanded: boolean; onToolExpandedChange: (open: boolean) => void }) {
   const item = props.item;
   if (item.type === 'text') return <Show when={item.text.trim()}><LiveAgentText text={item.text} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>;
   if (item.type === 'thinking') return <Show when={!props.hideThinking && item.text.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{item.text}</div></Collapsible></Show>;
-  return <Show when={props.toolOutputMode !== 'hidden'}><LiveToolLine tool={item.tool} /></Show>;
+  return <Show when={props.toolOutputMode !== 'hidden'}><LiveToolLine tool={item.tool} open={props.toolExpanded} onOpenChange={props.onToolExpandedChange} /></Show>;
 }
 
 function LiveAgentText(props: { text: string; optimizeStreamingRender: boolean; syntaxTheme: ShikiSyntaxTheme }) {
@@ -11227,15 +11243,29 @@ function LiveShellActivity(props: { activity: BashActivity; command?: string }) 
   );
 }
 
-function LiveToolLine(props: { tool: AgentToolActivity }) {
+function LiveToolLine(props: { tool: AgentToolActivity; open: boolean; onOpenChange: (open: boolean) => void }) {
   const action = () => formatLiveToolAction(props.tool);
+  const fullSummary = () => props.tool.summary?.trim();
+  const canExpand = () => {
+    const summary = fullSummary();
+    return Boolean(summary && singleLine(summary) !== summary);
+  };
+  const title = () => (
+    <>
+      <span class="tool-line-label">{props.tool.status === 'running' ? action().label : props.tool.status === 'error' ? `Failed ${action().label}` : action().label}</span>
+      <span class="tool-line-text">{props.tool.status === 'running' ? `${action().text}...` : action().text}</span>
+    </>
+  );
+  const className = () => `tool-card tool-card-compact ${props.tool.status === 'error' ? 'tool-card-error' : ''} ${toolToneClass(props.tool.name)}`;
   return (
-    <div class={`tool-card tool-card-compact ${props.tool.status === 'error' ? 'tool-card-error' : ''} ${toolToneClass(props.tool.name)}`}>
-      <div class="tool-card-title tool-line-summary">
-        <span class="tool-line-label">{props.tool.status === 'running' ? action().label : props.tool.status === 'error' ? `Failed ${action().label}` : action().label}</span>
-        <span class="tool-line-text">{props.tool.status === 'running' ? `${action().text}...` : action().text}</span>
-      </div>
-    </div>
+    <Show
+      when={canExpand()}
+      fallback={<div class={className()}><div class="tool-card-title tool-line-summary">{title()}</div></div>}
+    >
+      <Collapsible class={className()} triggerClass="tool-card-title tool-line-summary" title={title()} open={props.open} onOpenChange={props.onOpenChange}>
+        <div class="tool-line-details whitespace-pre-wrap break-words">{fullSummary()}</div>
+      </Collapsible>
+    </Show>
   );
 }
 
