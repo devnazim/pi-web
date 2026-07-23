@@ -2713,11 +2713,11 @@ body {
   }
 
   .live-agent {
-    @apply mb-3 max-w-4xl px-1 text-sm;
+    @apply mb-3 max-w-full text-sm;
   }
 
   .live-agent-header {
-    @apply mb-2 flex items-center gap-1.5 text-xs font-medium text-muted-foreground;
+    @apply mb-2 flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground;
   }
 
   .live-agent-tools {

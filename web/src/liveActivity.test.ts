@@ -19,6 +19,10 @@ function assistantMessageStart(): AgentServerEvent {
   return { type: 'agent:event', data: { type: 'message_start', message: { role: 'assistant' } } };
 }
 
+function userMessageStart(text: string, clientMessageId?: string): AgentServerEvent {
+  return { type: 'agent:event', data: { type: 'message_start', message: { role: 'user', content: [{ type: 'text', text }] }, clientMessageId } };
+}
+
 describe('live agent activity', () => {
   test('retains the operation identity for the live turn', () => {
     let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:start', operationId: 'operation-1' });
@@ -74,6 +78,50 @@ describe('live agent activity', () => {
 
     activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'agent_end' } });
     assert.equal(shouldUseOptimizedStreamingRender(activity, true), false);
+  });
+
+  test('places a delivered steering prompt between live response segments', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, userMessageStart('Initial prompt'));
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Before steering.', contentIndex: 0 }));
+    activity = reduceAgentActivityEvent(activity, userMessageStart('Change direction', 'client-message-1'));
+    activity = reduceAgentActivityEvent(activity, assistantMessageStart());
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'After steering.', contentIndex: 0 }));
+
+    assert.deepEqual(activity.items, [
+      { type: 'text', text: 'Before steering.' },
+      { type: 'user', clientMessageId: 'client-message-1', text: 'Change direction' },
+      { type: 'text', text: 'After steering.' },
+    ]);
+    assert.equal(activity.text, 'Before steering.After steering.');
+  });
+
+  test('preserves earlier output when the same operation continues after agent_end', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', operationId: 'operation-1', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'Before steering.', contentIndex: 0 }));
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', operationId: 'operation-1', data: { type: 'agent_end' } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', operationId: 'operation-1', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, userMessageStart('Change direction', 'client-message-1'));
+    activity = reduceAgentActivityEvent(activity, assistantMessageStart());
+    activity = reduceAgentActivityEvent(activity, messageUpdate({ type: 'text_delta', delta: 'After steering.', contentIndex: 0 }));
+
+    assert.deepEqual(activity.items, [
+      { type: 'text', text: 'Before steering.' },
+      { type: 'user', clientMessageId: 'client-message-1', text: 'Change direction' },
+      { type: 'text', text: 'After steering.' },
+    ]);
+  });
+
+  test('updates a tool at its original position across a steering boundary', () => {
+    let activity = reduceAgentActivityEvent(emptyAgentActivity(), { type: 'agent:event', data: { type: 'agent_start' } });
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'tool_execution_start', toolCallId: 'tool-1', toolName: 'read' } });
+    activity = reduceAgentActivityEvent(activity, userMessageStart('Change direction', 'client-message-1'));
+    activity = reduceAgentActivityEvent(activity, { type: 'agent:event', data: { type: 'tool_execution_end', toolCallId: 'tool-1', toolName: 'read' } });
+
+    assert.deepEqual(activity.items, [
+      { type: 'tool', tool: { id: 'tool-1', name: 'read', status: 'done', summary: undefined } },
+      { type: 'user', clientMessageId: 'client-message-1', text: 'Change direction' },
+    ]);
   });
 
   test('keeps complete tool arguments available for expanded live activity', () => {

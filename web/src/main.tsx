@@ -1800,7 +1800,10 @@ function Shell() {
       try {
         const parsed = JSON.parse(payload) as AgentServerEvent & { sessionId?: string };
         const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
-        if (parsed.type === 'agent:start' || dataType === 'agent_start') resetAgentEvents([payload]);
+        const startsAgent = parsed.type === 'agent:start' || dataType === 'agent_start';
+        const continuesCurrentOperation = startsAgent
+          && Boolean(parsed.operationId && liveAgentActivityValue.running && parsed.operationId === liveAgentActivityValue.operationId);
+        if (startsAgent && !continuesCurrentOperation) resetAgentEvents([payload]);
         else if (shouldHandleAgentEvent(parsed)) handleAgentEvent(payload, parsed);
         const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
         if (parsed.type === 'agent:ui-request') {
@@ -5110,7 +5113,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
   );
 }
 
-type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; attachments: UploadAsset[]; steering: boolean };
+type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; clientMessageId: string; attachments: UploadAsset[]; steering: boolean };
 
 function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
@@ -5127,7 +5130,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let localCommandGeneration = 0;
   let pendingAgentSelectionApply: { sessionId: string; promise: Promise<void> } | undefined;
   let pendingUserMessageSequence = 0;
-  let pendingTerminalRefreshCount = 0;
+  const pendingTerminalRefreshCounts = new Map<string, number>();
+  const pendingTerminalRefreshRetryTimers = new Map<string, number>();
+  const blockedTerminalRefreshKeys = new Set<string>();
   let terminalSubmissionGeneration = 0;
   let handledPendingTerminalError = '';
   let liveTurnActivityActive = false;
@@ -5135,15 +5140,11 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let liveTurnRenderStateProvisional = false;
   const liveTurnRenderStates = new Map<string, { pendingBoundary: number; transcriptEntries: SessionEntry[]; transcriptSnapshot: LiveTranscriptSnapshot }>();
   const transcriptEntryRefs = new Map<string, HTMLDivElement>();
-  const pendingUserMessageRefs = new Map<number, HTMLDivElement>();
   let userScrollingTranscriptAwayFromBottom = false;
   let transcriptScrollFrame: number | undefined;
   let transcriptScrollFollowupFrame: number | undefined;
   let transcriptPrependFrame: number | undefined;
   let transcriptScrollForce = false;
-  let pendingUserMessageAnchorFrame: number | undefined;
-  let pendingUserMessageAnchorFollowupFrame: number | undefined;
-  let pendingUserMessageAnchorScrollForce = false;
   let composerLayoutFrame: number | undefined;
   let composerLayoutPasses = 0;
   let composerHistoryIndex: number | undefined;
@@ -5171,8 +5172,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [commandSessionId, setCommandSessionId] = createSignal<string>();
   const [pendingUserMessages, setPendingUserMessages] = createSignal<PendingUserMessage[]>([]);
   const [liveActivityPendingBoundary, setLiveActivityPendingBoundary] = createSignal(0);
-  const [pendingUserMessageAnchorId, setPendingUserMessageAnchorId] = createSignal<number>();
-  const [pendingUserMessageAnchorSpace, setPendingUserMessageAnchorSpace] = createSignal(0);
   const [liveTurnDisplayEntries, setLiveTurnDisplayEntries] = createSignal<SessionEntry[]>();
   const [liveTurnTranscriptSnapshot, setLiveTurnTranscriptSnapshot] = createSignal<LiveTranscriptSnapshot>();
   const [liveTurnRetired, setLiveTurnRetired] = createSignal(false);
@@ -5180,7 +5179,11 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
-  const [pendingTerminalRefreshActive, setPendingTerminalRefreshActive] = createSignal(false);
+  const [pendingTerminalRefreshKeys, setPendingTerminalRefreshKeys] = createSignal<Set<string>>(new Set<string>());
+  const pendingTerminalRefreshActive = createMemo(() => {
+    const sessionId = props.sessionId ?? commandSessionId();
+    return Boolean(sessionId && pendingTerminalRefreshKeys().has(`${props.project.id}\u0000${sessionId}`));
+  });
   const [attachBusy, setAttachBusy] = createSignal(false);
   const [attachErrorToast, setAttachErrorToast] = createSignal<{ id: number; message: string }>();
   const [extensionUiResponding, setExtensionUiResponding] = createSignal<string>();
@@ -5298,7 +5301,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   ));
   const pendingUserMessagesBeforeLiveActivity = createMemo(() => unresolvedActivePendingUserMessages().filter(({ id }) => id <= liveActivityPendingBoundary()));
   const pendingUserMessagesAfterLiveActivity = createMemo(() => unresolvedActivePendingUserMessages().filter(({ id }) => id > liveActivityPendingBoundary()));
-  const pendingUserMessageAnchorCandidate = createMemo(() => pendingUserMessagesAfterLiveActivity().filter((pending) => pending.steering).at(-1));
   const pendingUserMessageVisible = createMemo(() => unresolvedActivePendingUserMessages().length > 0);
   const visibleTranscriptEntries = createMemo(() => {
     const options = { hideThinking: hideThinking(), toolOutputMode: toolOutputMode() };
@@ -5489,16 +5491,25 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       setLiveTurnTranscriptSnapshot(nextState.transcriptSnapshot);
       setLiveTurnRetired(false);
     }
-    if (!active && liveTurnActivityActive) terminalSubmissionGeneration += 1;
+    if (!active && liveTurnActivityActive) {
+      terminalSubmissionGeneration += 1;
+      const sessionId = props.sessionId ?? commandSessionId();
+      const pendingAtTerminal = untrack(activePendingUserMessages);
+      if (!activity.error && sessionId && (pendingAtTerminal.length || activity.items.some((item) => item.type === 'user'))) {
+        void reconcilePendingUserMessagesAfterTerminal(props.project.id, sessionId, pendingAtTerminal);
+      }
+    }
     if (!active && !activity.error) {
       if (liveAgentActivityHasPreviewText(activity, options)) {
         if (transcriptHasCaughtUpToLiveActivity(liveTurnTranscriptEntries(), options, liveTurnTranscriptSnapshot(), activity)) setLiveTurnRetired(true);
-      } else if (activity.tools.length) {
-        setLiveTurnRetired(true);
-      } else {
-        setLiveTurnDisplayEntries(undefined);
-        setLiveTurnTranscriptSnapshot(undefined);
-        setLiveTurnRetired(false);
+      } else if (!activity.items.some((item) => item.type === 'user')) {
+        if (activity.tools.length) {
+          setLiveTurnRetired(true);
+        } else {
+          setLiveTurnDisplayEntries(undefined);
+          setLiveTurnTranscriptSnapshot(undefined);
+          setLiveTurnRetired(false);
+        }
       }
     }
     liveTurnActivityActive = active;
@@ -5511,14 +5522,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (!activePending.length || unresolvedActivePendingUserMessages().length) return;
     const resolvedIds = new Set(activePending.map(({ id }) => id));
     setPendingUserMessages((pending) => pending.filter(({ id }) => !resolvedIds.has(id)));
-  });
-
-  createEffect(() => {
-    const anchorId = pendingUserMessageAnchorId();
-    const candidateId = pendingUserMessageAnchorCandidate()?.id;
-    if (anchorId === candidateId) return;
-    if (candidateId === undefined) clearPendingUserMessageAnchor();
-    else anchorPendingUserMessage(candidateId, false);
   });
 
   createEffect(() => {
@@ -5729,6 +5732,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (transcriptScrollFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFrame);
     if (transcriptScrollFollowupFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFollowupFrame);
     if (composerLayoutFrame !== undefined) window.cancelAnimationFrame(composerLayoutFrame);
+    for (const timer of pendingTerminalRefreshRetryTimers.values()) window.clearTimeout(timer);
+    pendingTerminalRefreshRetryTimers.clear();
     clearAttachToastTimer();
   });
 
@@ -5753,15 +5758,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
 
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => syncComposerLayout());
     if (observer && composerRef) observer.observe(composerRef);
-    const transcriptObserver = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => {
-      const anchorId = untrack(pendingUserMessageAnchorId);
-      if (anchorId !== undefined) scrollPendingUserMessageAnchor(anchorId);
-    });
-    if (transcriptObserver && transcriptScrollerRef) transcriptObserver.observe(transcriptScrollerRef);
     onCleanup(() => {
       window.removeEventListener('keydown', onKeyDown);
       observer?.disconnect();
-      transcriptObserver?.disconnect();
     });
   });
 
@@ -5794,14 +5793,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
 
   function deleteTranscriptEntryRef(id: string, element: HTMLDivElement) {
     if (transcriptEntryRefs.get(id) === element) transcriptEntryRefs.delete(id);
-  }
-
-  function setPendingUserMessageRef(id: number, element: HTMLDivElement) {
-    pendingUserMessageRefs.set(id, element);
-  }
-
-  function deletePendingUserMessageRef(id: number, element: HTMLDivElement) {
-    if (pendingUserMessageRefs.get(id) === element) pendingUserMessageRefs.delete(id);
   }
 
   function transcriptDistanceFromBottom(element: HTMLElement) {
@@ -5840,72 +5831,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     loadEarlierTranscript(element);
   }
 
-  function cancelPendingUserMessageAnchorScroll() {
-    if (pendingUserMessageAnchorFrame !== undefined) cancelAnimationFrame(pendingUserMessageAnchorFrame);
-    if (pendingUserMessageAnchorFollowupFrame !== undefined) cancelAnimationFrame(pendingUserMessageAnchorFollowupFrame);
-    pendingUserMessageAnchorFrame = undefined;
-    pendingUserMessageAnchorFollowupFrame = undefined;
-    pendingUserMessageAnchorScrollForce = false;
-  }
-
-  function clearPendingUserMessageAnchor() {
-    cancelPendingUserMessageAnchorScroll();
-    setPendingUserMessageAnchorId(undefined);
-    setPendingUserMessageAnchorSpace(0);
-  }
-
-  function anchorPendingUserMessage(id: number, force = true) {
-    cancelPendingUserMessageAnchorScroll();
-    setPendingUserMessageAnchorId(id);
-    setPendingUserMessageAnchorSpace(0);
-    scrollPendingUserMessageAnchor(id, force);
-  }
-
-  function scrollPendingUserMessageAnchor(id: number, force = false, retry = true) {
-    if (force) {
-      userScrollingTranscriptAwayFromBottom = false;
-      pendingUserMessageAnchorScrollForce = true;
-    }
-    if (pendingUserMessageAnchorFrame !== undefined || pendingUserMessageAnchorFollowupFrame !== undefined) return;
-    pendingUserMessageAnchorFrame = requestAnimationFrame(() => {
-      pendingUserMessageAnchorFrame = undefined;
-      if (pendingUserMessageAnchorId() !== id) {
-        pendingUserMessageAnchorScrollForce = false;
-        return;
-      }
-      const scroller = transcriptScrollerRef;
-      const target = pendingUserMessageRefs.get(id);
-      if (!scroller || !target) {
-        if (!retry) {
-          pendingUserMessageAnchorScrollForce = false;
-          return;
-        }
-        pendingUserMessageAnchorFollowupFrame = requestAnimationFrame(() => {
-          pendingUserMessageAnchorFollowupFrame = undefined;
-          scrollPendingUserMessageAnchor(id, force, false);
-        });
-        return;
-      }
-      setPendingUserMessageAnchorSpace(Math.max(0, scroller.clientHeight - target.getBoundingClientRect().height - 48));
-      pendingUserMessageAnchorFollowupFrame = requestAnimationFrame(() => {
-        pendingUserMessageAnchorFollowupFrame = undefined;
-        const shouldForce = pendingUserMessageAnchorScrollForce;
-        pendingUserMessageAnchorScrollForce = false;
-        if (pendingUserMessageAnchorId() !== id || (!shouldForce && !stickToBottom())) return;
-        const currentScroller = transcriptScrollerRef;
-        const currentTarget = pendingUserMessageRefs.get(id);
-        if (!currentScroller || !currentTarget) return;
-        currentScroller.scrollTop += currentTarget.getBoundingClientRect().top - currentScroller.getBoundingClientRect().top - 24;
-      });
-    });
-  }
-
   function scrollTranscriptToBottom(force = false) {
-    const anchorId = pendingUserMessageAnchorId();
-    if (anchorId !== undefined) {
-      scrollPendingUserMessageAnchor(anchorId, force);
-      return;
-    }
     if (force) {
       userScrollingTranscriptAwayFromBottom = false;
       transcriptScrollForce = true;
@@ -5931,7 +5857,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (transcriptScrollFrame !== undefined) cancelAnimationFrame(transcriptScrollFrame);
     if (transcriptScrollFollowupFrame !== undefined) cancelAnimationFrame(transcriptScrollFollowupFrame);
     if (transcriptPrependFrame !== undefined) cancelAnimationFrame(transcriptPrependFrame);
-    cancelPendingUserMessageAnchorScroll();
   });
 
   async function ensureCommandSession(draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId)) {
@@ -6432,11 +6357,23 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setUploads((items) => items.filter((item) => item.path !== path));
   }
 
-  async function reconcilePendingUserMessagesAfterTerminal(projectId: string, sessionId: string, pendingAtTerminal: PendingUserMessage[]) {
-    pendingTerminalRefreshCount += 1;
-    setPendingTerminalRefreshActive(true);
+  async function reconcilePendingUserMessagesAfterTerminal(projectId: string, sessionId: string, pendingAtTerminal: PendingUserMessage[], retry = true, terminalError = Boolean(liveActivity().error)) {
+    const refreshKey = `${projectId}\u0000${sessionId}`;
+    pendingTerminalRefreshCounts.set(refreshKey, (pendingTerminalRefreshCounts.get(refreshKey) ?? 0) + 1);
+    setPendingTerminalRefreshKeys((keys) => {
+      if (keys.has(refreshKey)) return keys;
+      const next = new Set(keys);
+      next.add(refreshKey);
+      return next;
+    });
     try {
-      const detail = await api<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}`);
+      const detail = await apiWithTimeout<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}`);
+      const retryTimer = pendingTerminalRefreshRetryTimers.get(refreshKey);
+      if (retryTimer !== undefined) {
+        window.clearTimeout(retryTimer);
+        pendingTerminalRefreshRetryTimers.delete(refreshKey);
+      }
+      blockedTerminalRefreshKeys.delete(refreshKey);
       queryClient.setQueryData(['session', projectId, sessionId], detail);
       const retainedIds = new Set(pendingUserMessagesAfterTerminalRefresh(
         branchForEntry(detail.entries, detail.leafId).filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
@@ -6444,13 +6381,32 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       ).map(({ id }) => id));
       const terminalIds = new Set(pendingAtTerminal.map(({ id }) => id));
       setPendingUserMessages((pending) => pending.filter(({ id }) => !terminalIds.has(id) || retainedIds.has(id)));
-      if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId && liveActivity().error) setLiveTurnRetired(true);
+      const activity = liveActivity();
+      if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId && (terminalError || (!activity.running && !activity.streaming))) setLiveTurnRetired(true);
     } catch {
-      await queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] }).catch(() => undefined);
-      if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId && liveActivity().error) setLiveTurnRetired(true);
+      if (retry) {
+        const existingTimer = pendingTerminalRefreshRetryTimers.get(refreshKey);
+        if (existingTimer !== undefined) window.clearTimeout(existingTimer);
+        pendingTerminalRefreshRetryTimers.set(refreshKey, window.setTimeout(() => {
+          pendingTerminalRefreshRetryTimers.delete(refreshKey);
+          void reconcilePendingUserMessagesAfterTerminal(projectId, sessionId, pendingAtTerminal, false, terminalError);
+        }, 1_000));
+      } else {
+        blockedTerminalRefreshKeys.add(refreshKey);
+        if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId) showAttachErrorToast('Could not refresh the finished conversation. Reload this session before sending another prompt.');
+      }
     } finally {
-      pendingTerminalRefreshCount -= 1;
-      if (pendingTerminalRefreshCount === 0) setPendingTerminalRefreshActive(false);
+      const remaining = (pendingTerminalRefreshCounts.get(refreshKey) ?? 1) - 1;
+      if (remaining > 0) pendingTerminalRefreshCounts.set(refreshKey, remaining);
+      else pendingTerminalRefreshCounts.delete(refreshKey);
+      if (remaining <= 0 && !pendingTerminalRefreshRetryTimers.has(refreshKey) && !blockedTerminalRefreshKeys.has(refreshKey)) {
+        setPendingTerminalRefreshKeys((keys) => {
+          if (!keys.has(refreshKey)) return keys;
+          const next = new Set(keys);
+          next.delete(refreshKey);
+          return next;
+        });
+      }
     }
   }
 
@@ -6467,7 +6423,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId }),
       });
-      await reconcilePendingUserMessagesAfterTerminal(projectId, sessionId, pendingAtInterrupt);
+      await reconcilePendingUserMessagesAfterTerminal(projectId, sessionId, pendingAtInterrupt, true, true);
       setRunningCommand(undefined);
     } finally {
       setAborting(false);
@@ -6794,6 +6750,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       if (mirrorActiveStream && submittedWorkspaceStillCurrent()) props.onSession(submittedSessionId, projectId, routeSessionId ?? null);
     };
     let submittedPendingUserMessageId: number | undefined;
+    let submittedPendingUserMessageClientId: string | undefined;
     let submissionInterruptedByTerminalRefresh = false;
 
     if (submittedComposerStillActive()) {
@@ -6841,18 +6798,21 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       addComposerHistory({ text: prompt, uploads: uploadAssets }, 'normal', projectId);
       if (!extensionCommand && submittedComposerStillActive()) {
         const pendingMessageId = ++pendingUserMessageSequence;
+        const clientMessageId = `${Date.now().toString(36)}-${pendingMessageId.toString(36)}-${Math.random().toString(36).slice(2)}`;
         submittedPendingUserMessageId = pendingMessageId;
+        submittedPendingUserMessageClientId = clientMessageId;
         setPendingUserMessages((pending) => [...pending, {
           id: pendingMessageId,
           projectId,
           sessionId: submittedSessionId,
+          clientMessageId,
           text: prompt,
           attachments: attachmentAssets,
           previousUserEntryIds: (session.data?.entries ?? transcriptEntries()).filter(isUserMessageEntry).map((entry) => entry.id),
           accepted: false,
           steering: steeringSubmit,
         }]);
-        if (steeringSubmit) anchorPendingUserMessage(pendingMessageId);
+        if (steeringSubmit) scrollTranscriptToBottom(true);
       }
       if (aborting() || pendingTerminalRefreshActive() || submissionTerminalGeneration !== terminalSubmissionGeneration) {
         submissionInterruptedByTerminalRefresh = true;
@@ -6872,6 +6832,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           model: submittedModelExplicit ? submittedModel || submittedDefaultModel : shouldUseAgentModel ? undefined : submittedModel || submittedDefaultModel,
           thinking: submittedThinkingExplicit || !shouldUseAgentThinking ? promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel) : undefined,
           streamingBehavior: steeringSubmit && !extensionCommand ? 'steer' : undefined,
+          clientMessageId: steeringSubmit && !extensionCommand ? submittedPendingUserMessageClientId : undefined,
         }),
       });
       if (submittedPendingUserMessageId !== undefined) {
@@ -6945,22 +6906,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
             <For each={pendingUserMessagesBeforeLiveActivity()}>
               {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
             </For>
-            <LiveAgentActivity activity={displayedLiveActivity()} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} />
-            <For each={pendingUserMessagesAfterLiveActivity()}>
-              {(pending) => {
-                let element: HTMLDivElement | undefined;
-                onCleanup(() => {
-                  if (element) deletePendingUserMessageRef(pending.id, element);
-                });
-                return <UserMessage elementRef={(node) => {
-                  element = node;
-                  setPendingUserMessageRef(pending.id, node);
-                }} project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />;
-              }}
-            </For>
-            <Show when={pendingUserMessageAnchorSpace() > 0}>
-              <div aria-hidden="true" class="pointer-events-none" style={{ height: `${pendingUserMessageAnchorSpace()}px` }} />
-            </Show>
+            <LiveAgentActivity activity={displayedLiveActivity()} pendingUserMessages={pendingUserMessagesAfterLiveActivity()} project={props.project} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
             <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
           </div>
         </div>
@@ -10653,9 +10599,9 @@ function PanelSection(props: { title: string; children: JSX.Element; open?: bool
   );
 }
 
-function UserMessage(props: { project: Project; parts: ChatContentPart[]; attachments?: UploadAsset[]; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; elementRef?: (element: HTMLDivElement) => void; onPreviewAttachment: (path: string) => void }) {
+function UserMessage(props: { project: Project; parts: ChatContentPart[]; attachments?: UploadAsset[]; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; onPreviewAttachment: (path: string) => void }) {
   return (
-    <div ref={props.elementRef} class="chat-row chat-row-user">
+    <div class="chat-row chat-row-user">
       <div class="chat-user-message">
         <Show when={(props.attachments?.length ?? 0) > 0}>
           <ChatAttachmentPreviews project={props.project} attachments={props.attachments ?? []} onPreviewAttachment={props.onPreviewAttachment} />
@@ -11168,10 +11114,12 @@ function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; synt
   );
 }
 
-function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme }) {
+function LiveAgentActivity(props: { activity: AgentActivity; pendingUserMessages: PendingUserMessage[]; project: Project; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; onPreviewAttachment: (path: string) => void }) {
   const error = createMemo(() => props.activity.error === 'Operation aborted' ? undefined : props.activity.error);
   const contentVisible = createMemo(() => liveAgentActivityHasDisplayContent(props.activity, { hideThinking: props.hideThinking, toolOutputMode: props.toolOutputMode }));
   const orderedItems = createMemo(() => liveAgentActivityRenderItems(props.activity));
+  const pendingUserMessagesByClientId = createMemo(() => new Map(props.pendingUserMessages.map((pending) => [pending.clientMessageId, pending])));
+  const deliveredClientMessageIds = createMemo(() => new Set(orderedItems().filter((item) => item.type === 'user').map((item) => item.clientMessageId)));
   const [expandedToolIds, setExpandedToolIds] = createSignal<Set<string>>(new Set<string>());
   let expandedToolsOperationId = props.activity.operationId;
   createEffect(() => {
@@ -11195,10 +11143,19 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
     return `retrying${attempt}`;
   });
   return (
-    <Show when={props.activity.running || error() || props.activity.notices.length || contentVisible()}>
+    <Show when={props.activity.running || error() || props.activity.notices.length || contentVisible() || props.pendingUserMessages.length || deliveredClientMessageIds().size}>
       <div class="live-agent">
         <div class="live-agent-header"><Show when={props.activity.running} fallback={<Bot class="size-3.5" />}><Show when={props.activity.retry} fallback={<LoaderCircle class="size-3.5 animate-spin" />}><RefreshCw class="size-3.5 animate-spin" /></Show></Show>{statusText()}<Show when={error()}><span class="text-destructive"> · {error()}</span></Show></div>
-        <For each={orderedItems()}>{(item) => <LiveAgentActivityItem item={item} hideThinking={props.hideThinking} optimizeStreamingRender={shouldUseOptimizedStreamingRender(props.activity, props.optimizeStreamingRender)} toolOutputMode={props.toolOutputMode} syntaxTheme={props.syntaxTheme} toolExpanded={item.type === 'tool' && expandedToolIds().has(item.tool.id)} onToolExpandedChange={(open) => item.type === 'tool' && setToolExpanded(item.tool.id, open)} />}</For>
+        <For each={orderedItems()}>{(item) => {
+          if (item.type === 'user') {
+            const pending = () => pendingUserMessagesByClientId().get(item.clientMessageId);
+            return <UserMessage project={props.project} parts={[{ type: 'text', text: pending()?.text ?? item.text }]} attachments={pending()?.attachments} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} onPreviewAttachment={props.onPreviewAttachment} />;
+          }
+          return <LiveAgentActivityItem item={item} hideThinking={props.hideThinking} optimizeStreamingRender={shouldUseOptimizedStreamingRender(props.activity, props.optimizeStreamingRender)} toolOutputMode={props.toolOutputMode} syntaxTheme={props.syntaxTheme} toolExpanded={item.type === 'tool' && expandedToolIds().has(item.tool.id)} onToolExpandedChange={(open) => item.type === 'tool' && setToolExpanded(item.tool.id, open)} />;
+        }}</For>
+        <For each={props.pendingUserMessages.filter((pending) => !deliveredClientMessageIds().has(pending.clientMessageId))}>
+          {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} onPreviewAttachment={props.onPreviewAttachment} />}
+        </For>
         <Show when={props.activity.notices.length}>
           <div class="live-agent-tools">
             <For each={props.activity.notices}>{(notice) => <div class="chat-meta"><span>agent</span><span>{notice}</span></div>}</For>
@@ -11209,7 +11166,7 @@ function LiveAgentActivity(props: { activity: AgentActivity; hideThinking: boole
   );
 }
 
-function LiveAgentActivityItem(props: { item: AgentActivityItem; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme; toolExpanded: boolean; onToolExpandedChange: (open: boolean) => void }) {
+function LiveAgentActivityItem(props: { item: Exclude<AgentActivityItem, { type: 'user' }>; hideThinking: boolean; optimizeStreamingRender: boolean; toolOutputMode: ChatToolOutputMode; syntaxTheme: ShikiSyntaxTheme; toolExpanded: boolean; onToolExpandedChange: (open: boolean) => void }) {
   const item = props.item;
   if (item.type === 'text') return <Show when={item.text.trim()}><LiveAgentText text={item.text} optimizeStreamingRender={props.optimizeStreamingRender} syntaxTheme={props.syntaxTheme} /></Show>;
   if (item.type === 'thinking') return <Show when={!props.hideThinking && item.text.trim()}><Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking" defaultOpen><div class="mt-2 whitespace-pre-wrap">{item.text}</div></Collapsible></Show>;
@@ -11435,11 +11392,11 @@ function liveTranscriptSnapshot(entries: SessionEntry[], options: { hideThinking
 
 function displayLiveAgentActivity(activity: AgentActivity, entries: SessionEntry[], options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, snapshot: LiveTranscriptSnapshot | undefined, retired: boolean): AgentActivity {
   if (activity.streaming) return activity;
-  if (activity.error === 'Operation aborted') return emptyAgentActivity();
   if (retired) {
     const retiredActivity = retireAgentActivityPreview(activity);
-    return activity.error ? { ...retiredActivity, error: activity.error } : retiredActivity;
+    return activity.error && activity.error !== 'Operation aborted' ? { ...retiredActivity, error: activity.error } : retiredActivity;
   }
+  if (activity.error === 'Operation aborted') return { ...activity, error: undefined };
   if (activity.error) return activity;
   if (!liveAgentActivityHasDisplayContent(activity, options)) return activity;
   if (!liveAgentActivityHasPreviewText(activity, options)) return retireAgentActivityPreview(activity);

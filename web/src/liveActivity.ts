@@ -5,7 +5,8 @@ export type AgentActivityThinkingItem = { type: 'thinking'; text: string };
 export type AgentActivityContentItem = AgentActivityTextItem | AgentActivityThinkingItem;
 export type AgentActivityDelta = AgentActivityContentItem & { contentIndex?: number };
 export type AgentActivityToolItem = { type: 'tool'; tool: AgentToolActivity };
-export type AgentActivityItem = AgentActivityContentItem | AgentActivityToolItem;
+export type AgentActivityUserItem = { type: 'user'; clientMessageId: string; text: string };
+export type AgentActivityItem = AgentActivityContentItem | AgentActivityToolItem | AgentActivityUserItem;
 export type AgentRetryActivity = { attempt?: number; maxAttempts?: number; delayMs?: number; errorMessage?: string };
 export type AgentActivity = { running: boolean; streaming: boolean; operationId?: string; error?: string; text: string; thinking: string; tools: AgentToolActivity[]; items: AgentActivityItem[]; notices: string[]; deltaContentKeys: string[]; retry?: AgentRetryActivity };
 export type AgentServerEvent = { type?: string; operationId?: string; message?: string; data?: unknown };
@@ -120,7 +121,10 @@ function comparablePreviewText(value: string) {
 }
 
 export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentServerEvent): AgentActivity {
-  if (event.type === 'agent:start') return { ...emptyAgentActivity(), running: true, operationId: event.operationId };
+  if (event.type === 'agent:start') {
+    if (activity.running && event.operationId && activity.operationId === event.operationId) return { ...activity, running: true };
+    return { ...emptyAgentActivity(), running: true, operationId: event.operationId };
+  }
   if (event.type === 'agent:finish') return { ...activity, running: false, streaming: false, retry: undefined };
   if (event.type === 'agent:error' || event.type === 'error') {
     const message = event.message ?? 'Agent failed';
@@ -132,10 +136,15 @@ export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentSe
 
   const data = event.data as Record<string, unknown>;
   const type = typeof data.type === 'string' ? data.type : '';
-  if (type === 'agent_start') return { ...emptyAgentActivity(), running: true, streaming: true, operationId: event.operationId };
+  if (type === 'agent_start') {
+    if (activity.running && event.operationId && activity.operationId === event.operationId) return { ...activity, running: true, streaming: true, error: undefined };
+    return { ...emptyAgentActivity(), running: true, streaming: true, operationId: event.operationId };
+  }
   if (type === 'message_start') {
-    const message = data.message && typeof data.message === 'object' ? data.message as { role?: unknown } : undefined;
-    return message?.role === 'assistant' ? { ...activity, deltaContentKeys: [] } : activity;
+    const message = data.message && typeof data.message === 'object' ? data.message as { role?: unknown; content?: unknown } : undefined;
+    if (message?.role === 'assistant') return { ...activity, deltaContentKeys: [] };
+    if (message?.role !== 'user' || typeof data.clientMessageId !== 'string' || !data.clientMessageId) return activity;
+    return { ...activity, items: [...activity.items, { type: 'user', clientMessageId: data.clientMessageId, text: agentMessageText(message.content) }] };
   }
   if (type === 'agent_end') {
     const willRetry = data.willRetry === true;
@@ -204,6 +213,18 @@ export function reduceAgentActivityEvent(activity: AgentActivity, event: AgentSe
     };
   }
   return activity;
+}
+
+function agentMessageText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => {
+    if (typeof part === 'string') return part;
+    if (!part || typeof part !== 'object') return '';
+    const record = part as Record<string, unknown>;
+    if (typeof record.text === 'string') return record.text;
+    return record.type === 'image' ? '[image]' : '';
+  }).filter(Boolean).join(' ');
 }
 
 function toolActivitySummary(data: Record<string, unknown>) {

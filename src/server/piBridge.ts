@@ -23,6 +23,7 @@ type WebSocket = {
 type TreeSummaryOptions = { mode?: 'none' | 'summary' | 'custom'; instructions?: string; replace?: boolean };
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 type StreamingBehavior = 'steer' | 'followUp';
+type PendingStreamingClientMessage = { token: string; behavior: StreamingBehavior; clientMessageId?: string; queued: boolean };
 type ImageContent = { type: 'image'; mimeType: string; data: string };
 
 interface PromptBody {
@@ -37,6 +38,7 @@ interface PromptBody {
   attachments?: string[];
   mirrorActiveStream?: boolean;
   streamingBehavior?: StreamingBehavior;
+  clientMessageId?: string;
   awaitCompletion?: boolean;
 }
 
@@ -195,6 +197,10 @@ export class PiBridge {
   private readonly sessionStreamKeys = new WeakMap<object, string | string[]>();
   private readonly sessionOperationIds = new WeakMap<object, string>();
   private readonly sessionStreamKeyLocks = new WeakMap<object, StreamKeyLock>();
+  private readonly pendingStreamingClientMessages = new WeakMap<object, PendingStreamingClientMessage[]>();
+  private readonly deliveredStreamingClientMessages = new WeakMap<object, PendingStreamingClientMessage[]>();
+  private readonly streamingQueueSlots = new WeakMap<object, { steer: Array<PendingStreamingClientMessage | undefined>; followUp: Array<PendingStreamingClientMessage | undefined> }>();
+  private readonly streamingDispatchTails = new Map<string, Promise<void>>();
   private readonly extensionAsyncWrappedSessions = new WeakSet<object>();
   private readonly extensionAsyncTasks = new WeakMap<object, Set<Promise<unknown>>>();
   private readonly extensionErrorCounts = new WeakMap<object, number>();
@@ -423,6 +429,10 @@ export class PiBridge {
     let assistantError: string | undefined;
     let terminalSdkError: string | undefined;
     let runtimeSession: object | undefined;
+    let queuedClientMessageToken: string | undefined;
+    let streamingDispatchReady: Promise<void> | undefined;
+    let streamingDispatchRelease: (() => void) | undefined;
+    let streamingDispatchGate: Promise<void> | undefined;
     let setupSupervisor: RuntimeSetupSupervisor | undefined;
     const clearCommandBusyTimer = () => {
       if (!commandBusyTimer) return;
@@ -435,6 +445,22 @@ export class PiBridge {
       preflightAccepted = success;
       options.preflightResult?.(success, error);
     };
+    const releaseStreamingDispatch = () => {
+      const release = streamingDispatchRelease;
+      if (!release) return;
+      streamingDispatchRelease = undefined;
+      release();
+    };
+    const streamingDispatchKey = body.streamingBehavior ? this.runtimeSessionCacheKey(projectPath, body.sessionId) : undefined;
+    if (streamingDispatchKey) {
+      streamingDispatchReady = this.streamingDispatchTails.get(streamingDispatchKey) ?? Promise.resolve();
+      const ownGate = new Promise<void>((resolve) => { streamingDispatchRelease = resolve; });
+      streamingDispatchGate = streamingDispatchReady.then(() => ownGate);
+      this.streamingDispatchTails.set(streamingDispatchKey, streamingDispatchGate);
+      void streamingDispatchGate.then(() => {
+        if (this.streamingDispatchTails.get(streamingDispatchKey) === streamingDispatchGate) this.streamingDispatchTails.delete(streamingDispatchKey);
+      });
+    }
     try {
       const sessionLock = await this.markSessionActiveWithState(projectPath, body.sessionId);
       markSessionIdle = sessionLock.release;
@@ -457,11 +483,6 @@ export class PiBridge {
         throw error;
       }
       const requestedStreamingBehavior = extensionCommand ? undefined : body.streamingBehavior;
-      if (requestedStreamingBehavior && typeof session?.prompt !== 'function') {
-        const error = new Error('Loaded pi SDK session does not support streamingBehavior');
-        reportPreflight(false, error);
-        throw error;
-      }
       let streamingBehavior = requestedStreamingBehavior;
       if (requestedStreamingBehavior) {
         if (this.cachedSessionIsStreaming(session)) queuedStreamingPrompt = true;
@@ -470,6 +491,11 @@ export class PiBridge {
           reportPreflight(false, error);
           throw error;
         } else streamingBehavior = undefined;
+      }
+      if (queuedStreamingPrompt && ((streamingBehavior === 'steer' && typeof session?.steer !== 'function') || (streamingBehavior === 'followUp' && typeof session?.followUp !== 'function'))) {
+        const error = new Error('Loaded pi SDK session does not support streamingBehavior');
+        reportPreflight(false, error);
+        throw error;
       }
       if (!extensionCommand && !queuedStreamingPrompt && sessionBusy) {
         const error = new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
@@ -557,12 +583,63 @@ export class PiBridge {
       assistantError = undefined;
       terminalSdkError = undefined;
 
-      if (typeof session?.prompt === 'function') {
+      if (queuedStreamingPrompt && streamingBehavior) {
+        await streamingDispatchReady;
+        if (!this.cachedSessionIsStreaming(session)) throw new Error('Agent finished before the queued message could be delivered. Please retry.');
+        let queuedPrompt = prompt;
+        let queuedImages = images;
+        const extensionRunner = session?.extensionRunner;
+        if (typeof extensionRunner?.hasHandlers === 'function' && extensionRunner.hasHandlers('input') && typeof extensionRunner.emitInput === 'function') {
+          const inputResult = await setupSupervisor.wait(extensionRunner.emitInput(queuedPrompt, queuedImages.length ? queuedImages : undefined, 'rpc', streamingBehavior)) as { action?: string; text?: string; images?: typeof images };
+          if (inputResult.action === 'handled') {
+            releaseStreamingDispatch();
+            reportPreflight(true);
+          } else if (inputResult.action === 'transform' && typeof inputResult.text === 'string') {
+            queuedPrompt = inputResult.text;
+            queuedImages = inputResult.images ?? queuedImages;
+          }
+        }
+        if (!preflightReported) {
+          if (!this.cachedSessionIsStreaming(session)) throw new Error('Agent finished before the queued message could be delivered. Please retry.');
+          if (runtimeSession) {
+            queuedClientMessageToken = randomUUID();
+            this.pendingStreamingClientMessages.set(runtimeSession, [...(this.pendingStreamingClientMessages.get(runtimeSession) ?? []), {
+              token: queuedClientMessageToken,
+              behavior: streamingBehavior,
+              clientMessageId: body.clientMessageId,
+              queued: false,
+            }]);
+          }
+          const queueTask = streamingBehavior === 'steer'
+            ? Promise.resolve(session.steer(queuedPrompt, queuedImages.length ? queuedImages : undefined))
+            : Promise.resolve(session.followUp(queuedPrompt, queuedImages.length ? queuedImages : undefined));
+          await setupSupervisor.watch(queueTask, {
+            session,
+            accepted: () => true,
+            settled: () => agentSettled,
+            progress: () => progressGeneration,
+            terminalError: () => terminalSdkError,
+            acceptedIsActivity: true,
+          });
+          releaseStreamingDispatch();
+          if (runtimeSession && queuedClientMessageToken) {
+            const pendingMessages = this.pendingStreamingClientMessages.get(runtimeSession);
+            const pendingMessage = pendingMessages?.find(({ token }) => token === queuedClientMessageToken);
+            if (pendingMessages && pendingMessage && !pendingMessage.queued) {
+              const nextMessages = pendingMessages.filter(({ token }) => token !== queuedClientMessageToken);
+              if (nextMessages.length) this.pendingStreamingClientMessages.set(runtimeSession, nextMessages);
+              else this.pendingStreamingClientMessages.delete(runtimeSession);
+            }
+          }
+          reportPreflight(true);
+        }
+      } else if (typeof session?.prompt === 'function') {
+        await streamingDispatchReady;
         const promptTask = Promise.resolve().then(() => session.prompt(prompt, {
           source: 'rpc',
-          streamingBehavior,
           images: images.length ? images : undefined,
           preflightResult: (success: boolean) => {
+            if (success) releaseStreamingDispatch();
             if (success && !extensionCommand) reportPreflight(true);
           },
         }));
@@ -581,6 +658,7 @@ export class PiBridge {
         }
         if (!extensionCommand) reportPreflight(true);
       } else if (typeof session?.followUp === 'function') {
+        await streamingDispatchReady;
         await setupSupervisor.watch(Promise.resolve().then(() => session.followUp(prompt, images.length ? images : undefined)), {
           session,
           accepted: () => true,
@@ -593,6 +671,7 @@ export class PiBridge {
           const report = this.recoverRuntimeSession(projectPath, body.sessionId, session, terminalSdkError);
           throw new AgentRuntimeRecoveryError(terminalSdkError, report);
         }
+        releaseStreamingDispatch();
         reportPreflight(true);
       } else {
         throw new Error('Loaded pi SDK session does not expose prompt() or followUp()');
@@ -630,6 +709,12 @@ export class PiBridge {
     } catch (error) {
       clearCommandBusyTimer();
       subscription?.();
+      if (runtimeSession && queuedClientMessageToken) {
+        const pendingMessages = this.pendingStreamingClientMessages.get(runtimeSession);
+        const nextMessages = pendingMessages?.filter(({ token }) => token !== queuedClientMessageToken) ?? [];
+        if (nextMessages.length) this.pendingStreamingClientMessages.set(runtimeSession, nextMessages);
+        else this.pendingStreamingClientMessages.delete(runtimeSession);
+      }
       if (!preflightReported) reportPreflight(false, error);
       if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
       const message = error instanceof Error ? error.message : 'Agent failed';
@@ -643,6 +728,7 @@ export class PiBridge {
       setupSupervisor?.release();
       if (!queuedStreamingPrompt && runtimeSession) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false, session: runtimeSession });
       if (runtimeSession && this.sessionOperationIds.get(runtimeSession) === operationId) this.sessionOperationIds.delete(runtimeSession);
+      releaseStreamingDispatch();
       releaseStreamKeyLock?.();
       markSessionIdle();
     }
@@ -1078,9 +1164,56 @@ export class PiBridge {
         options.onActivityStart?.();
         if (!options.syntheticStartActive?.()) this.broadcast(key, { type: 'agent:start', operationId: options.operationId, sessionId });
       }
-      this.broadcast(key, { type: 'agent:event', operationId: options.operationId, sessionId, data: event });
+      this.broadcast(key, { type: 'agent:event', operationId: options.operationId, sessionId, data: this.agentEventWithClientMessageId(session, event, type) });
       if (options.mirrorLifecycle && type === 'agent_settled' && options.lifecycle) options.lifecycle.finished = true;
     });
+  }
+
+  private agentEventWithClientMessageId(session: object, event: unknown, type: string | undefined) {
+    if (type === 'agent_settled') {
+      this.pendingStreamingClientMessages.delete(session);
+      this.deliveredStreamingClientMessages.delete(session);
+      this.streamingQueueSlots.delete(session);
+      return event;
+    }
+    if (!event || typeof event !== 'object') return event;
+    if (type === 'queue_update') {
+      const record = event as { steering?: unknown; followUp?: unknown };
+      const nextSizes = {
+        steer: Array.isArray(record.steering) ? record.steering.length : 0,
+        followUp: Array.isArray(record.followUp) ? record.followUp.length : 0,
+      };
+      const slots = this.streamingQueueSlots.get(session) ?? { steer: [], followUp: [] };
+      const pendingMessages = this.pendingStreamingClientMessages.get(session) ?? [];
+      const deliveredMessages = this.deliveredStreamingClientMessages.get(session) ?? [];
+      for (const behavior of ['steer', 'followUp'] as const) {
+        while (slots[behavior].length < nextSizes[behavior]) {
+          const pending = pendingMessages.find((message) => message.behavior === behavior && !message.queued);
+          if (pending) pending.queued = true;
+          slots[behavior].push(pending);
+        }
+        while (slots[behavior].length > nextSizes[behavior]) {
+          const delivered = slots[behavior].shift();
+          if (!delivered) continue;
+          deliveredMessages.push(delivered);
+          const index = pendingMessages.findIndex(({ token }) => token === delivered.token);
+          if (index !== -1) pendingMessages.splice(index, 1);
+        }
+      }
+      if (pendingMessages.length) this.pendingStreamingClientMessages.set(session, pendingMessages);
+      else this.pendingStreamingClientMessages.delete(session);
+      if (deliveredMessages.length) this.deliveredStreamingClientMessages.set(session, deliveredMessages);
+      this.streamingQueueSlots.set(session, slots);
+      return event;
+    }
+    if (type !== 'message_start') return event;
+    const message = (event as { message?: unknown }).message;
+    if (!message || typeof message !== 'object' || (message as { role?: unknown }).role !== 'user') return event;
+    const deliveredMessages = this.deliveredStreamingClientMessages.get(session);
+    const deliveredMessage = deliveredMessages?.shift();
+    if (!deliveredMessage) return event;
+    if (!deliveredMessages?.length) this.deliveredStreamingClientMessages.delete(session);
+    return deliveredMessage.clientMessageId ? { ...event, clientMessageId: deliveredMessage.clientMessageId } : event;
   }
 
   private isExtensionCommandPrompt(session: any, prompt: string) {
@@ -2337,6 +2470,7 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
   app.post<{ Params: { projectId: string }; Body: PromptBody }>('/api/projects/:projectId/agent/prompt', async (request, reply) => {
     if (!request.body?.prompt?.trim()) return reply.code(400).send({ error: 'Missing prompt' });
     if (request.body.streamingBehavior && request.body.streamingBehavior !== 'steer' && request.body.streamingBehavior !== 'followUp') return reply.code(400).send({ error: 'Invalid streaming behavior' });
+    if (request.body.clientMessageId !== undefined && (typeof request.body.clientMessageId !== 'string' || !request.body.clientMessageId || request.body.clientMessageId.length > 200 || request.body.streamingBehavior !== 'steer')) return reply.code(400).send({ error: 'Invalid client message id' });
     if (request.body.streamingBehavior && (request.body.treeTargetId || request.body.treeSummary || 'branchFromId' in request.body)) return reply.code(400).send({ error: 'Streaming behavior cannot be combined with tree navigation or branching' });
     try {
       const project = registry.get(request.params.projectId);
