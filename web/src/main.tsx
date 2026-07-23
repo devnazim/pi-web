@@ -9397,7 +9397,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
                 <Show when={selected()} fallback={<div class="min-w-0 break-all text-sm font-medium">{gitFileDisplayPath(selectedStatus())}</div>}>
                   <button class="min-w-0 break-all text-left text-sm font-medium hover:underline" onClick={() => setReviewPreviewPath(selected()!.path)}>{gitFileDisplayPath(selectedStatus())}</button>
                   <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Open file" onClick={() => setReviewPreviewPath(selected()!.path)}><ExternalLink class="size-3.5" /></button>
-                  <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Copy file name" aria-label={`Copy file name ${selected()!.path.split('/').at(-1) ?? selected()!.path}`} onClick={() => void copyText(selected()!.path.split('/').at(-1) ?? selected()!.path)}><Copy class="size-3.5" /></button>
+                  <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Copy relative path" aria-label={`Copy relative path ${selected()!.path}`} onClick={() => void copyText(selected()!.path)}><Copy class="size-3.5" /></button>
                 </Show>
               </div>
               <div class="text-xs text-muted-foreground">{selected() ? (selected()?.staged ? 'Staged changes' : 'Working tree changes') : 'No preview open'}<Show when={selectedStatus()}> · {selectedStatus()?.status}</Show></div>
