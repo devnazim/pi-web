@@ -144,7 +144,7 @@ type ReviewThread = {
   updatedAt?: string;
   messages: ReviewMessage[];
 };
-type ReviewThreadsResponse = { revision: number; threads: ReviewThread[] };
+type ReviewThreadsResponse = { revision: number; threads: ReviewThread[]; thread?: ReviewThread; deletedThread?: { id: string } };
 type ReviewNoteDraft = ReviewLineRange & { path: string; staged: boolean; body: string; sessionId: string; selectedText: string; contextBefore: string[]; contextAfter: string[] };
 type GitStatus = { branch: string; files: GitFile[] };
 type ReviewEditorKind = 'diff' | 'patch';
@@ -320,6 +320,8 @@ const THINKING_LEVEL_VALUE_OPTIONS: SelectOption[] = [
 ];
 const COMPOSER_MIN_LINES = 2;
 const COMPOSER_MAX_LINES = 7;
+const REVIEW_TEXTAREA_MAX_LINES = 14;
+const PI_WEB_AGENT_SELECTABLE_COMMAND_NAMES = new Set(['pi-web-review', 'pi-web-notes']);
 const CHAT_SEARCH_DEBOUNCE_MS = 200;
 const FILE_SEARCH_DEBOUNCE_MS = 250;
 const SETTINGS_CACHE_STALE_TIME_MS = 60_000;
@@ -429,6 +431,7 @@ const REVIEW_SOURCE_CONTROL_RESIZE_KEY_STEP = 24;
 const REVIEW_EDITOR_SCROLL_BEYOND_LAST_COLUMN = 24;
 const REVIEW_CONTEXT_LINE_COUNT = 3;
 let reviewEditorModelSequence = 0;
+let reviewTextareaSequence = 0;
 const RECENT_PROJECTS_KEY = 'pi-web-recent-projects';
 const RECENT_FILES_KEY_PREFIX = 'pi-web-recent-files:';
 const fileExplorerPaths = new Map<string, string>();
@@ -5098,7 +5101,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
             }
           >
             <Show when={project()} keyed>
-              {(reviewProject) => <ReviewWorkspace project={reviewProject} sessionId={props.sessionId} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} onClose={props.onClosePanel} />}
+              {(reviewProject) => <ReviewWorkspace project={reviewProject} sessionId={props.sessionId} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} agentRunning={props.liveActivity.running} onClose={props.onClosePanel} />}
             </Show>
           </Show>
         )}
@@ -6865,7 +6868,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           prompt,
           attachments,
           mirrorActiveStream,
-          agent: submittedAgentExplicit && !steeringSubmit && (!extensionCommand || composerSlashCommandName(prompt) === 'pi-web-review') ? submittedAgent : undefined,
+          agent: submittedAgentExplicit && !steeringSubmit && (!extensionCommand || PI_WEB_AGENT_SELECTABLE_COMMAND_NAMES.has(composerSlashCommandName(prompt) ?? '')) ? submittedAgent : undefined,
           model: submittedModelExplicit ? submittedModel || submittedDefaultModel : shouldUseAgentModel ? undefined : submittedModel || submittedDefaultModel,
           thinking: submittedThinkingExplicit || !shouldUseAgentThinking ? promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel) : undefined,
           streamingBehavior: steeringSubmit && !extensionCommand ? 'steer' : undefined,
@@ -8697,7 +8700,7 @@ function GitCommitDialog(props: { stagedCount: number; busy: boolean; error: str
   );
 }
 
-function ReviewWorkspace(props: { project: Project; sessionId?: string; state: ReviewWorkspaceState; themeMode: ResolvedThemeMode; onClose: () => void }) {
+function ReviewWorkspace(props: { project: Project; sessionId?: string; state: ReviewWorkspaceState; themeMode: ResolvedThemeMode; agentRunning: boolean; onClose: () => void }) {
   let reviewSplitRef: HTMLDivElement | undefined;
   let fileListRef: HTMLDivElement | undefined;
   const sourceControlPanel = createResizableDimension({
@@ -8730,6 +8733,9 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   const notesVisible = createMemo(() => notesFilter() !== 'hidden');
   const [reviewNoteError, setReviewNoteError] = createSignal('');
   const [reviewNoteBusy, setReviewNoteBusy] = createSignal('');
+  const [reviewAgentBusy, setReviewAgentBusy] = createSignal('');
+  const reviewBusyAction = createMemo(() => reviewAgentBusy() || reviewNoteBusy() || (props.agentRunning ? 'agent' : ''));
+  let reviewAgentWasRunning = props.agentRunning;
   const [newDrafts, setNewDrafts] = createSignal(props.state.reviewDrafts);
   const [replyDrafts, setReplyDrafts] = createSignal(props.state.reviewReplyDrafts);
   const [editDrafts, setEditDrafts] = createSignal(props.state.reviewEditDrafts);
@@ -8753,6 +8759,14 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   }));
   const [diffRefreshToken, setDiffRefreshToken] = createSignal(0);
   const [fileDiffState, setFileDiffState] = createSignal<ReviewFileDiffState>({ key: '', loading: false });
+  createEffect(() => {
+    const running = props.agentRunning;
+    const finished = reviewAgentWasRunning && !running;
+    reviewAgentWasRunning = running;
+    if (!finished) return;
+    if (selected()) refreshSelectedDiff({ force: true });
+    if (props.sessionId) void reviewThreads.refetch();
+  });
   const stagedFiles = createMemo(() => (status.data?.status.files ?? []).filter((file) => file.staged));
   const unstagedFiles = createMemo(() => (status.data?.status.files ?? []).filter((file) => file.unstaged));
   const canCommit = createMemo(() => stagedFiles().length > 0 && !commitBusy());
@@ -8976,27 +8990,28 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   }
 
   async function mutateReviewNotes(actionKey: string, path: string, init: RequestInit, onSuccess?: (result: ReviewThreadsResponse) => void) {
+    const projectId = props.project.id;
     const sessionId = props.sessionId;
-    if (!sessionId || reviewThreads.data?.revision === undefined || reviewNoteBusy()) return false;
+    if (!sessionId || reviewThreads.data?.revision === undefined || reviewNoteBusy()) return undefined;
     setReviewNoteBusy(actionKey);
     setReviewNoteError('');
-    const queryKey = ['review-threads', props.project.id, sessionId] as const;
+    const queryKey = ['review-threads', projectId, sessionId] as const;
     try {
       await queryClient.cancelQueries({ queryKey, exact: true }).catch(() => undefined);
-      const result = await api<ReviewThreadsResponse>(`/api/projects/${props.project.id}/review-threads${path}?sessionId=${encodeURIComponent(sessionId)}`, init);
+      const result = await api<ReviewThreadsResponse>(`/api/projects/${projectId}/review-threads${path}?sessionId=${encodeURIComponent(sessionId)}`, init);
       await queryClient.cancelQueries({ queryKey, exact: true }).catch(() => undefined);
       onSuccess?.(result);
       queryClient.setQueryData<ReviewThreadsResponse>(queryKey, (current) => !current || current.revision <= result.revision ? result : current);
-      return true;
+      return result;
     } catch (error) {
       if ((error as { status?: number }).status === 409) {
         if (props.sessionId === sessionId) await reviewThreads.refetch().catch(() => undefined);
-        else await queryClient.invalidateQueries({ queryKey: ['review-threads', props.project.id, sessionId] }).catch(() => undefined);
+        else await queryClient.invalidateQueries({ queryKey: ['review-threads', projectId, sessionId] }).catch(() => undefined);
         if (props.sessionId === sessionId) setReviewNoteError(errorMessage(error, 'Review notes changed. Retry your action.'));
       } else if (props.sessionId === sessionId) {
         setReviewNoteError(errorMessage(error, 'Could not update review note'));
       }
-      return false;
+      return undefined;
     } finally {
       setReviewNoteBusy('');
     }
@@ -9004,7 +9019,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
 
   async function createReviewThread() {
     const draft = currentDraft();
-    if (!draft || !draft.body.trim()) return;
+    if (!draft || !draft.body.trim()) return undefined;
     const draftKey = `${draft.sessionId}:${draft.staged ? 'staged' : 'worktree'}:${draft.path}`;
     const clearSubmittedDraft = () => setNewDrafts((drafts) => {
       if (drafts[draftKey]?.body !== draft.body) return drafts;
@@ -9012,7 +9027,8 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
       delete next[draftKey];
       return next;
     });
-    const duplicate = reviewThreads.data?.threads.some((thread) => thread.anchor.path === draft.path
+    const duplicate = reviewThreads.data?.threads.find((thread) => thread.status === 'open'
+      && thread.anchor.path === draft.path
       && (thread.anchor.staged === true) === draft.staged
       && thread.anchor.startLine === draft.startLine
       && thread.anchor.endLine === draft.endLine
@@ -9024,16 +9040,16 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
       && thread.messages[0].body === draft.body.trim());
     if (duplicate) {
       clearSubmittedDraft();
-      return;
+      return duplicate.id;
     }
     const snapshot = selectedReviewSnapshot(draft);
     if (snapshot.selectedText !== draft.selectedText
       || snapshot.contextBefore.join('\n') !== draft.contextBefore.join('\n')
       || snapshot.contextAfter.join('\n') !== draft.contextAfter.join('\n')) {
       setReviewNoteError('The selected lines or their surrounding context changed. Cancel this draft and select them again.');
-      return;
+      return undefined;
     }
-    await mutateReviewNotes('create', '', {
+    const result = await mutateReviewNotes('create', '', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -9050,18 +9066,82 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
         body: draft.body.trim(),
       }),
     }, clearSubmittedDraft);
+    return result?.thread?.id;
   }
 
-  async function replyToReviewThread(threadId: string) {
-    const draft = replyDrafts()[threadId] ?? '';
-    const body = draft.trim();
-    if (!body) return;
-    const succeeded = await mutateReviewNotes(`reply:${threadId}`, `/${threadId}/messages`, {
+  async function replyToReviewThread(threadId: string, submittedDraft = replyDrafts()[threadId] ?? '') {
+    const body = submittedDraft.trim();
+    if (!body) return false;
+    const result = await mutateReviewNotes(`reply:${threadId}`, `/${threadId}/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ expectedRevision: reviewThreads.data?.revision, body }),
     });
-    if (succeeded) setReplyDrafts((drafts) => drafts[threadId] === draft ? { ...drafts, [threadId]: '' } : drafts);
+    if (result) setReplyDrafts((drafts) => drafts[threadId] === submittedDraft ? { ...drafts, [threadId]: '' } : drafts);
+    return Boolean(result);
+  }
+
+  async function promptAgentAboutReviewThread(projectId: string, sessionId: string, threadId: string, noteSaved: boolean) {
+    const controls = readSessionComposerControls(projectId, sessionId);
+    const needsDefaultSettings = Boolean(controls && (('model' in controls && !controls.model) || ('thinking' in controls && !controls.thinking)));
+    try {
+      const effectiveSettings = settings.data?.effective ?? (needsDefaultSettings
+        ? (await queryClient.fetchQuery({
+          queryKey: ['settings', projectId],
+          queryFn: () => api<PiSettingsResponse>(`/api/projects/${projectId}/settings`),
+          staleTime: SETTINGS_CACHE_STALE_TIME_MS,
+        })).effective
+        : undefined);
+      await api(`/api/projects/${projectId}/agent/prompt`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sessionId,
+          prompt: `/pi-web-notes ${threadId}`,
+          mirrorActiveStream: false,
+          ...(controls && 'agent' in controls ? { agent: controls.agent ?? '' } : {}),
+          ...(controls && 'model' in controls ? { model: controls.model || defaultModelReference(effectiveSettings) } : {}),
+          ...(controls && 'thinking' in controls ? { thinking: controls.thinking || effectiveSettings?.defaultThinkingLevel || 'medium' } : {}),
+        }),
+      });
+      return true;
+    } catch (error) {
+      if (props.project.id === projectId && props.sessionId === sessionId) {
+        setReviewNoteError(errorMessage(error, noteSaved ? 'Note saved, but the agent could not be asked. Use Ask agent to retry.' : 'Could not ask the agent about this note.'));
+      }
+      return false;
+    }
+  }
+
+  async function createReviewThreadAndAsk() {
+    const projectId = props.project.id;
+    const sessionId = props.sessionId;
+    if (!sessionId || props.agentRunning || reviewAgentBusy() || reviewNoteBusy()) return;
+    const actionKey = 'ask:create';
+    setReviewAgentBusy(actionKey);
+    setReviewNoteError('');
+    try {
+      const threadId = await createReviewThread();
+      if (threadId) await promptAgentAboutReviewThread(projectId, sessionId, threadId, true);
+    } finally {
+      setReviewAgentBusy((current) => current === actionKey ? '' : current);
+    }
+  }
+
+  async function askAgentAboutReviewThread(threadId: string) {
+    const projectId = props.project.id;
+    const sessionId = props.sessionId;
+    if (!sessionId || props.agentRunning || reviewAgentBusy() || reviewNoteBusy()) return;
+    const actionKey = `ask:${threadId}`;
+    const draft = replyDrafts()[threadId] ?? '';
+    setReviewAgentBusy(actionKey);
+    setReviewNoteError('');
+    try {
+      if (draft.trim() && !await replyToReviewThread(threadId, draft)) return;
+      await promptAgentAboutReviewThread(projectId, sessionId, threadId, Boolean(draft.trim()));
+    } finally {
+      setReviewAgentBusy((current) => current === actionKey ? '' : current);
+    }
   }
 
   async function editReviewMessage(threadId: string, messageId: string) {
@@ -9371,6 +9451,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
                 <Show when={selected()} fallback={<div class="min-w-0 break-all text-sm font-medium">{gitFileDisplayPath(selectedStatus())}</div>}>
                   <button class="min-w-0 break-all text-left text-sm font-medium hover:underline" onClick={() => setReviewPreviewPath(selected()!.path)}>{gitFileDisplayPath(selectedStatus())}</button>
                   <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Open file" onClick={() => setReviewPreviewPath(selected()!.path)}><ExternalLink class="size-3.5" /></button>
+                  <button class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground" title="Copy file name" aria-label={`Copy file name ${selected()!.path.split('/').at(-1) ?? selected()!.path}`} onClick={() => void copyText(selected()!.path.split('/').at(-1) ?? selected()!.path)}><Copy class="size-3.5" /></button>
                 </Show>
               </div>
               <div class="text-xs text-muted-foreground">{selected() ? (selected()?.staged ? 'Staged changes' : 'Working tree changes') : 'No preview open'}<Show when={selectedStatus()}> · {selectedStatus()?.status}</Show></div>
@@ -9401,7 +9482,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
           </div>
         </Show>
         <Show when={notesVisible() && props.sessionId && reviewThreads.error}><div class="review-note-notice review-note-notice-error">{errorMessage(reviewThreads.error, 'Could not load review notes')}</div></Show>
-        <Show when={notesVisible() && reviewNoteError()}><div class="review-note-notice review-note-notice-error">{reviewNoteError()}</div></Show>
+        <Show when={notesVisible() && reviewNoteError()}><div class="review-note-notice review-note-notice-error" role="alert">{reviewNoteError()}</div></Show>
         </div>
         <div class="review-preview-body">
         <div class="review-unanchored-slot">
@@ -9427,17 +9508,19 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
                       <For each={group.threads}>
                         {(thread) => (
                           <ReviewThreadCard
+                            projectId={props.project.id}
                             thread={thread}
                             contextLabel={`${thread.anchor.path}, ${thread.anchor.startLine === thread.anchor.endLine ? `line ${thread.anchor.startLine}` : `lines ${thread.anchor.startLine}–${thread.anchor.endLine}`}`}
                             showContext
                             collapsed={Boolean(collapsedThreads()[thread.id])}
-                            busyAction={reviewNoteBusy()}
+                            busyAction={reviewBusyAction()}
                             replyDraft={replyDrafts()[thread.id] ?? ''}
                             editDrafts={editDrafts()}
                             syntaxTheme={syntaxTheme()}
                             onToggle={() => setCollapsedThreads((threads) => ({ ...threads, [thread.id]: !threads[thread.id] }))}
                             onReplyDraft={(body) => setReplyDrafts((drafts) => ({ ...drafts, [thread.id]: body }))}
                             onReply={() => void replyToReviewThread(thread.id)}
+                            onAsk={() => void askAgentAboutReviewThread(thread.id)}
                             onStartEdit={(message) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${message.id}`]: message.body }))}
                             onEditDraft={(messageId, body) => setEditDrafts((drafts) => ({ ...drafts, [`${thread.id}:${messageId}`]: body }))}
                             onCancelEdit={(messageId) => setEditDrafts((drafts) => { const next = { ...drafts }; delete next[`${thread.id}:${messageId}`]; return next; })}
@@ -9466,6 +9549,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
               }
             >
               <ReviewFileDiffPreview
+                projectId={props.project.id}
                 selection={selection}
                 diff={selectedDiff()!}
                 themeMode={props.themeMode}
@@ -9477,7 +9561,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
                 notesVisible={notesVisible()}
                 canCreateNotes={Boolean(props.sessionId && reviewThreads.data)}
                 draft={currentDraft()}
-                busyAction={reviewNoteBusy()}
+                busyAction={reviewBusyAction()}
                 collapsedThreads={collapsedThreads()}
                 replyDrafts={replyDrafts()}
                 editDrafts={editDrafts()}
@@ -9485,9 +9569,11 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
                 onDraftBody={updateNewReviewDraft}
                 onCancelDraft={() => setNewReviewDraft()}
                 onCreateThread={() => void createReviewThread()}
+                onAskDraft={() => void createReviewThreadAndAsk()}
                 onToggleThread={(threadId) => setCollapsedThreads((threads) => ({ ...threads, [threadId]: !threads[threadId] }))}
                 onReplyDraft={(threadId, body) => setReplyDrafts((drafts) => ({ ...drafts, [threadId]: body }))}
                 onReply={(threadId) => void replyToReviewThread(threadId)}
+                onAskThread={(threadId) => void askAgentAboutReviewThread(threadId)}
                 onStartEdit={(threadId, message) => setEditDrafts((drafts) => ({ ...drafts, [`${threadId}:${message.id}`]: message.body }))}
                 onEditDraft={(threadId, messageId, body) => setEditDrafts((drafts) => ({ ...drafts, [`${threadId}:${messageId}`]: body }))}
                 onCancelEdit={(threadId, messageId) => setEditDrafts((drafts) => { const next = { ...drafts }; delete next[`${threadId}:${messageId}`]; return next; })}
@@ -9545,6 +9631,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
 }
 
 function ReviewFileDiffPreview(props: {
+  projectId: string;
   selection: GitFileSelection;
   diff: GitFileDiff;
   themeMode: ResolvedThemeMode;
@@ -9564,9 +9651,11 @@ function ReviewFileDiffPreview(props: {
   onDraftBody: (body: string) => void;
   onCancelDraft: () => void;
   onCreateThread: () => void;
+  onAskDraft: () => void;
   onToggleThread: (threadId: string) => void;
   onReplyDraft: (threadId: string, body: string) => void;
   onReply: (threadId: string) => void;
+  onAskThread: (threadId: string) => void;
   onStartEdit: (threadId: string, message: ReviewMessage) => void;
   onEditDraft: (threadId: string, messageId: string, body: string) => void;
   onCancelEdit: (threadId: string, messageId: string) => void;
@@ -9584,6 +9673,7 @@ function ReviewFileDiffPreview(props: {
         when={props.diff.patch}
         fallback={
           <ReviewDiffEditor
+            projectId={props.projectId}
             path={props.diff.path}
             original={props.diff.original}
             modified={props.diff.modified}
@@ -9607,9 +9697,11 @@ function ReviewFileDiffPreview(props: {
             onDraftBody={props.onDraftBody}
             onCancelDraft={props.onCancelDraft}
             onCreateThread={props.onCreateThread}
+            onAskDraft={props.onAskDraft}
             onToggleThread={props.onToggleThread}
             onReplyDraft={props.onReplyDraft}
             onReply={props.onReply}
+            onAskThread={props.onAskThread}
             onStartEdit={props.onStartEdit}
             onEditDraft={props.onEditDraft}
             onCancelEdit={props.onCancelEdit}
@@ -9682,7 +9774,173 @@ function reviewMessageTime(value?: string) {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString();
 }
 
+function ReviewTextarea(props: { projectId: string; value: string; ariaLabel: string; placeholder?: string; autofocus?: boolean; onValue: (value: string) => void }) {
+  let rootRef: HTMLDivElement | undefined;
+  let textareaRef: HTMLTextAreaElement | undefined;
+  const listboxId = `review-file-mentions-${reviewTextareaSequence += 1}`;
+  const [mention, setMention] = createSignal<FileMention>();
+  const [searchQuery, setSearchQuery] = createSignal<string>();
+  const [highlightedIndex, setHighlightedIndex] = createSignal(0);
+  const searchPending = createMemo(() => Boolean(mention() && searchQuery() !== mention()?.query));
+  const fileSearch = createQuery(() => ({
+    queryKey: ['file-search', props.projectId, searchQuery() ?? ''],
+    queryFn: ({ signal }) => api<{ files: ProjectFileSearchEntry[] }>(`/api/projects/${props.projectId}/files/search?query=${encodeURIComponent(searchQuery() ?? '')}`, { signal }),
+    enabled: Boolean(mention() && searchQuery() !== undefined && !searchPending()),
+    staleTime: 0,
+  }));
+  const files = createMemo(() => searchPending() ? [] : fileSearch.data?.files ?? []);
+  const activeOptionId = createMemo(() => mention() && files()[highlightedIndex()] ? `${listboxId}-option-${highlightedIndex()}` : undefined);
+
+  function syncHeight() {
+    const target = textareaRef;
+    if (!target) return;
+    const style = window.getComputedStyle(target);
+    const lineHeight = Number.parseFloat(style.lineHeight);
+    const verticalPadding = (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0);
+    const verticalBorder = (Number.parseFloat(style.borderTopWidth) || 0) + (Number.parseFloat(style.borderBottomWidth) || 0);
+    const maxHeight = (Number.isFinite(lineHeight) ? lineHeight : 20) * REVIEW_TEXTAREA_MAX_LINES + verticalPadding + verticalBorder;
+    const scrollTop = target.scrollTop;
+    target.style.height = 'auto';
+    const contentHeight = target.scrollHeight + verticalBorder;
+    target.style.height = `${Math.min(contentHeight, maxHeight)}px`;
+    target.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
+    target.scrollTop = Math.min(scrollTop, Math.max(target.scrollHeight - target.clientHeight, 0));
+  }
+
+  function updateMention(target: HTMLTextAreaElement) {
+    setMention(activeFileMention(target.value, textareaActivePosition(target)));
+  }
+
+  function selectMention(file: ProjectFileSearchEntry) {
+    const active = mention();
+    if (!active) return;
+    const suffix = props.value.slice(active.end);
+    const reference = formatComposerFileReference(file.path, active.quoted);
+    const insert = `${reference}${suffix.startsWith(' ') || suffix.startsWith('\n') ? '' : ' '}`;
+    const nextValue = `${props.value.slice(0, active.start)}${insert}${suffix}`;
+    const cursor = active.start + insert.length;
+    props.onValue(nextValue);
+    setMention(undefined);
+    requestAnimationFrame(() => {
+      textareaRef?.focus();
+      textareaRef?.setSelectionRange(cursor, cursor);
+      syncHeight();
+    });
+  }
+
+  function handleKeyDown(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
+    if (event.isComposing || !mention()) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      setMention(undefined);
+      return;
+    }
+    const options = files();
+    if (!options.length) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setHighlightedIndex((index) => Math.min(index + 1, Math.max(options.length - 1, 0)));
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setHighlightedIndex((index) => Math.max(index - 1, 0));
+      return;
+    }
+    if (event.key === 'Enter' || event.key === 'Tab') {
+      event.preventDefault();
+      const file = options[highlightedIndex()];
+      if (file) selectMention(file);
+    }
+  }
+
+  function handleWheel(event: WheelEvent & { currentTarget: HTMLTextAreaElement }) {
+    const target = event.currentTarget;
+    if (target.scrollHeight <= target.clientHeight + 1) return;
+    const canScrollUp = event.deltaY < 0 && target.scrollTop > 0;
+    const canScrollDown = event.deltaY > 0 && target.scrollTop + target.clientHeight < target.scrollHeight - 1;
+    if (canScrollUp || canScrollDown) event.stopPropagation();
+  }
+
+  createEffect(() => {
+    const active = mention();
+    setHighlightedIndex(0);
+    if (!active) {
+      setSearchQuery(undefined);
+      return;
+    }
+    const timeout = window.setTimeout(() => setSearchQuery(active.query), FILE_SEARCH_DEBOUNCE_MS);
+    onCleanup(() => window.clearTimeout(timeout));
+  });
+
+  createEffect(() => {
+    props.value;
+    queueMicrotask(syncHeight);
+  });
+
+  onMount(() => queueMicrotask(() => {
+    syncHeight();
+    if (props.autofocus) textareaRef?.focus({ preventScroll: true });
+  }));
+
+  return (
+    <div ref={rootRef} class="review-thread-textarea-wrap">
+      <Show when={mention()}>
+        <div id={listboxId} class="review-file-mention-menu" role="listbox" aria-label="Workspace files" aria-busy={searchPending() || fileSearch.isLoading} onWheel={(event) => event.stopPropagation()}>
+          <Show when={!searchPending() && !fileSearch.isLoading} fallback={<div class="px-3 py-2 text-xs text-muted-foreground">Searching files...</div>}>
+            <Show when={files().length > 0} fallback={<div class="px-3 py-2 text-xs text-muted-foreground">No matching files</div>}>
+              <For each={files()}>
+                {(file, index) => (
+                  <button
+                    id={`${listboxId}-option-${index()}`}
+                    type="button"
+                    role="option"
+                    aria-selected={highlightedIndex() === index()}
+                    class={`file-mention-item review-file-mention-item ${highlightedIndex() === index() ? 'file-mention-item-active' : ''}`}
+                    onMouseDown={(event) => { event.preventDefault(); selectMention(file); }}
+                  >
+                    <span class="grid w-7 shrink-0 place-items-center text-muted-foreground"><FileTypeIcon name={file.name} class="size-4" /></span>
+                    <span class="min-w-0 flex-1 truncate text-left">{file.path}</span>
+                  </button>
+                )}
+              </For>
+            </Show>
+          </Show>
+        </div>
+      </Show>
+      <textarea
+        ref={textareaRef}
+        class="review-thread-textarea"
+        aria-label={props.ariaLabel}
+        aria-autocomplete="list"
+        aria-haspopup="listbox"
+        aria-expanded={Boolean(mention())}
+        aria-controls={mention() ? listboxId : undefined}
+        aria-activedescendant={activeOptionId()}
+        value={props.value}
+        placeholder={props.placeholder}
+        rows={1}
+        onInput={(event) => {
+          props.onValue(event.currentTarget.value);
+          updateMention(event.currentTarget);
+          syncHeight();
+        }}
+        onClick={(event) => updateMention(event.currentTarget)}
+        onKeyUp={(event) => {
+          if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateMention(event.currentTarget);
+        }}
+        onKeyDown={handleKeyDown}
+        onWheel={handleWheel}
+        onBlur={() => queueMicrotask(() => {
+          if (!rootRef?.contains(document.activeElement)) setMention(undefined);
+        })}
+      />
+    </div>
+  );
+}
+
 function ReviewThreadCard(props: {
+  projectId: string;
   thread: ReviewThread;
   contextLabel: string;
   showContext?: boolean;
@@ -9694,6 +9952,7 @@ function ReviewThreadCard(props: {
   onToggle: () => void;
   onReplyDraft: (body: string) => void;
   onReply: () => void;
+  onAsk: () => void;
   onStartEdit: (message: ReviewMessage) => void;
   onEditDraft: (messageId: string, body: string) => void;
   onCancelEdit: (messageId: string) => void;
@@ -9725,7 +9984,7 @@ function ReviewThreadCard(props: {
                   <div class="review-thread-message-meta"><strong>{message.author === 'agent' ? 'Agent' : 'You'}</strong><span>{reviewMessageTime(message.updatedAt ?? message.createdAt)}</span></div>
                   <Show when={message.deletedAt} fallback={
                     <Show when={props.editDrafts[editKey] !== undefined} fallback={<MarkdownContent text={message.body} compact syntaxTheme={props.syntaxTheme} />}>
-                      <textarea class="review-thread-textarea" aria-label={`Edit your message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} value={props.editDrafts[editKey]} onInput={(event) => props.onEditDraft(message.id, event.currentTarget.value)} />
+                      <ReviewTextarea projectId={props.projectId} value={props.editDrafts[editKey]} ariaLabel={`Edit your message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} onValue={(body) => props.onEditDraft(message.id, body)} />
                       <div class="review-thread-actions">
                         <button class="review-thread-button" type="button" aria-label={`Save message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} disabled={!props.editDrafts[editKey]?.trim() || Boolean(props.busyAction)} onClick={() => props.onEdit(message.id)}>Save</button>
                         <button class="review-thread-button" type="button" aria-label={`Cancel editing message ${messageIndex() + 1} in review thread on ${props.contextLabel}`} onClick={() => props.onCancelEdit(message.id)}>Cancel</button>
@@ -9744,10 +10003,13 @@ function ReviewThreadCard(props: {
           </For>
         </div>
         <div class="review-thread-reply">
-          <textarea class="review-thread-textarea" aria-label={`Reply to review thread on ${props.contextLabel}`} value={props.replyDraft} placeholder="Reply to thread" onInput={(event) => props.onReplyDraft(event.currentTarget.value)} />
+          <ReviewTextarea projectId={props.projectId} value={props.replyDraft} ariaLabel={`Reply to review thread on ${props.contextLabel}`} placeholder="Reply to thread or ask the agent" onValue={props.onReplyDraft} />
           <div class="review-thread-actions review-thread-actions-between">
             <button class="review-thread-link" type="button" aria-label={`${props.thread.status === 'open' ? 'Resolve' : 'Reopen'} review thread on ${props.contextLabel}`} disabled={Boolean(props.busyAction)} onClick={props.onStatus}>{props.thread.status === 'open' ? 'Resolve thread' : 'Reopen thread'}</button>
-            <button class="review-thread-button" type="button" aria-label={`Reply to review thread on ${props.contextLabel}`} disabled={!props.replyDraft.trim() || Boolean(props.busyAction)} onClick={props.onReply}>Reply</button>
+            <div class="review-thread-action-group">
+              <button class="review-thread-button" type="button" aria-label={`Reply to review thread on ${props.contextLabel}`} disabled={!props.replyDraft.trim() || Boolean(props.busyAction)} onClick={props.onReply}>Reply</button>
+              <button class="review-thread-button review-thread-button-primary" type="button" aria-label={`Ask agent about review thread on ${props.contextLabel}`} disabled={Boolean(props.busyAction) || (props.thread.status === 'resolved' && !props.replyDraft.trim())} onClick={props.onAsk}>Ask agent</button>
+            </div>
           </div>
         </div>
       </Show>
@@ -9755,23 +10017,25 @@ function ReviewThreadCard(props: {
   );
 }
 
-function ReviewDraftCard(props: { draft: ReviewNoteDraft; busy: boolean; onBody: (body: string) => void; onCancel: () => void; onSubmit: () => void }) {
-  let textareaRef: HTMLTextAreaElement | undefined;
+function ReviewDraftCard(props: { projectId: string; draft: ReviewNoteDraft; busy: boolean; onBody: (body: string) => void; onCancel: () => void; onSubmit: () => void; onAsk: () => void }) {
   const contextLabel = () => `${props.draft.path}, ${props.draft.startLine === props.draft.endLine ? `line ${props.draft.startLine}` : `lines ${props.draft.startLine}–${props.draft.endLine}`}`;
-  onMount(() => queueMicrotask(() => textareaRef?.focus({ preventScroll: true })));
   return (
     <div class="review-thread-card review-draft-card">
       <div class="review-draft-title">New note on {props.draft.startLine === props.draft.endLine ? `line ${props.draft.startLine}` : `lines ${props.draft.startLine}–${props.draft.endLine}`}</div>
-      <textarea ref={textareaRef} class="review-thread-textarea" aria-label={`New review note on ${contextLabel()}`} value={props.draft.body} placeholder="Leave a review note" onInput={(event) => props.onBody(event.currentTarget.value)} />
-      <div class="review-thread-actions">
+      <ReviewTextarea projectId={props.projectId} value={props.draft.body} ariaLabel={`New review note on ${contextLabel()}`} placeholder="Leave a review note" autofocus onValue={props.onBody} />
+      <div class="review-thread-actions review-thread-actions-between">
         <button class="review-thread-button" type="button" aria-label={`Cancel new review note on ${contextLabel()}`} onClick={props.onCancel}>Cancel</button>
-        <button class="review-thread-button review-thread-button-primary" type="button" aria-label={`Add review note on ${contextLabel()}`} disabled={!props.draft.body.trim() || props.busy} onClick={props.onSubmit}>Add note</button>
+        <div class="review-thread-action-group">
+          <button class="review-thread-button" type="button" aria-label={`Add review note on ${contextLabel()}`} disabled={!props.draft.body.trim() || props.busy} onClick={props.onSubmit}>Add note</button>
+          <button class="review-thread-button review-thread-button-primary" type="button" aria-label={`Add review note and ask agent on ${contextLabel()}`} disabled={!props.draft.body.trim() || props.busy} onClick={props.onAsk}>Ask agent</button>
+        </div>
       </div>
     </div>
   );
 }
 
 type ReviewDiffEditorProps = {
+  projectId: string;
   path: string;
   original: string;
   modified: string;
@@ -9795,9 +10059,11 @@ type ReviewDiffEditorProps = {
   onDraftBody: (body: string) => void;
   onCancelDraft: () => void;
   onCreateThread: () => void;
+  onAskDraft: () => void;
   onToggleThread: (threadId: string) => void;
   onReplyDraft: (threadId: string, body: string) => void;
   onReply: (threadId: string) => void;
+  onAskThread: (threadId: string) => void;
   onStartEdit: (threadId: string, message: ReviewMessage) => void;
   onEditDraft: (threadId: string, messageId: string, body: string) => void;
   onCancelEdit: (threadId: string, messageId: string) => void;
@@ -9829,6 +10095,8 @@ function ReviewDiffEditor(props: ReviewDiffEditorProps) {
   const draftZones: NoteZoneGroup = { zoneIds: [], rootDisposers: [], resizeObservers: [] };
   let addNoteHost: HTMLButtonElement | undefined;
   let addNoteWidget: import('monaco-editor').editor.IContentWidget | undefined;
+  let addNoteScrollListener: import('monaco-editor').IDisposable | undefined;
+  let addNoteLayoutListener: import('monaco-editor').IDisposable | undefined;
   let addNoteRange: ReviewLineRange = { startLine: 1, endLine: 1 };
   let addNotePointerSnapshot: AddNotePointerSnapshot | undefined;
   const [sideBySide, setSideBySide] = createSignal(true);
@@ -9866,10 +10134,20 @@ function ReviewDiffEditor(props: ReviewDiffEditorProps) {
   }
 
   function disposeAddNoteWidget() {
+    addNoteScrollListener?.dispose();
+    addNoteLayoutListener?.dispose();
+    addNoteScrollListener = undefined;
+    addNoteLayoutListener = undefined;
     if (addNoteWidget) editor?.getModifiedEditor().removeContentWidget(addNoteWidget);
     addNoteHost = undefined;
     addNoteWidget = undefined;
     addNotePointerSnapshot = undefined;
+  }
+
+  function syncAddNoteHorizontalPosition() {
+    const modifiedEditor = editor?.getModifiedEditor();
+    if (!modifiedEditor || !addNoteHost) return;
+    addNoteHost.style.transform = `translateX(${modifiedEditor.getScrollLeft()}px)`;
   }
 
   function disposeNoteUi() {
@@ -9953,6 +10231,7 @@ function ReviewDiffEditor(props: ReviewDiffEditorProps) {
       });
       addReviewZone(threadZones, thread.anchor.endLine, (host) => render(() => (
         <ReviewThreadCard
+          projectId={props.projectId}
           thread={thread}
           contextLabel={`${thread.anchor.path}, ${thread.anchor.startLine === thread.anchor.endLine ? `line ${thread.anchor.startLine}` : `lines ${thread.anchor.startLine}–${thread.anchor.endLine}`}`}
           collapsed={Boolean(props.collapsedThreads[thread.id])}
@@ -9963,6 +10242,7 @@ function ReviewDiffEditor(props: ReviewDiffEditorProps) {
           onToggle={() => props.onToggleThread(thread.id)}
           onReplyDraft={(body) => props.onReplyDraft(thread.id, body)}
           onReply={() => props.onReply(thread.id)}
+          onAsk={() => props.onAskThread(thread.id)}
           onStartEdit={(message) => props.onStartEdit(thread.id, message)}
           onEditDraft={(messageId, body) => props.onEditDraft(thread.id, messageId, body)}
           onCancelEdit={(messageId) => props.onCancelEdit(thread.id, messageId)}
@@ -9990,7 +10270,7 @@ function ReviewDiffEditor(props: ReviewDiffEditorProps) {
       }]);
       addReviewZone(draftZones, props.draft.endLine, (host) => render(() => (
         <Show when={props.draft?.path === props.path ? props.draft : undefined}>
-          {(draft) => <ReviewDraftCard draft={draft()} busy={Boolean(props.busyAction)} onBody={props.onDraftBody} onCancel={props.onCancelDraft} onSubmit={props.onCreateThread} />}
+          {(draft) => <ReviewDraftCard projectId={props.projectId} draft={draft()} busy={Boolean(props.busyAction)} onBody={props.onDraftBody} onCancel={props.onCancelDraft} onSubmit={props.onCreateThread} onAsk={props.onAskDraft} />}
         </Show>
       ), host));
     }
@@ -10059,12 +10339,21 @@ function ReviewDiffEditor(props: ReviewDiffEditorProps) {
       addNoteHost = host;
       addNoteWidget = widget;
       modifiedEditor.addContentWidget(widget);
+      addNoteScrollListener = modifiedEditor.onDidScrollChange((event) => {
+        if (event.scrollLeftChanged) syncAddNoteHorizontalPosition();
+      });
+      addNoteLayoutListener = modifiedEditor.onDidLayoutChange(() => {
+        if (addNoteWidget) modifiedEditor.layoutContentWidget(addNoteWidget);
+        syncAddNoteHorizontalPosition();
+      });
+      syncAddNoteHorizontalPosition();
     }
 
     const rangeLabel = addNoteRange.startLine === addNoteRange.endLine ? `line ${addNoteRange.startLine}` : `lines ${addNoteRange.startLine}–${addNoteRange.endLine}`;
     addNoteHost.title = `Add note on ${rangeLabel}`;
     addNoteHost.setAttribute('aria-label', `Add review note on ${props.path}, ${rangeLabel}`);
     modifiedEditor.layoutContentWidget(addNoteWidget);
+    syncAddNoteHorizontalPosition();
   }
 
   function saveViewState() {

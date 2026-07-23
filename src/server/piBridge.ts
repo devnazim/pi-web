@@ -159,6 +159,7 @@ class AgentRuntimeRecoveryError extends Error {
 }
 
 const WEB_BUILTIN_COMMAND_NAMES = new Set(['compact']);
+const PI_WEB_AGENT_SELECTABLE_COMMAND_NAMES = new Set(['pi-web-review', 'pi-web-notes']);
 const AGENT_ALREADY_PROCESSING_MESSAGE = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 const AGENT_RUNTIME_RECOVERY_MESSAGE = 'Agent stopped responding or crashed. Its session runtime was reset. You can retry or continue.';
 const AGENT_ABORT_RECOVERY_MESSAGE = 'Agent did not stop after abort and its session runtime was reset. You can retry or continue.';
@@ -1809,9 +1810,9 @@ export class PiBridge {
   }
 
   private shouldApplySuiteAgentSelection(body: PromptBody, extensionCommand: boolean, queuedStreamingPrompt: boolean, requestedStreamingBehavior: StreamingBehavior | undefined) {
-    const selectsReviewCommandAgent = extensionCommand && slashCommandName(body.prompt) === 'pi-web-review';
+    const selectsPiWebCommandAgent = extensionCommand && PI_WEB_AGENT_SELECTABLE_COMMAND_NAMES.has(slashCommandName(body.prompt) ?? '');
     return Object.prototype.hasOwnProperty.call(body, 'agent')
-      && (!extensionCommand || selectsReviewCommandAgent)
+      && (!extensionCommand || selectsPiWebCommandAgent)
       && !queuedStreamingPrompt
       && !requestedStreamingBehavior;
   }

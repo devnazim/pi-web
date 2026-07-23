@@ -17,12 +17,12 @@ test('binds browser extension UI in RPC mode', async () => {
   assert.equal(bindings?.mode, 'rpc');
 });
 
-test('applies explicit agent selection only before the pi-web review extension command', async () => {
+test('applies explicit agent selection only before Pi Web review extension commands', async () => {
   const bridge = new PiBridge();
   const calls: string[] = [];
   const session = {
     extensionRunner: {
-      getCommand: (name: string) => ['pi-web-review', 'other-extension', 'agent'].includes(name) ? {} : undefined,
+      getCommand: (name: string) => ['pi-web-review', 'pi-web-notes', 'other-extension', 'agent'].includes(name) ? {} : undefined,
     },
     prompt: async (prompt: string) => { calls.push(`prompt:${prompt}`); },
   };
@@ -39,6 +39,11 @@ test('applies explicit agent selection only before the pi-web review extension c
   }, 'project:review-agent-session');
   await bridge.prompt(process.cwd(), {
     sessionId: 'review-agent-session',
+    prompt: '/pi-web-notes thread-1',
+    agent: 'notes',
+  }, 'project:review-agent-session');
+  await bridge.prompt(process.cwd(), {
+    sessionId: 'review-agent-session',
     prompt: '/other-extension',
     agent: 'other',
   }, 'project:review-agent-session');
@@ -51,6 +56,8 @@ test('applies explicit agent selection only before the pi-web review extension c
   assert.deepEqual(calls, [
     'select:reviewer',
     'prompt:/pi-web-review',
+    'select:notes',
+    'prompt:/pi-web-notes thread-1',
     'prompt:/other-extension',
     'prompt:/agent alternate',
   ]);

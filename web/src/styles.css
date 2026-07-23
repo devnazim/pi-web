@@ -2172,8 +2172,24 @@ body {
     @apply text-xs font-semibold text-foreground;
   }
 
+  .review-thread-textarea-wrap {
+    @apply flex min-w-0 flex-col gap-1.5;
+  }
+
   .review-thread-textarea {
-    @apply min-h-20 w-full resize-y rounded-lg border border-input bg-input/20 px-3 py-2 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-[3px] focus:ring-ring/30;
+    @apply min-h-20 w-full resize-none overflow-y-auto rounded-lg border border-input bg-input/20 px-3 py-2 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-[3px] focus:ring-ring/30;
+    max-height: calc((1.25rem * 14) + 1rem + 2px);
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+  }
+
+  .review-file-mention-menu {
+    @apply max-h-48 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg;
+    overscroll-behavior: contain;
+  }
+
+  .review-file-mention-item {
+    @apply px-2 py-1.5 text-xs;
   }
 
   .review-thread-actions {
@@ -2182,6 +2198,10 @@ body {
 
   .review-thread-actions-between {
     @apply justify-between;
+  }
+
+  .review-thread-action-group {
+    @apply flex items-center justify-end gap-2;
   }
 
   .review-thread-button,
