@@ -2176,15 +2176,29 @@ body {
     @apply flex min-w-0 flex-col gap-1.5;
   }
 
-  .review-thread-textarea {
-    @apply min-h-20 w-full resize-none overflow-y-auto rounded-lg border border-input bg-input/20 px-3 py-2 text-sm leading-5 text-foreground outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-[3px] focus:ring-ring/30;
+  .review-thread-editor {
+    @apply relative min-w-0 rounded-lg bg-input/20;
+  }
+
+  .review-thread-highlights {
+    @apply pointer-events-none absolute inset-0 min-h-20 overflow-hidden whitespace-pre-wrap break-words rounded-lg border border-transparent px-3 py-2 text-sm leading-5 text-foreground;
+    font-family: inherit;
     max-height: calc((1.25rem * 14) + 1rem + 2px);
+    overflow-anchor: none;
+    scrollbar-gutter: stable;
+  }
+
+  .review-thread-textarea {
+    @apply relative min-h-20 w-full resize-none overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-words rounded-lg border border-input bg-transparent px-3 py-2 text-sm leading-5 text-transparent caret-foreground outline-none placeholder:text-muted-foreground focus:border-ring focus:ring-[3px] focus:ring-ring/30;
+    font-family: inherit;
+    max-height: calc((1.25rem * 14) + 1rem + 2px);
+    overflow-anchor: none;
     overscroll-behavior: contain;
     scrollbar-gutter: stable;
   }
 
   .review-file-mention-menu {
-    @apply max-h-48 overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg;
+    @apply fixed z-[80] overflow-y-auto rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg;
     overscroll-behavior: contain;
   }
 

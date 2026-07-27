@@ -7091,9 +7091,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   );
 }
 
-function ComposerHighlights(props: { text: string; setRef?: (element: HTMLDivElement) => void }) {
+function ComposerHighlights(props: { text: string; class?: string; setRef?: (element: HTMLDivElement) => void }) {
   return (
-    <div ref={props.setRef} class="composer-highlights" aria-hidden="true">
+    <div ref={props.setRef} class={props.class ?? 'composer-highlights'} aria-hidden="true">
       <For each={composerHighlightParts(props.text)}>
         {(part) => <span class={part.kind === 'file' ? 'composer-highlight-file' : ''}>{part.text}</span>}
       </For>
@@ -9723,10 +9723,13 @@ function reviewMessageTime(value?: string) {
 function ReviewTextarea(props: { projectId: string; value: string; ariaLabel: string; placeholder?: string; autofocus?: boolean; onValue: (value: string) => void }) {
   let rootRef: HTMLDivElement | undefined;
   let textareaRef: HTMLTextAreaElement | undefined;
+  let highlightsRef: HTMLDivElement | undefined;
+  let menuRef: HTMLDivElement | undefined;
   const listboxId = `review-file-mentions-${reviewTextareaSequence += 1}`;
   const [mention, setMention] = createSignal<FileMention>();
   const [searchQuery, setSearchQuery] = createSignal<string>();
   const [highlightedIndex, setHighlightedIndex] = createSignal(0);
+  const [menuPosition, setMenuPosition] = createSignal<{ left: number; top: number; width: number; maxHeight: number; placement: 'top' | 'bottom' }>();
   const searchPending = createMemo(() => Boolean(mention() && searchQuery() !== mention()?.query));
   const fileSearch = createQuery(() => ({
     queryKey: ['file-search', props.projectId, searchQuery() ?? ''],
@@ -9736,6 +9739,12 @@ function ReviewTextarea(props: { projectId: string; value: string; ariaLabel: st
   }));
   const files = createMemo(() => searchPending() ? [] : fileSearch.data?.files ?? []);
   const activeOptionId = createMemo(() => mention() && files()[highlightedIndex()] ? `${listboxId}-option-${highlightedIndex()}` : undefined);
+
+  function syncHighlightsScroll(target: HTMLTextAreaElement) {
+    if (!highlightsRef) return;
+    highlightsRef.scrollTop = target.scrollTop;
+    highlightsRef.scrollLeft = target.scrollLeft;
+  }
 
   function syncHeight() {
     const target = textareaRef;
@@ -9751,6 +9760,33 @@ function ReviewTextarea(props: { projectId: string; value: string; ariaLabel: st
     target.style.height = `${Math.min(contentHeight, maxHeight)}px`;
     target.style.overflowY = contentHeight > maxHeight ? 'auto' : 'hidden';
     target.scrollTop = Math.min(scrollTop, Math.max(target.scrollHeight - target.clientHeight, 0));
+    syncHighlightsScroll(target);
+  }
+
+  function updateMenuPosition() {
+    const target = textareaRef;
+    if (!target) return;
+    const gap = 6;
+    const margin = 8;
+    const rect = target.getBoundingClientRect();
+    const viewportLeft = window.visualViewport?.offsetLeft ?? 0;
+    const viewportTop = window.visualViewport?.offsetTop ?? 0;
+    const viewportWidth = window.visualViewport?.width ?? window.innerWidth;
+    const viewportHeight = window.visualViewport?.height ?? window.innerHeight;
+    const viewportRight = viewportLeft + viewportWidth;
+    const viewportBottom = viewportTop + viewportHeight;
+    const spaceBelow = Math.max(0, viewportBottom - rect.bottom - gap - margin);
+    const spaceAbove = Math.max(0, rect.top - viewportTop - gap - margin);
+    const desiredHeight = Math.min(menuRef?.scrollHeight ?? 192, 192);
+    const placement = spaceBelow < desiredHeight && spaceAbove > spaceBelow ? 'top' : 'bottom';
+    const width = Math.max(0, Math.min(rect.width, viewportWidth - margin * 2));
+    setMenuPosition({
+      left: Math.max(viewportLeft + margin, Math.min(rect.left, viewportRight - width - margin)),
+      top: placement === 'top' ? rect.top - gap : rect.bottom + gap,
+      width,
+      maxHeight: Math.min(192, placement === 'top' ? spaceAbove : spaceBelow),
+      placement,
+    });
   }
 
   function updateMention(target: HTMLTextAreaElement) {
@@ -9813,10 +9849,59 @@ function ReviewTextarea(props: { projectId: string; value: string; ariaLabel: st
     setHighlightedIndex(0);
     if (!active) {
       setSearchQuery(undefined);
+      setMenuPosition(undefined);
       return;
     }
     const timeout = window.setTimeout(() => setSearchQuery(active.query), FILE_SEARCH_DEBOUNCE_MS);
     onCleanup(() => window.clearTimeout(timeout));
+  });
+
+  createEffect(() => {
+    if (!mention()) return;
+    if (hasBlockingShortcutDialog()) {
+      setMention(undefined);
+      textareaRef?.blur();
+      return;
+    }
+    const update = () => updateMenuPosition();
+    const resizeObserver = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(update);
+    const dialogObserver = new MutationObserver(() => {
+      if (!hasBlockingShortcutDialog()) return;
+      setMention(undefined);
+      textareaRef?.blur();
+    });
+    if (resizeObserver && textareaRef) resizeObserver.observe(textareaRef);
+    dialogObserver.observe(document.body, { childList: true, subtree: true });
+    window.addEventListener('resize', update);
+    window.addEventListener('scroll', update, true);
+    window.visualViewport?.addEventListener('resize', update);
+    window.visualViewport?.addEventListener('scroll', update);
+    queueMicrotask(update);
+    const frame = requestAnimationFrame(update);
+    onCleanup(() => {
+      resizeObserver?.disconnect();
+      dialogObserver.disconnect();
+      window.removeEventListener('resize', update);
+      window.removeEventListener('scroll', update, true);
+      window.visualViewport?.removeEventListener('resize', update);
+      window.visualViewport?.removeEventListener('scroll', update);
+      cancelAnimationFrame(frame);
+    });
+  });
+
+  createEffect(() => {
+    if (!mention()) return;
+    searchPending();
+    fileSearch.isLoading;
+    files().length;
+    const frame = requestAnimationFrame(updateMenuPosition);
+    onCleanup(() => cancelAnimationFrame(frame));
+  });
+
+  createEffect(() => {
+    if (!mention()) return;
+    const index = highlightedIndex();
+    requestAnimationFrame(() => menuRef?.querySelector<HTMLElement>(`#${listboxId}-option-${index}`)?.scrollIntoView({ block: 'nearest' }));
   });
 
   createEffect(() => {
@@ -9832,55 +9917,77 @@ function ReviewTextarea(props: { projectId: string; value: string; ariaLabel: st
   return (
     <div ref={rootRef} class="review-thread-textarea-wrap">
       <Show when={mention()}>
-        <div id={listboxId} class="review-file-mention-menu" role="listbox" aria-label="Workspace files" aria-busy={searchPending() || fileSearch.isLoading} onWheel={(event) => event.stopPropagation()}>
-          <Show when={!searchPending() && !fileSearch.isLoading} fallback={<div class="px-3 py-2 text-xs text-muted-foreground">Searching files...</div>}>
-            <Show when={files().length > 0} fallback={<div class="px-3 py-2 text-xs text-muted-foreground">No matching files</div>}>
-              <For each={files()}>
-                {(file, index) => (
-                  <button
-                    id={`${listboxId}-option-${index()}`}
-                    type="button"
-                    role="option"
-                    aria-selected={highlightedIndex() === index()}
-                    class={`file-mention-item review-file-mention-item ${highlightedIndex() === index() ? 'file-mention-item-active' : ''}`}
-                    onMouseDown={(event) => { event.preventDefault(); selectMention(file); }}
-                  >
-                    <span class="grid w-7 shrink-0 place-items-center text-muted-foreground"><FileTypeIcon name={file.name} class="size-4" /></span>
-                    <span class="min-w-0 flex-1 truncate text-left">{file.path}</span>
-                  </button>
-                )}
-              </For>
+        <Portal>
+          <div
+            ref={menuRef}
+            id={listboxId}
+            class="review-file-mention-menu"
+            role="listbox"
+            aria-label="Workspace files"
+            aria-busy={searchPending() || fileSearch.isLoading}
+            style={{
+              left: `${menuPosition()?.left ?? 0}px`,
+              top: `${menuPosition()?.top ?? 0}px`,
+              width: `${menuPosition()?.width ?? 0}px`,
+              'max-height': `${menuPosition()?.maxHeight ?? 0}px`,
+              transform: menuPosition()?.placement === 'top' ? 'translateY(-100%)' : '',
+              visibility: menuPosition() ? 'visible' : 'hidden',
+            }}
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <Show when={!searchPending() && !fileSearch.isLoading} fallback={<div class="px-3 py-2 text-xs text-muted-foreground">Searching files...</div>}>
+              <Show when={files().length > 0} fallback={<div class="px-3 py-2 text-xs text-muted-foreground">No matching files</div>}>
+                <For each={files()}>
+                  {(file, index) => (
+                    <button
+                      id={`${listboxId}-option-${index()}`}
+                      type="button"
+                      role="option"
+                      aria-selected={highlightedIndex() === index()}
+                      class={`file-mention-item review-file-mention-item ${highlightedIndex() === index() ? 'file-mention-item-active' : ''}`}
+                      onMouseDown={(event) => { event.preventDefault(); selectMention(file); }}
+                    >
+                      <span class="grid w-7 shrink-0 place-items-center text-muted-foreground"><FileTypeIcon name={file.name} class="size-4" /></span>
+                      <span class="min-w-0 flex-1 truncate text-left">{file.path}</span>
+                    </button>
+                  )}
+                </For>
+              </Show>
             </Show>
-          </Show>
-        </div>
+          </div>
+        </Portal>
       </Show>
-      <textarea
-        ref={textareaRef}
-        class="review-thread-textarea"
-        aria-label={props.ariaLabel}
-        aria-autocomplete="list"
-        aria-haspopup="listbox"
-        aria-expanded={Boolean(mention())}
-        aria-controls={mention() ? listboxId : undefined}
-        aria-activedescendant={activeOptionId()}
-        value={props.value}
-        placeholder={props.placeholder}
-        rows={1}
-        onInput={(event) => {
-          props.onValue(event.currentTarget.value);
-          updateMention(event.currentTarget);
-          syncHeight();
-        }}
-        onClick={(event) => updateMention(event.currentTarget)}
-        onKeyUp={(event) => {
-          if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateMention(event.currentTarget);
-        }}
-        onKeyDown={handleKeyDown}
-        onWheel={handleWheel}
-        onBlur={() => queueMicrotask(() => {
-          if (!rootRef?.contains(document.activeElement)) setMention(undefined);
-        })}
-      />
+      <div class="review-thread-editor">
+        <ComposerHighlights text={props.value} class="review-thread-highlights" setRef={(element) => { highlightsRef = element; }} />
+        <textarea
+          ref={textareaRef}
+          class="review-thread-textarea"
+          aria-label={props.ariaLabel}
+          aria-autocomplete="list"
+          aria-haspopup="listbox"
+          aria-expanded={Boolean(mention())}
+          aria-controls={mention() ? listboxId : undefined}
+          aria-activedescendant={activeOptionId()}
+          value={props.value}
+          placeholder={props.placeholder}
+          rows={1}
+          onInput={(event) => {
+            props.onValue(event.currentTarget.value);
+            updateMention(event.currentTarget);
+            syncHeight();
+          }}
+          onClick={(event) => updateMention(event.currentTarget)}
+          onScroll={(event) => syncHighlightsScroll(event.currentTarget)}
+          onKeyUp={(event) => {
+            if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateMention(event.currentTarget);
+          }}
+          onKeyDown={handleKeyDown}
+          onWheel={handleWheel}
+          onBlur={() => queueMicrotask(() => {
+            if (!rootRef?.contains(document.activeElement) && !menuRef?.contains(document.activeElement)) setMention(undefined);
+          })}
+        />
+      </div>
     </div>
   );
 }
