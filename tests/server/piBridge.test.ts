@@ -1286,7 +1286,7 @@ test('lists config-refreshed model snapshots from the session runtime', async ()
     calls.push([projectPath, sessionId]);
     return {
       modelRuntime: {
-        reloadConfig: async () => {
+        refresh: async () => {
           await Promise.resolve();
           refreshes += 1;
           refreshFinished = true;

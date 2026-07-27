@@ -829,7 +829,7 @@ export class PiBridge {
     const session = await this.getCommandSession(projectPath, sessionId);
     const runtime: ModelRuntime | undefined = session?.modelRuntime;
     if (!runtime) throw new Error('Loaded pi SDK session does not expose a model runtime');
-    await runtime.reloadConfig();
+    await runtime.refresh();
     return runtime.getAvailableSnapshot()
       .map((model): ModelInfo => ({
         value: `${model.provider}/${model.id}`,
