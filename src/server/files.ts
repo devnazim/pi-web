@@ -9,6 +9,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import type { ProjectRegistry } from './projects.js';
+import { resolveSessionFile } from './sessions.js';
 import { projectUploadRoot, sessionUploadRoot } from './uploads.js';
 import { resolveWithin } from './util.js';
 
@@ -35,6 +36,7 @@ type FileIndexCacheEntry = { expiresAt: number; files: FileSearchEntry[]; promis
 type FileEntryType = 'directory' | 'file';
 type FileWatchSession = { projectId: string; root: string; sockets: Set<WebSocket>; watchers: Map<string, FSWatcher>; timer?: NodeJS.Timeout; rescanTimer?: NodeJS.Timeout; scanPromise?: Promise<void>; closed?: boolean };
 type WebSocket = { readyState: number; send(data: string): void; close(): void; on(event: 'close' | 'error' | 'message', listener: (...args: any[]) => void): void };
+type FileRouteBridge = { lockSessionMutation(projectPath: string, sessionId: string, filePath?: string): Promise<(() => void) | undefined> };
 
 class TrustedMvUnavailableError extends Error {
   constructor() {
@@ -64,7 +66,7 @@ const SANDBOXED_ASSET_CSP = "sandbox; default-src 'none'; base-uri 'none'; form-
 const TRUSTED_MV_PATHS = ['/usr/bin/mv', '/bin/mv'];
 const execFileAsync = promisify(execFile);
 
-export async function registerFileRoutes(app: FastifyInstance, registry: ProjectRegistry) {
+export async function registerFileRoutes(app: FastifyInstance, registry: ProjectRegistry, bridge?: FileRouteBridge) {
   const fileWatchSessions = new Map<string, FileWatchSession>();
 
   app.addHook('onClose', async () => {
@@ -278,17 +280,24 @@ export async function registerFileRoutes(app: FastifyInstance, registry: Project
   app.post<{ Params: { projectId: string }; Querystring: { sessionId?: string } }>('/api/projects/:projectId/uploads', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
-      const uploadRoot = request.query.sessionId ? sessionUploadRoot(project.path, request.query.sessionId) : projectUploadRoot(project.path);
-      const uploadDir = projectRelativePathFromAbsolute(project.path, uploadRoot);
+      const sessionId = request.query.sessionId;
+      const releaseSessionLock = sessionId ? await bridge?.lockSessionMutation(project.path, sessionId) : undefined;
+      if (sessionId && bridge && !releaseSessionLock) return reply.code(409).send({ error: 'Session is being deleted.' });
+      try {
+        if (sessionId) await resolveSessionFile(sessionId, project.path);
+        const uploadRoot = sessionId ? sessionUploadRoot(project.path, sessionId) : projectUploadRoot(project.path);
+        const uploadDir = projectRelativePathFromAbsolute(project.path, uploadRoot);
+        const uploaded: Array<{ filename: string; path: string; bytes: number }> = [];
+        for await (const part of request.parts()) {
+          if (part.type !== 'file') continue;
+          uploaded.push(await writeUploadWithin(project.path, uploadDir, part.filename || `upload-${Date.now()}`, part.file));
+        }
 
-      const uploaded: Array<{ filename: string; path: string; bytes: number }> = [];
-      for await (const part of request.parts()) {
-        if (part.type !== 'file') continue;
-        uploaded.push(await writeUploadWithin(project.path, uploadDir, part.filename || `upload-${Date.now()}`, part.file));
+        if (uploaded.length) clearProjectFileCaches(project.id);
+        return { uploaded };
+      } finally {
+        releaseSessionLock?.();
       }
-
-      if (uploaded.length) clearProjectFileCaches(project.id);
-      return { uploaded };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Upload failed' });
     }

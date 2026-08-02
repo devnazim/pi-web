@@ -46,7 +46,7 @@ export async function buildApp(options: ServerOptions) {
   await registerSessionRoutes(app, registry, bridge);
   await registerReviewThreadRoutes(app, registry);
   await registerSettingsRoutes(app, registry);
-  await registerFileRoutes(app, registry);
+  await registerFileRoutes(app, registry, bridge);
   await registerGitRoutes(app, registry);
   await registerTerminalRoutes(app, registry, { isClosing: () => closing });
   await registerPiRoutes(app, registry, bridge);

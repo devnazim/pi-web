@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import { test } from 'node:test';
 import { PiBridge } from '../../src/server/piBridge.js';
-import { createSessionFile, sessionManagerForSession } from '../../src/server/sessions.js';
+import { createSessionFile, listSessions, sessionManagerForSession } from '../../src/server/sessions.js';
 import { sessionIdFromPath } from '../../src/server/util.js';
 
 test('binds browser extension UI in RPC mode', async () => {
@@ -1124,17 +1125,49 @@ test('status follows a replacement when a stale cache entry rejects', async () =
   assert.equal((await status).sessionName, 'replacement-after-rejection');
 });
 
-test('uses the retained manager and named Pi Web review extension for durable sessions only', async () => {
+test('uses one pending runtime for command discovery, completion, and execution', async () => {
   const sessionDir = `/tmp/pi-web-review-loader-${randomUUID()}`;
   const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
   process.env.PI_CODING_AGENT_SESSION_DIR = sessionDir;
   try {
     const projectPath = process.cwd();
-    const sessionId = sessionIdFromPath(await createSessionFile(projectPath));
+    const sessionFile = await createSessionFile(projectPath);
+    const sessionId = sessionIdFromPath(sessionFile);
     const retainedSessionManager = await sessionManagerForSession(sessionId, projectPath);
     let loaderOptions: Record<string, any> | undefined;
     let reloads = 0;
     let createOptions: Record<string, any> | undefined;
+    let creates = 0;
+    let completionObserved = false;
+    const probeCommand = {
+      name: 'runtime-probe',
+      description: 'Authoritative runtime probe',
+      getArgumentCompletions: async () => {
+        completionObserved = true;
+        return [{ value: 'same-runtime' }];
+      },
+    };
+    const session = {
+      extensionRunner: {
+        getRegisteredCommands: () => [probeCommand],
+        getCommand: (name: string) => name === probeCommand.name ? probeCommand : undefined,
+      },
+      prompt: async (prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+        assert.equal(completionObserved, true);
+        retainedSessionManager.appendMessage({ role: 'user', content: prompt, timestamp: Date.now() } as any);
+        retainedSessionManager.appendMessage({
+          role: 'assistant',
+          content: [],
+          api: 'test',
+          provider: 'test',
+          model: 'test',
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: 'stop',
+          timestamp: Date.now(),
+        } as any);
+        options.preflightResult?.(true);
+      },
+    };
     const bridge = new PiBridge();
     (bridge as any).loadSdk = async () => ({
       DefaultResourceLoader: class {
@@ -1143,44 +1176,280 @@ test('uses the retained manager and named Pi Web review extension for durable se
       },
       SettingsManager: { create: () => ({ source: 'settings' }) },
       SessionManager: {
-        open: () => { throw new Error('durable sessions must use the server-retained session manager'); },
+        open: () => { throw new Error('pending sessions must use the server-retained session manager'); },
       },
       createAgentSession: async (options: Record<string, any>) => {
+        creates += 1;
         createOptions = options;
-        return { session: {} };
+        return { session };
       },
     });
 
-    await (bridge as any).getSession(projectPath, sessionId);
+    const commands = await bridge.commands(projectPath, sessionId);
+    const completions = await bridge.commandCompletions(projectPath, { sessionId, command: probeCommand.name });
+    assert.equal(existsSync(sessionFile), false);
+    assert.deepEqual(await listSessions('project', projectPath), []);
 
+    await bridge.prompt(projectPath, { sessionId, prompt: 'Use the authoritative runtime' }, `project:${sessionId}`);
+
+    assert.equal(creates, 1);
     assert.equal(reloads, 1);
+    assert.equal(commands.some((command) => command.name === probeCommand.name && command.hasArgumentCompletions), true);
+    assert.deepEqual(completions, [{ value: 'same-runtime', label: undefined, description: undefined }]);
     assert.equal(loaderOptions?.cwd, projectPath);
     assert.equal(loaderOptions?.extensionFactories.length, 1);
     assert.equal(loaderOptions?.extensionFactories[0].name, 'pi-web-review');
     assert.equal(createOptions?.resourceLoader instanceof Object, true);
     assert.equal(createOptions?.settingsManager, loaderOptions?.settingsManager);
     assert.equal(createOptions?.sessionManager, retainedSessionManager);
-
-    let sessionlessCreateOptions: Record<string, any> | undefined;
-    const sessionlessBridge = new PiBridge();
-    (sessionlessBridge as any).loadSdk = async () => ({
-      DefaultResourceLoader: class {
-        constructor() { throw new Error('sessionless command discovery must not add the review extension'); }
-      },
-      SessionManager: { inMemory: () => ({}) },
-      createAgentSession: async (options: Record<string, any>) => {
-        sessionlessCreateOptions = options;
-        return { session: {} };
-      },
-    });
-
-    assert.deepEqual(await sessionlessBridge.commands(projectPath), []);
-    assert.equal(sessionlessCreateOptions?.resourceLoader, undefined);
+    assert.equal(existsSync(sessionFile), true);
+    assert.deepEqual((await listSessions('project', projectPath)).map(({ id }) => id), [sessionId]);
+    await bridge.dispose({ timeoutMs: 50 });
   } finally {
     if (previousSessionDir === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
     else process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionDir;
     await rm(sessionDir, { recursive: true, force: true });
   }
+});
+
+test('requires a reserved session for extension-backed discovery', async () => {
+  const bridge = new PiBridge();
+
+  await assert.rejects(bridge.commands('/workspace'), /missing session id/i);
+  await assert.rejects(bridge.agents('/workspace'), /missing session id/i);
+  await assert.rejects(bridge.commandCompletions('/workspace', { command: 'probe' }), /missing session id/i);
+});
+
+test('runtime-backed command completion blocks deletion without reporting agent activity', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'leased-completion-session';
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  let releaseCompletion!: (value: Array<{ value: string }>) => void;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const session = {
+    extensionRunner: {
+      getCommand: () => ({
+        getArgumentCompletions: () => {
+          markStarted();
+          return new Promise<Array<{ value: string }>>((resolve) => { releaseCompletion = resolve; });
+        },
+      }),
+    },
+  };
+  const entry = { promise: Promise.resolve(session), expiresAt: Date.now() + 60_000 };
+  (bridge as any).runtimeSessions.set(cacheKey, entry);
+  (bridge as any).runtimeSessionEntries.set(session, entry);
+
+  const completion = bridge.commandCompletions(projectPath, { sessionId, command: 'probe' });
+  await started;
+  assert.equal(await bridge.isSessionActive(projectPath, sessionId), false);
+  assert.equal(await bridge.lockSessionDeletion(projectPath, sessionId), undefined);
+
+  releaseCompletion([{ value: 'done' }]);
+  assert.deepEqual(await completion, [{ value: 'done', label: undefined, description: undefined }]);
+  const releaseDeletion = await bridge.lockSessionDeletion(projectPath, sessionId);
+  assert.equal(typeof releaseDeletion, 'function');
+  releaseDeletion?.();
+  await bridge.dispose();
+});
+
+test('runtime recovery defers disposal until an in-flight completion rejects as stale', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'recovered-completion-session';
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  let releaseCompletion!: (value: Array<{ value: string }>) => void;
+  let markStarted!: () => void;
+  let disposed = 0;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const session = {
+    extensionRunner: {
+      getCommand: () => ({
+        getArgumentCompletions: () => {
+          markStarted();
+          return new Promise<Array<{ value: string }>>((resolve) => { releaseCompletion = resolve; });
+        },
+      }),
+    },
+    dispose: () => { disposed += 1; },
+  };
+  const entry = { promise: Promise.resolve(session), expiresAt: Date.now() + 60_000 };
+  (bridge as any).runtimeSessions.set(cacheKey, entry);
+  (bridge as any).runtimeSessionEntries.set(session, entry);
+
+  const completion = bridge.commandCompletions(projectPath, { sessionId, command: 'probe' });
+  await started;
+  (bridge as any).recoverRuntimeSession(projectPath, sessionId, session, 'runtime reset');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(disposed, 0);
+
+  releaseCompletion([{ value: 'stale' }]);
+  await assert.rejects(completion, /runtime changed/i);
+  for (let attempt = 0; attempt < 50 && !disposed; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(disposed, 1);
+  await bridge.dispose();
+});
+
+test('agent completions reject results from a recovered runtime generation', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'recovered-agent-completion-session';
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  let releaseCompletion!: (value: Array<{ value: string }>) => void;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const session = {
+    extensionRunner: { getCommand: (name: string) => name === 'agent' ? {} : undefined },
+  };
+  const entry = { promise: Promise.resolve(session), expiresAt: Date.now() + 60_000 };
+  (bridge as any).runtimeSessions.set(cacheKey, entry);
+  (bridge as any).runtimeSessionEntries.set(session, entry);
+  (bridge as any).agentCommandCompletions = () => {
+    markStarted();
+    return new Promise<Array<{ value: string }>>((resolve) => { releaseCompletion = resolve; });
+  };
+
+  const completion = bridge.commandCompletions(projectPath, { sessionId, command: 'agent' });
+  await started;
+  (bridge as any).recoverRuntimeSession(projectPath, sessionId, session, 'runtime reset');
+  releaseCompletion([{ value: 'stale-agent' }]);
+  await assert.rejects(completion, /runtime changed/i);
+  await bridge.dispose();
+});
+
+test('cache eviction waits for runtime read leases', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'evicted-completion-session';
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  let releaseCompletion!: (value: Array<{ value: string }>) => void;
+  let markStarted!: () => void;
+  let disposed = 0;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const session = {
+    extensionRunner: {
+      getCommand: () => ({
+        getArgumentCompletions: () => {
+          markStarted();
+          return new Promise<Array<{ value: string }>>((resolve) => { releaseCompletion = resolve; });
+        },
+      }),
+    },
+    dispose: () => { disposed += 1; },
+  };
+  const entry = { promise: Promise.resolve(session), expiresAt: Date.now() + 60_000 };
+  (bridge as any).runtimeSessions.set(cacheKey, entry);
+  (bridge as any).runtimeSessionEntries.set(session, entry);
+
+  const completion = bridge.commandCompletions(projectPath, { sessionId, command: 'probe' });
+  await started;
+  entry.expiresAt = 0;
+  await (bridge as any).evictCachedSession((bridge as any).runtimeSessions, cacheKey, entry);
+  assert.equal((bridge as any).runtimeSessions.get(cacheKey), entry);
+  assert.equal(disposed, 0);
+  if ((entry as any).timer) clearTimeout((entry as any).timer);
+
+  releaseCompletion([{ value: 'current' }]);
+  assert.deepEqual(await completion, [{ value: 'current', label: undefined, description: undefined }]);
+  entry.expiresAt = 0;
+  await (bridge as any).evictCachedSession((bridge as any).runtimeSessions, cacheKey, entry);
+  assert.equal(disposed, 1);
+  await bridge.dispose();
+});
+
+test('bounded shutdown does not poll forever for a hung recovered runtime read', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'hung-shutdown-completion-session';
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  let releaseCompletion!: (value: Array<{ value: string }>) => void;
+  let markStarted!: () => void;
+  let disposed = 0;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const session = {
+    extensionRunner: {
+      getCommand: () => ({
+        getArgumentCompletions: () => {
+          markStarted();
+          return new Promise<Array<{ value: string }>>((resolve) => { releaseCompletion = resolve; });
+        },
+      }),
+    },
+    dispose: () => { disposed += 1; },
+  };
+  const entry = { promise: Promise.resolve(session), expiresAt: Date.now() + 60_000 };
+  (bridge as any).runtimeSessions.set(cacheKey, entry);
+  (bridge as any).runtimeSessionEntries.set(session, entry);
+
+  const completion = bridge.commandCompletions(projectPath, { sessionId, command: 'probe' });
+  await started;
+  (bridge as any).recoverRuntimeSession(projectPath, sessionId, session, 'runtime reset');
+  const startedAt = Date.now();
+  await bridge.dispose({ timeoutMs: 20 });
+  assert.ok(Date.now() - startedAt < 500);
+  assert.equal(disposed, 0);
+
+  releaseCompletion([{ value: 'late' }]);
+  await assert.rejects(completion, /shutting down|runtime changed/i);
+  for (let attempt = 0; attempt < 50 && !disposed; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(disposed, 1);
+});
+
+test('shutdown waits for runtime reads before disposing their SDK session', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'shutdown-completion-session';
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  let releaseCompletion!: (value: Array<{ value: string }>) => void;
+  let markStarted!: () => void;
+  let disposed = 0;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const session = {
+    extensionRunner: {
+      getCommand: () => ({
+        getArgumentCompletions: () => {
+          markStarted();
+          return new Promise<Array<{ value: string }>>((resolve) => { releaseCompletion = resolve; });
+        },
+      }),
+    },
+    dispose: () => { disposed += 1; },
+  };
+  const entry = { promise: Promise.resolve(session), expiresAt: Date.now() + 60_000 };
+  (bridge as any).runtimeSessions.set(cacheKey, entry);
+  (bridge as any).runtimeSessionEntries.set(session, entry);
+
+  const completion = bridge.commandCompletions(projectPath, { sessionId, command: 'probe' });
+  await started;
+  const disposal = bridge.dispose({ timeoutMs: 1_000 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(disposed, 0);
+
+  releaseCompletion([{ value: 'late' }]);
+  await assert.rejects(completion, /shutting down|runtime changed/i);
+  await disposal;
+  assert.equal(disposed, 1);
+});
+
+test('session mutation leases block deletion without reporting agent activity', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'upload-mutation-session';
+  const releaseMutation = await bridge.lockSessionMutation(projectPath, sessionId);
+  assert.equal(typeof releaseMutation, 'function');
+  assert.equal(await bridge.isSessionActive(projectPath, sessionId), false);
+  assert.equal(await bridge.lockSessionDeletion(projectPath, sessionId), undefined);
+  const operationLock = await (bridge as any).markSessionActiveWithState(projectPath, sessionId);
+  assert.equal(operationLock.wasActive, true);
+  operationLock.release();
+
+  releaseMutation?.();
+  const releaseDeletion = await bridge.lockSessionDeletion(projectPath, sessionId);
+  assert.equal(typeof releaseDeletion, 'function');
+  releaseDeletion?.();
+  await bridge.dispose();
 });
 
 test('bounds session creation and disposes a late runtime', async () => {
@@ -1265,16 +1534,91 @@ test('dispose closes sockets and cached SDK sessions', async () => {
   let disposed = 0;
   let socketsClosed = 0;
   const runtimeSession = { dispose: () => { disposed += 1; } };
-  const commandSession = { dispose: () => { disposed += 1; } };
   (bridge as any).runtimeSessions.set('runtime', { promise: Promise.resolve(runtimeSession), expiresAt: Date.now() + 60_000 });
-  (bridge as any).commandSessions.set('command', { promise: Promise.resolve(commandSession), expiresAt: Date.now() + 60_000 });
   (bridge as any).sockets.set('socket', new Set([{ readyState: 1, send: () => undefined, close: () => { socketsClosed += 1; }, on: () => undefined }]));
 
   await bridge.dispose({ timeoutMs: 50 });
 
-  assert.equal(disposed, 2);
+  assert.equal(disposed, 1);
   assert.equal(socketsClosed, 1);
   await assert.rejects((bridge as any).getSession(process.cwd(), 'closed-session'), /shutting down/i);
+  await assert.rejects(bridge.models(process.cwd()), /shutting down/i);
+});
+
+test('does not start a sessionless model runtime after disposal begins', async () => {
+  let resolveSdk: ((sdk: unknown) => void) | undefined;
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let creates = 0;
+  const bridge = new PiBridge();
+  (bridge as any).loadSdk = () => {
+    markStarted?.();
+    return new Promise((resolve) => { resolveSdk = resolve; });
+  };
+
+  const models = bridge.models('/workspace');
+  await started;
+  await bridge.dispose({ timeoutMs: 50 });
+  resolveSdk?.({ ModelRuntime: { create: async () => { creates += 1; return {}; } } });
+
+  await assert.rejects(models, /shutting down/i);
+  assert.equal(creates, 0);
+});
+
+test('does not publish an in-flight sessionless model list after disposal', async () => {
+  let resolveRuntime: ((runtime: unknown) => void) | undefined;
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let refreshes = 0;
+  const bridge = new PiBridge();
+  (bridge as any).loadSdk = async () => ({
+    ModelRuntime: {
+      create: () => {
+        markStarted?.();
+        return new Promise((resolve) => { resolveRuntime = resolve; });
+      },
+    },
+  });
+
+  const models = bridge.models('/workspace');
+  await started;
+  await bridge.dispose({ timeoutMs: 50 });
+  resolveRuntime?.({
+    refresh: async () => { refreshes += 1; },
+    getAvailableSnapshot: () => [],
+  });
+
+  await assert.rejects(models, /shutting down/i);
+  assert.equal(refreshes, 0);
+});
+
+test('lists sessionless settings models without creating an extension runtime', async () => {
+  let creates = 0;
+  let refreshes = 0;
+  const runtime = {
+    refresh: async () => { refreshes += 1; },
+    getAvailableSnapshot: () => [{ provider: 'openai', id: 'gpt-test', name: 'GPT Test', reasoning: false }],
+    getProvider: () => ({ name: 'OpenAI' }),
+  };
+  const bridge = new PiBridge();
+  (bridge as any).loadSdk = async () => ({
+    ModelRuntime: { create: async () => runtime },
+    createAgentSession: async () => {
+      creates += 1;
+      return { session: {} };
+    },
+  });
+
+  assert.deepEqual(await bridge.models('/workspace'), [{
+    value: 'openai/gpt-test',
+    label: 'GPT Test · OpenAI',
+    provider: 'openai',
+    id: 'gpt-test',
+    reasoning: false,
+    thinkingLevels: ['off'],
+  }]);
+  assert.equal(refreshes, 1);
+  assert.equal(creates, 0);
 });
 
 test('lists config-refreshed model snapshots from the session runtime', async () => {
@@ -1282,6 +1626,7 @@ test('lists config-refreshed model snapshots from the session runtime', async ()
   let refreshFinished = false;
   const calls: Array<[string, string | undefined]> = [];
   const bridge = new PiBridge();
+  (bridge as any).runtimeSessionCurrent = () => true;
   (bridge as any).getCommandSession = async (projectPath: string, sessionId?: string) => {
     calls.push([projectPath, sessionId]);
     return {

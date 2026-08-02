@@ -5,6 +5,7 @@ import { constants, type Dirent, type Stats } from 'node:fs';
 import { open, readdir, readFile, realpath, stat, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { clearProjectFileCaches } from './files.js';
 import { getGitBranch } from './git.js';
 import type { ProjectRegistry } from './projects.js';
@@ -12,6 +13,7 @@ import { createPiWebReviewExtension } from './reviewExtension.js';
 import { applyPendingSessionInfo, projectSessionDir, resolveSessionFile, sessionDetailFromManager, sessionManagerForSession } from './sessions.js';
 import type { AgentEvent } from './types.js';
 import { resolveWithin, sessionIdFromPath } from './util.js';
+import { WebExtensionTerminal, type WebExtensionTerminalWriter } from './webExtensionTerminal.js';
 
 type WebSocket = {
   readyState: number;
@@ -107,6 +109,40 @@ type PendingExtensionUiRequest<T = unknown> = {
   defaultValue: T;
   cleanup: () => boolean;
 };
+type CustomUiRuntime = { TUI: new (terminal: WebExtensionTerminal, showHardwareCursor?: boolean) => any; visibleWidth: (value: string) => number; keybindings: unknown; theme: unknown };
+type PendingExtensionCustomUi<T = unknown> = {
+  id: string;
+  session: object;
+  projectPath: string;
+  sessionId?: string;
+  streamKey: string | string[];
+  terminal: WebExtensionTerminal;
+  tui: any;
+  component?: { dispose?: () => void };
+  mountedComponent?: object;
+  overlayHandle?: { hide: () => void };
+  controller?: WebSocket;
+  writer?: WebExtensionTerminalWriter;
+  epoch: number;
+  seq: number;
+  unackedBytes: number;
+  sentBytes: Map<number, number>;
+  needsRedraw: boolean;
+  redrawRequested: boolean;
+  detachTimer?: NodeJS.Timeout;
+  settled: boolean;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+};
+type ExtensionCustomUiClientMessage = {
+  type?: string;
+  id?: string;
+  epoch?: number;
+  seq?: number;
+  data?: string;
+  cols?: number;
+  rows?: number;
+};
 
 interface ExtensionUiReplyBody extends ExtensionUiResponse {
   sessionId?: string;
@@ -174,6 +210,8 @@ const RUNTIME_WATCH_INTERVAL_MS = 250;
 const RUNTIME_NO_PROGRESS_TIMEOUT_MS = 5 * 60_000;
 const ABORT_GRACE_MS = 5_000;
 const EXTENSION_COMMAND_BUSY_DELAY_MS = 300;
+const EXTENSION_CUSTOM_UI_MAX_UNACKED_BYTES = 1024 * 1024;
+const EXTENSION_CUSTOM_UI_DETACHED_TIMEOUT_MS = 5 * 60_000;
 const IMAGE_TYPE_SNIFF_BYTES = 4100;
 const MAX_PROMPT_ATTACHMENT_PATHS = 100;
 const MAX_PROMPT_IMAGE_ATTACHMENTS = 20;
@@ -187,7 +225,6 @@ export class PiBridge {
   private readonly sockets = new Map<string, Set<WebSocket>>();
   private readonly notificationSockets = new Map<string, Set<WebSocket>>();
   private readonly runtimeSessions = new Map<string, CachedSession>();
-  private readonly commandSessions = new Map<string, CachedSession>();
   private readonly runtimeOperations = new Map<string, Set<RuntimeOperation>>();
   private readonly runtimeRecoveries = new Map<string, AgentRecovery>();
   private readonly runtimeSessionEntries = new WeakMap<object, CachedSession>();
@@ -206,7 +243,16 @@ export class PiBridge {
   private readonly extensionErrorCounts = new WeakMap<object, number>();
   private readonly extensionStatuses = new WeakMap<object, Map<string, string>>();
   private readonly pendingExtensionUiRequests = new Map<string, PendingExtensionUiRequest<any>>();
+  private readonly pendingExtensionCustomUi = new Map<string, PendingExtensionCustomUi<any>>();
+  private readonly extensionCustomUiCancellationGenerations = new WeakMap<object, number>();
+  private customUiRuntimePromise?: Promise<CustomUiRuntime>;
   private readonly activeRuntimeSessions = new Map<string, number>();
+  private readonly operationBlockingRuntimeSessions = new Map<string, number>();
+  private readonly leasedRuntimeSessions = new Map<string, number>();
+  private readonly runtimeReadLeases = new Map<string, number>();
+  private readonly runtimeReadLeaseWaiters = new Map<string, Set<() => void>>();
+  private readonly runtimeReadTasks = new Set<Promise<unknown>>();
+  private readonly deferredRuntimeDisposals = new Set<Promise<void>>();
   private readonly abortingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessionFiles = new Set<string>();
@@ -237,14 +283,14 @@ export class PiBridge {
   async dispose(options: { timeoutMs?: number } = {}) {
     if (this.disposePromise) return this.disposePromise;
     this.closing = true;
-    const cachedEntries = new Set([...this.runtimeSessions.values(), ...this.commandSessions.values()]);
+    const cachedEntries = new Set(this.runtimeSessions.values());
     this.runtimeSessions.clear();
-    this.commandSessions.clear();
     for (const entry of cachedEntries) if (entry.timer) clearTimeout(entry.timer);
     for (const operations of this.runtimeOperations.values()) {
       for (const operation of [...operations]) operation.recover('pi-web is shutting down.');
     }
     for (const pending of [...this.pendingExtensionUiRequests.values()]) this.settleExtensionUiRequest(pending, { cancelled: true }, pending.defaultValue);
+    for (const pending of [...this.pendingExtensionCustomUi.values()]) this.settleExtensionCustomUi(pending, undefined);
     for (const sockets of [...this.sockets.values(), ...this.notificationSockets.values()]) {
       for (const socket of sockets) {
         try { socket.close?.(); } catch { /* Ignore shutdown races. */ }
@@ -253,10 +299,15 @@ export class PiBridge {
     this.sockets.clear();
     this.notificationSockets.clear();
 
-    const disposal = Promise.allSettled([...cachedEntries].map(async (entry) => {
-      const session = await entry.promise.catch(() => undefined);
-      await this.disposeCachedSession(session);
-    })).then(() => undefined);
+    const disposal = Promise.allSettled([...this.runtimeReadTasks])
+      .then(() => Promise.allSettled([
+        ...[...cachedEntries].map(async (entry) => {
+          const session = await entry.promise.catch(() => undefined);
+          await this.disposeCachedSession(session);
+        }),
+        ...this.deferredRuntimeDisposals,
+      ]))
+      .then(() => undefined);
     const timeoutMs = options.timeoutMs ?? 10_000;
     this.disposePromise = timeoutMs > 0
       ? Promise.race([
@@ -278,7 +329,14 @@ export class PiBridge {
     const set = this.sockets.get(key) ?? new Set<WebSocket>();
     set.add(socket);
     this.sockets.set(key, set);
-    socket.on('close', () => set.delete(socket));
+    for (const pending of this.pendingExtensionCustomUi.values()) {
+      if (streamKeysInclude(pending.streamKey, key)) this.sendSocketPayload(socket, JSON.stringify({ type: 'agent:ui-custom-start', sessionId: pending.sessionId, data: { id: pending.id } }));
+    }
+    socket.on('close', () => {
+      set.delete(socket);
+      if (!set.size && this.sockets.get(key) === set) this.sockets.delete(key);
+      for (const pending of this.pendingExtensionCustomUi.values()) this.releaseExtensionCustomUiController(pending, socket);
+    });
   }
 
   subscribeNotifications(projectId: string, socket: WebSocket) {
@@ -289,7 +347,10 @@ export class PiBridge {
     const set = this.notificationSockets.get(projectId) ?? new Set<WebSocket>();
     set.add(socket);
     this.notificationSockets.set(projectId, set);
-    socket.on('close', () => set.delete(socket));
+    socket.on('close', () => {
+      set.delete(socket);
+      if (!set.size && this.notificationSockets.get(projectId) === set) this.notificationSockets.delete(projectId);
+    });
   }
 
   broadcast(key: string | string[], event: AgentEvent) {
@@ -331,8 +392,14 @@ export class PiBridge {
   }
 
   async isSessionActive(projectPath: string, sessionId: string, filePath?: string) {
+    return this.isSessionInUse(projectPath, sessionId, filePath, false);
+  }
+
+  private async isSessionInUse(projectPath: string, sessionId: string, filePath: string | undefined, includeLeases: boolean) {
     const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, filePath);
-    for (const key of keys) if (this.activeRuntimeSessions.has(key)) return true;
+    for (const key of keys) {
+      if (this.activeRuntimeSessions.has(key) || (includeLeases && this.leasedRuntimeSessions.has(key))) return true;
+    }
     for (const key of keys) {
       const cached = this.runtimeSessions.get(key);
       if (cached && this.cachedSessionInUse(await cached.promise.catch(() => undefined))) return true;
@@ -343,7 +410,7 @@ export class PiBridge {
       if (keys.has(key) || !this.isRuntimeSessionCacheKeyForProject(projectPath, key)) continue;
       const session = await cached.promise.catch(() => undefined);
       if (this.cachedSessionFile(session) !== targetPath) continue;
-      if (this.activeRuntimeSessions.has(key) || this.cachedSessionInUse(session)) return true;
+      if (this.activeRuntimeSessions.has(key) || (includeLeases && this.leasedRuntimeSessions.has(key)) || this.cachedSessionInUse(session)) return true;
     }
     return false;
   }
@@ -364,7 +431,7 @@ export class PiBridge {
     };
 
     try {
-      if (await this.isSessionActive(projectPath, sessionId, filePath)) {
+      if (await this.isSessionInUse(projectPath, sessionId, filePath, true)) {
         release();
         return undefined;
       }
@@ -376,7 +443,7 @@ export class PiBridge {
   }
 
   async lockSessionMutation(projectPath: string, sessionId: string, filePath?: string) {
-    return this.lockRuntimeSession(projectPath, sessionId, filePath);
+    return this.lockRuntimeSession(projectPath, sessionId, filePath, false, true);
   }
 
   async disposeSession(projectPath: string, sessionId: string, filePath?: string) {
@@ -826,58 +893,96 @@ export class PiBridge {
   }
 
   async models(projectPath: string, sessionId?: string): Promise<ModelInfo[]> {
-    const session = await this.getCommandSession(projectPath, sessionId);
-    const runtime: ModelRuntime | undefined = session?.modelRuntime;
-    if (!runtime) throw new Error('Loaded pi SDK session does not expose a model runtime');
-    await runtime.refresh();
-    return runtime.getAvailableSnapshot()
-      .map((model): ModelInfo => ({
-        value: `${model.provider}/${model.id}`,
-        label: [model.name || model.id, runtime.getProvider?.(model.provider)?.name ?? model.provider].filter(Boolean).join(' · '),
-        provider: model.provider,
-        id: model.id,
-        reasoning: Boolean(model.reasoning),
-        thinkingLevels: supportedThinkingLevels(model),
-      }))
-      .sort((a, b) => a.label.localeCompare(b.label));
+    const modelInfos = async (runtime: ModelRuntime | undefined, session?: object) => {
+      if (this.closing) throw new Error('pi-web is shutting down.');
+      if (!runtime) throw new Error('Loaded pi SDK session does not expose a model runtime');
+      if (session && !this.runtimeSessionCurrent(projectPath, sessionId!, session)) throw new Error('Session runtime changed while loading models.');
+      await runtime.refresh();
+      if (this.closing || (session && !this.runtimeSessionCurrent(projectPath, sessionId!, session))) throw new Error('Session runtime changed while loading models.');
+      return runtime.getAvailableSnapshot()
+        .map((model): ModelInfo => ({
+          value: `${model.provider}/${model.id}`,
+          label: [model.name || model.id, runtime.getProvider?.(model.provider)?.name ?? model.provider].filter(Boolean).join(' · '),
+          provider: model.provider,
+          id: model.id,
+          reasoning: Boolean(model.reasoning),
+          thinkingLevels: supportedThinkingLevels(model),
+        }))
+        .sort((a, b) => a.label.localeCompare(b.label));
+    };
+    if (sessionId) {
+      return this.withRuntimeSessionRead(projectPath, sessionId, async () => {
+        const session = await this.getCommandSession(projectPath, sessionId);
+        return modelInfos(session?.modelRuntime, session);
+      });
+    }
+    const sdk = await this.loadSdk();
+    if (this.closing) throw new Error('pi-web is shutting down.');
+    if (typeof sdk.ModelRuntime?.create !== 'function') throw new Error('Loaded pi SDK does not expose a model runtime');
+    return modelInfos(await sdk.ModelRuntime.create());
   }
 
   async agents(projectPath: string, sessionId?: string): Promise<AgentListResponse> {
-    const session = await this.getCommandSession(projectPath, sessionId);
-    if (!this.hasAgentExtensionCommand(session)) return { supported: false, active: null, agents: [] };
-    const location = await this.agentProfileLocation();
-    return {
-      supported: true,
-      active: await this.activeAgentId(projectPath, location),
-      agents: await this.loadAgentProfilesFromDir(location.agentsDir, location.source),
-    };
+    if (!sessionId) throw new Error('Missing session id');
+    return this.withRuntimeSessionRead(projectPath, sessionId, async () => {
+      const session = await this.getCommandSession(projectPath, sessionId);
+      if (!this.runtimeSessionCurrent(projectPath, sessionId, session)) throw new Error('Session runtime changed while loading agents.');
+      if (!this.hasAgentExtensionCommand(session)) return { supported: false, active: null, agents: [] };
+      const location = await this.agentProfileLocation();
+      const result = {
+        supported: true,
+        active: await this.activeAgentId(projectPath, location),
+        agents: await this.loadAgentProfilesFromDir(location.agentsDir, location.source),
+      };
+      if (!this.runtimeSessionCurrent(projectPath, sessionId, session)) throw new Error('Session runtime changed while loading agents.');
+      return result;
+    });
   }
 
   async commands(projectPath: string, sessionId?: string): Promise<CommandInfo[]> {
-    const session = await this.getCommandSession(projectPath, sessionId);
-    const hasAgentCommand = this.hasAgentExtensionCommand(session);
-    return [
-      ...this.builtinCommands(Boolean(sessionId)),
-      ...this.extensionCommands(session, hasAgentCommand),
-      ...this.promptTemplateCommands(session),
-      ...this.skillCommands(session),
-    ];
+    if (!sessionId) throw new Error('Missing session id');
+    return this.withRuntimeSessionRead(projectPath, sessionId, async () => {
+      const session = await this.getCommandSession(projectPath, sessionId);
+      if (!this.runtimeSessionCurrent(projectPath, sessionId, session)) throw new Error('Session runtime changed while loading commands.');
+      const hasAgentCommand = this.hasAgentExtensionCommand(session);
+      return [
+        ...this.builtinCommands(true),
+        ...this.extensionCommands(session, hasAgentCommand),
+        ...this.promptTemplateCommands(session),
+        ...this.skillCommands(session),
+      ];
+    });
   }
 
   async commandCompletions(projectPath: string, query: CommandCompletionQuery): Promise<CommandCompletion[]> {
     if (!query.command) return [];
-    const session = await this.getCommandSession(projectPath, query.sessionId);
-    if (query.command === 'agent' && this.hasAgentExtensionCommand(session)) return this.agentCommandCompletions(projectPath, query.prefix ?? '');
-    const command = typeof session?.extensionRunner?.getCommand === 'function'
-      ? session.extensionRunner.getCommand(query.command)
-      : undefined;
-    if (typeof command?.getArgumentCompletions !== 'function') return [];
-    const completions = await command.getArgumentCompletions(query.prefix ?? '');
-    if (!Array.isArray(completions)) return [];
-    return completions.map((item: unknown) => this.commandCompletion(item)).filter((item): item is CommandCompletion => Boolean(item));
+    if (!query.sessionId) throw new Error('Missing session id');
+    const sessionId = query.sessionId;
+    return this.withRuntimeSessionRead(projectPath, sessionId, async () => {
+      const session = await this.getCommandSession(projectPath, sessionId);
+      if (!this.runtimeSessionCurrent(projectPath, sessionId, session)) throw new Error('Session runtime changed while loading command completions.');
+      if (query.command === 'agent' && this.hasAgentExtensionCommand(session)) {
+        const completions = await this.agentCommandCompletions(projectPath, query.prefix ?? '');
+        if (!this.runtimeSessionCurrent(projectPath, sessionId, session)) throw new Error('Session runtime changed while loading command completions.');
+        return completions;
+      }
+      const command = typeof session?.extensionRunner?.getCommand === 'function'
+        ? session.extensionRunner.getCommand(query.command)
+        : undefined;
+      if (typeof command?.getArgumentCompletions !== 'function') return [];
+      const completions = await command.getArgumentCompletions(query.prefix ?? '');
+      if (!this.runtimeSessionCurrent(projectPath, sessionId, session)) throw new Error('Session runtime changed while loading command completions.');
+      if (!Array.isArray(completions)) return [];
+      return completions.map((item: unknown) => this.commandCompletion(item)).filter((item): item is CommandCompletion => Boolean(item));
+    });
   }
 
   async status(projectPath: string, sessionId: string | undefined, key: string | string[]): Promise<AgentStatus> {
+    if (!sessionId) return this.statusWithoutLease(projectPath, sessionId, key);
+    return this.withRuntimeSessionRead(projectPath, sessionId, () => this.statusWithoutLease(projectPath, sessionId, key));
+  }
+
+  private async statusWithoutLease(projectPath: string, sessionId: string | undefined, key: string | string[]): Promise<AgentStatus> {
     const branch = await getGitBranch(projectPath).catch(() => undefined);
     const inactiveStatus: AgentStatus = {
       branch,
@@ -1306,7 +1411,8 @@ export class PiBridge {
         }
         const settled = options.settled();
         const terminalError = options.terminalError?.();
-        const hasUiRequest = [...this.pendingExtensionUiRequests.values()].some((item) => item.session === options.session && item.projectPath === projectPath && item.request.sessionId === sessionId);
+        const hasUiRequest = [...this.pendingExtensionUiRequests.values()].some((item) => item.session === options.session && item.projectPath === projectPath && item.request.sessionId === sessionId)
+          || [...this.pendingExtensionCustomUi.values()].some((item) => item.session === options.session && item.projectPath === projectPath && item.sessionId === sessionId);
         const inUse = this.cachedSessionInUse(options.session);
         if (inUse) sawActivity = true;
         const eligible = options.accepted()
@@ -1359,7 +1465,7 @@ export class PiBridge {
     if (cached && this.runtimeSessions.get(cacheKey) === cached) {
       this.runtimeSessions.delete(cacheKey);
       if (cached.timer) clearTimeout(cached.timer);
-      void cached.promise.then((session) => this.disposeCachedSession(session)).catch(() => undefined);
+      void cached.promise.then((session) => this.deferRuntimeSessionDisposal(cacheKey, session)).catch(() => undefined);
     }
     return true;
   }
@@ -1388,9 +1494,7 @@ export class PiBridge {
         if (entry.timer) clearTimeout(entry.timer);
       }).catch(() => undefined);
     }
-    void this.disposeCachedSession(session)
-      .catch(() => this.disposeCachedSession(session))
-      .catch(() => undefined);
+    this.deferRuntimeSessionDisposal(cacheKey, session);
     return report;
   }
 
@@ -1544,6 +1648,7 @@ export class PiBridge {
 
   private cancelExtensionUiRequests(projectPath: string, sessionId?: string, options: { allWhenSessionMissing?: boolean; session?: object } = {}) {
     const allWhenSessionMissing = options.allWhenSessionMissing ?? true;
+    if (options.session) this.extensionCustomUiCancellationGenerations.set(options.session, (this.extensionCustomUiCancellationGenerations.get(options.session) ?? 0) + 1);
     for (const pending of [...this.pendingExtensionUiRequests.values()]) {
       if (pending.projectPath !== projectPath || (options.session && pending.session !== options.session)) continue;
       if (sessionId) {
@@ -1553,6 +1658,300 @@ export class PiBridge {
       }
       this.settleExtensionUiRequest(pending, { cancelled: true }, pending.defaultValue);
     }
+    for (const pending of [...this.pendingExtensionCustomUi.values()]) {
+      if (pending.projectPath !== projectPath || (options.session && pending.session !== options.session)) continue;
+      if (sessionId) {
+        if (pending.sessionId !== sessionId) continue;
+      } else if (!allWhenSessionMissing && pending.sessionId !== undefined) {
+        continue;
+      }
+      this.settleExtensionCustomUi(pending, undefined);
+    }
+  }
+
+  private loadCustomUiRuntime() {
+    if (!this.customUiRuntimePromise) {
+      this.customUiRuntimePromise = (async () => {
+        const sdk = await this.loadSdk();
+        if (typeof sdk.initTheme === 'function') sdk.initTheme(undefined, false);
+        const agentEntry = fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent'));
+        const agentRoot = path.dirname(path.dirname(agentEntry));
+        const nestedTuiEntry = path.join(agentRoot, 'node_modules/@earendil-works/pi-tui/dist/index.js');
+        const siblingTuiEntry = path.join(path.dirname(agentRoot), 'pi-tui/dist/index.js');
+        const tuiEntry = await stat(nestedTuiEntry).then(() => nestedTuiEntry).catch(() => siblingTuiEntry);
+        const [{ TUI, visibleWidth }, { KeybindingsManager }, { theme }] = await Promise.all([
+          import(pathToFileURL(tuiEntry).href),
+          import(pathToFileURL(path.join(path.dirname(agentEntry), 'core/keybindings.js')).href),
+          import(pathToFileURL(path.join(path.dirname(agentEntry), 'modes/interactive/theme/theme.js')).href),
+        ]);
+        return { TUI, visibleWidth, keybindings: KeybindingsManager.create(getAgentDir()), theme } as CustomUiRuntime;
+      })();
+      this.customUiRuntimePromise.catch(() => { this.customUiRuntimePromise = undefined; });
+    }
+    return this.customUiRuntimePromise;
+  }
+
+  private async createExtensionCustomUi<T>(session: object, projectPath: string, sessionId: string | undefined, factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => any, options?: { overlay?: boolean; overlayOptions?: object | (() => object); onHandle?: (handle: any) => void }) {
+    if (this.sessionCannotPublish(session)) return undefined as T;
+    const cancellationGeneration = this.extensionCustomUiCancellationGenerations.get(session) ?? 0;
+    const { TUI, visibleWidth, keybindings, theme } = await this.loadCustomUiRuntime();
+    if (this.sessionCannotPublish(session) || (this.extensionCustomUiCancellationGenerations.get(session) ?? 0) !== cancellationGeneration) return undefined as T;
+
+    const id = randomUUID();
+    const streamKey = this.sessionStreamKeys.get(session) ?? [];
+    const terminal = new WebExtensionTerminal();
+    const tui = new TUI(terminal, true);
+    let pending: PendingExtensionCustomUi<T>;
+    const result = new Promise<T>((resolve, reject) => {
+      pending = {
+        id,
+        session,
+        projectPath,
+        sessionId,
+        streamKey,
+        terminal,
+        tui,
+        epoch: 0,
+        seq: 0,
+        unackedBytes: 0,
+        sentBytes: new Map(),
+        needsRedraw: false,
+        redrawRequested: false,
+        settled: false,
+        resolve,
+        reject,
+      };
+    });
+    this.pendingExtensionCustomUi.set(id, pending!);
+    pending!.detachTimer = setTimeout(() => this.settleExtensionCustomUi(pending!, undefined as T), EXTENSION_CUSTOM_UI_DETACHED_TIMEOUT_MS);
+    pending!.detachTimer.unref();
+    tui.start();
+    this.broadcast(streamKey, { type: 'agent:ui-custom-start', sessionId, data: { id } });
+
+    const done = (value: T) => this.settleExtensionCustomUi(pending!, value);
+    void Promise.resolve()
+      .then(() => factory(tui, theme, keybindings, done))
+      .then((component) => {
+        if (!component || typeof component.render !== 'function') throw new Error('Extension custom UI factory did not return a component');
+        if (pending!.settled) {
+          try { component.dispose?.(); } catch { /* Ignore late component disposal errors. */ }
+          return;
+        }
+        pending!.component = component;
+        const guardedComponent: any = {
+          render: (width: number) => {
+            try {
+              const lines = component.render(width);
+              if (!Array.isArray(lines) || lines.some((line: unknown) => typeof line !== 'string')) throw new Error('Extension custom UI render() must return an array of strings');
+              if (lines.some((line: string) => visibleWidth(line) > width)) throw new Error('Extension custom UI render() returned a line wider than the available terminal width');
+              return lines;
+            } catch (error) {
+              this.failExtensionCustomUi(pending!, error);
+              return [];
+            }
+          },
+          invalidate: () => {
+            try { component.invalidate(); }
+            catch (error) { this.failExtensionCustomUi(pending!, error); }
+          },
+        };
+        Object.defineProperty(guardedComponent, 'wantsKeyRelease', {
+          get: () => {
+            try { return component.wantsKeyRelease; }
+            catch (error) {
+              this.failExtensionCustomUi(pending!, error);
+              return false;
+            }
+          },
+          configurable: true,
+        });
+        if (typeof component.handleInput === 'function') {
+          guardedComponent.handleInput = (data: string) => {
+            try { component.handleInput(data); }
+            catch (error) { this.failExtensionCustomUi(pending!, error); }
+          };
+        }
+        if ('focused' in component) {
+          Object.defineProperty(guardedComponent, 'focused', {
+            get: () => {
+              try { return component.focused; }
+              catch (error) {
+                this.failExtensionCustomUi(pending!, error);
+                return false;
+              }
+            },
+            set: (focused) => {
+              try { component.focused = focused; }
+              catch (error) { this.failExtensionCustomUi(pending!, error); }
+            },
+            configurable: true,
+          });
+        }
+        pending!.mountedComponent = guardedComponent;
+        if (options?.overlay) {
+          const rawOverlayOptions: any = typeof options.overlayOptions === 'function' ? options.overlayOptions() : options.overlayOptions;
+          const overlayOptions = rawOverlayOptions && typeof rawOverlayOptions.visible === 'function'
+            ? {
+                ...rawOverlayOptions,
+                visible: (width: number, height: number) => {
+                  try { return rawOverlayOptions.visible(width, height); }
+                  catch (error) {
+                    this.failExtensionCustomUi(pending!, error);
+                    return false;
+                  }
+                },
+              }
+            : rawOverlayOptions;
+          const fallbackWidth = typeof component.width === 'number' ? { width: component.width } : undefined;
+          const overlayHandle = tui.showOverlay(guardedComponent, overlayOptions ?? fallbackWidth);
+          if (pending!.settled) {
+            try { overlayHandle.hide(); } catch { /* Ignore cleanup after an initial visibility failure. */ }
+            return;
+          }
+          pending!.overlayHandle = overlayHandle;
+          options.onHandle?.(overlayHandle);
+        } else {
+          tui.addChild(guardedComponent);
+          tui.setFocus(guardedComponent);
+        }
+        tui.requestRender(true);
+      })
+      .catch((error) => this.failExtensionCustomUi(pending!, error));
+    return result;
+  }
+
+  private settleExtensionCustomUi<T>(pending: PendingExtensionCustomUi<T>, value: T) {
+    if (pending.settled) return;
+    pending.settled = true;
+    if (pending.detachTimer) clearTimeout(pending.detachTimer);
+    this.pendingExtensionCustomUi.delete(pending.id);
+    try { pending.overlayHandle?.hide(); } catch { /* Ignore overlay cleanup errors. */ }
+    if (!pending.overlayHandle && pending.mountedComponent) {
+      try { pending.tui.removeChild(pending.mountedComponent); } catch { /* Ignore component removal errors. */ }
+    }
+    try { pending.component?.dispose?.(); } catch { /* Ignore extension disposal errors. */ }
+    try { pending.tui.stop(); } catch { /* Ignore TUI cleanup errors. */ }
+    this.broadcast(pending.streamKey, { type: 'agent:ui-custom-end', sessionId: pending.sessionId, data: { id: pending.id } });
+    pending.resolve(value);
+  }
+
+  private failExtensionCustomUi(pending: PendingExtensionCustomUi<any>, error: unknown) {
+    if (pending.settled) return;
+    pending.settled = true;
+    if (pending.detachTimer) clearTimeout(pending.detachTimer);
+    this.pendingExtensionCustomUi.delete(pending.id);
+    try { pending.overlayHandle?.hide(); } catch { /* Ignore overlay cleanup errors. */ }
+    if (!pending.overlayHandle && pending.mountedComponent) {
+      try { pending.tui.removeChild(pending.mountedComponent); } catch { /* Ignore component removal errors. */ }
+    }
+    try { pending.component?.dispose?.(); } catch { /* Ignore extension disposal errors. */ }
+    try { pending.tui.stop(); } catch { /* Ignore TUI cleanup errors. */ }
+    this.broadcast(pending.streamKey, { type: 'agent:ui-custom-end', sessionId: pending.sessionId, data: { id: pending.id, error: true } });
+    pending.reject(error);
+  }
+
+  private releaseExtensionCustomUiController(pending: PendingExtensionCustomUi<any>, socket: WebSocket) {
+    if (pending.controller !== socket) return;
+    pending.controller = undefined;
+    pending.terminal.detach(pending.writer);
+    pending.writer = undefined;
+    pending.needsRedraw = true;
+    pending.redrawRequested = false;
+    if (pending.detachTimer) clearTimeout(pending.detachTimer);
+    pending.detachTimer = setTimeout(() => this.settleExtensionCustomUi(pending, undefined), EXTENSION_CUSTOM_UI_DETACHED_TIMEOUT_MS);
+    pending.detachTimer.unref();
+    this.broadcast(pending.streamKey, { type: 'agent:ui-custom-start', sessionId: pending.sessionId, data: { id: pending.id, reclaim: true } });
+  }
+
+  handleExtensionCustomUiMessage(key: string, socket: WebSocket, message: ExtensionCustomUiClientMessage) {
+    if (!message.type?.startsWith('agent:ui-custom-')) return false;
+    const pending = typeof message.id === 'string' ? this.pendingExtensionCustomUi.get(message.id) : undefined;
+    if (!pending) return true;
+    if (!streamKeysInclude(pending.streamKey, key)) {
+      sendWebSocketJson(socket, { type: 'error', message: 'Custom UI request not found' });
+      return true;
+    }
+
+    if (message.type === 'agent:ui-custom-abandon') {
+      if (!pending.controller || pending.controller === socket) this.settleExtensionCustomUi(pending, undefined);
+      return true;
+    }
+
+    if (message.type === 'agent:ui-custom-keepalive') {
+      if (!pending.controller) {
+        if (pending.detachTimer) clearTimeout(pending.detachTimer);
+        pending.detachTimer = setTimeout(() => this.settleExtensionCustomUi(pending, undefined), EXTENSION_CUSTOM_UI_DETACHED_TIMEOUT_MS);
+        pending.detachTimer.unref();
+      }
+      return true;
+    }
+
+    if (message.type === 'agent:ui-custom-attach') {
+      if (pending.controller && pending.controller !== socket) {
+        this.sendSocketPayload(socket, JSON.stringify({ type: 'agent:ui-custom-end', sessionId: pending.sessionId, data: { id: pending.id, occupied: true } }));
+        return true;
+      }
+      if (pending.detachTimer) {
+        clearTimeout(pending.detachTimer);
+        pending.detachTimer = undefined;
+      }
+      pending.controller = socket;
+      pending.epoch += 1;
+      pending.seq = 0;
+      pending.unackedBytes = 0;
+      pending.sentBytes.clear();
+      pending.needsRedraw = false;
+      pending.redrawRequested = false;
+      const epoch = pending.epoch;
+      const writer: WebExtensionTerminalWriter = (data) => {
+        if (pending.settled || pending.controller !== socket || pending.epoch !== epoch) return;
+        const bytes = Buffer.byteLength(data);
+        const forcedRedraw = pending.needsRedraw && pending.redrawRequested;
+        if (pending.needsRedraw && !forcedRedraw) return;
+        if (!forcedRedraw && pending.unackedBytes > 0 && pending.unackedBytes + bytes > EXTENSION_CUSTOM_UI_MAX_UNACKED_BYTES) {
+          pending.needsRedraw = true;
+          pending.redrawRequested = false;
+          return;
+        }
+        if (forcedRedraw) {
+          pending.needsRedraw = false;
+          pending.redrawRequested = false;
+        }
+        const seq = ++pending.seq;
+        if (!this.sendSocketPayload(socket, JSON.stringify({ type: 'agent:ui-custom-data', sessionId: pending.sessionId, data: { id: pending.id, epoch, seq, ansi: data } }))) {
+          this.releaseExtensionCustomUiController(pending, socket);
+          return;
+        }
+        pending.sentBytes.set(seq, bytes);
+        pending.unackedBytes += bytes;
+      };
+      pending.writer = writer;
+      pending.terminal.resize(this.finiteNumber(message.cols) ?? 80, this.finiteNumber(message.rows) ?? 24);
+      this.sendSocketPayload(socket, JSON.stringify({ type: 'agent:ui-custom-ready', sessionId: pending.sessionId, data: { id: pending.id, epoch } }));
+      pending.terminal.attach(writer);
+      pending.tui.requestRender(true);
+      return true;
+    }
+
+    if (pending.controller !== socket || message.epoch !== pending.epoch) return true;
+    if (message.type === 'agent:ui-custom-input' && typeof message.data === 'string' && message.data.length <= 64 * 1024) {
+      pending.terminal.receiveInput(message.data);
+    } else if (message.type === 'agent:ui-custom-resize') {
+      pending.terminal.resize(this.finiteNumber(message.cols) ?? pending.terminal.columns, this.finiteNumber(message.rows) ?? pending.terminal.rows);
+    } else if (message.type === 'agent:ui-custom-ack' && Number.isSafeInteger(message.seq)) {
+      for (const [seq, bytes] of pending.sentBytes) {
+        if (seq > message.seq!) continue;
+        pending.sentBytes.delete(seq);
+        pending.unackedBytes = Math.max(0, pending.unackedBytes - bytes);
+      }
+      if (pending.needsRedraw && !pending.redrawRequested && pending.unackedBytes < EXTENSION_CUSTOM_UI_MAX_UNACKED_BYTES / 2) {
+        pending.redrawRequested = true;
+        pending.tui.requestRender(true);
+      }
+    } else if (message.type === 'agent:ui-custom-cancel') {
+      pending.terminal.receiveInput('\x1b');
+    }
+    return true;
   }
 
   private normalizeExtensionUiResponse(request: ExtensionUiRequest, response: ExtensionUiResponse): ExtensionUiResponse {
@@ -1628,7 +2027,7 @@ export class PiBridge {
       setFooter: () => undefined,
       setHeader: () => undefined,
       setTitle: () => undefined,
-      custom: async () => undefined,
+      custom: <T>(factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => any, options?: { overlay?: boolean; overlayOptions?: object | (() => object); onHandle?: (handle: any) => void }) => this.createExtensionCustomUi(session, projectPath, sessionId, factory, options),
       pasteToEditor: () => undefined,
       setEditorText: () => undefined,
       getEditorText: () => '',
@@ -2090,34 +2489,108 @@ export class PiBridge {
     return undefined;
   }
 
-  private async lockRuntimeSession(projectPath: string, sessionId: string, filePath?: string) {
-    return (await this.lockRuntimeSessionWithState(projectPath, sessionId, filePath))?.release;
+  private async withRuntimeSessionRead<T>(projectPath: string, sessionId: string, read: () => Promise<T>) {
+    if (this.closing) throw new Error('pi-web is shutting down.');
+    const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    const task = (async () => {
+      const release = await this.lockRuntimeSession(projectPath, sessionId, undefined, false);
+      if (!release) throw new Error('Session is being deleted.');
+      this.runtimeReadLeases.set(cacheKey, (this.runtimeReadLeases.get(cacheKey) ?? 0) + 1);
+      try {
+        if (this.closing) throw new Error('pi-web is shutting down.');
+        const result = await read();
+        if (this.closing) throw new Error('pi-web is shutting down.');
+        return result;
+      } finally {
+        const readCount = this.runtimeReadLeases.get(cacheKey) ?? 0;
+        if (readCount <= 1) {
+          this.runtimeReadLeases.delete(cacheKey);
+          const waiters = this.runtimeReadLeaseWaiters.get(cacheKey);
+          this.runtimeReadLeaseWaiters.delete(cacheKey);
+          for (const resolve of waiters ?? []) resolve();
+        } else {
+          this.runtimeReadLeases.set(cacheKey, readCount - 1);
+        }
+        release();
+      }
+    })();
+    this.runtimeReadTasks.add(task);
+    try {
+      return await task;
+    } finally {
+      this.runtimeReadTasks.delete(task);
+    }
   }
 
-  private async lockRuntimeSessionWithState(projectPath: string, sessionId: string, filePath?: string): Promise<RuntimeSessionLock | undefined> {
+  private runtimeSessionCurrent(projectPath: string, sessionId: string, session: object) {
+    const entry = this.runtimeSessionEntries.get(session);
+    return Boolean(entry)
+      && !this.closing
+      && !this.sessionCannotPublish(session)
+      && this.runtimeSessions.get(this.runtimeSessionCacheKey(projectPath, sessionId)) === entry;
+  }
+
+  private deferRuntimeSessionDisposal(cacheKey: string, session: unknown) {
+    const disposal = (async () => {
+      if (this.runtimeReadLeases.has(cacheKey)) {
+        await new Promise<void>((resolve) => {
+          const waiters = this.runtimeReadLeaseWaiters.get(cacheKey) ?? new Set<() => void>();
+          waiters.add(resolve);
+          this.runtimeReadLeaseWaiters.set(cacheKey, waiters);
+          if (!this.runtimeReadLeases.has(cacheKey) && waiters.delete(resolve)) {
+            if (!waiters.size) this.runtimeReadLeaseWaiters.delete(cacheKey);
+            resolve();
+          }
+        });
+      }
+      await this.disposeCachedSession(session).catch(() => this.disposeCachedSession(session));
+    })().catch(() => undefined).finally(() => this.deferredRuntimeDisposals.delete(disposal));
+    this.deferredRuntimeDisposals.add(disposal);
+  }
+
+  private async lockRuntimeSession(projectPath: string, sessionId: string, filePath?: string, countAsActivity = true, blockOperations = false) {
+    return (await this.lockRuntimeSessionWithState(projectPath, sessionId, filePath, countAsActivity, blockOperations))?.release;
+  }
+
+  private async lockRuntimeSessionWithState(projectPath: string, sessionId: string, filePath?: string, countAsActivity = true, blockOperations = false): Promise<RuntimeSessionLock | undefined> {
     let resolvedFilePath = filePath;
     if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
     if (!resolvedFilePath) {
       try {
         resolvedFilePath = await resolveSessionFile(sessionId, projectPath);
       } catch {
-        const cached = this.runtimeSessions.get(this.runtimeSessionCacheKey(projectPath, sessionId));
-        resolvedFilePath = cached ? this.cachedSessionFile(await cached.promise.catch(() => undefined)) : undefined;
+        // The base session-id key is sufficient while a pending runtime has no resolvable file.
+        // Do not await its initialization here: recovery must see this lease before that promise settles.
+        resolvedFilePath = undefined;
       }
     }
     if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
 
     const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, resolvedFilePath);
-    const wasActive = [...keys].some((key) => this.activeRuntimeSessions.has(key));
-    for (const key of keys) this.activeRuntimeSessions.set(key, (this.activeRuntimeSessions.get(key) ?? 0) + 1);
+    const wasActive = [...keys].some((key) => this.activeRuntimeSessions.has(key) || this.operationBlockingRuntimeSessions.has(key));
+    for (const key of keys) {
+      this.leasedRuntimeSessions.set(key, (this.leasedRuntimeSessions.get(key) ?? 0) + 1);
+      if (countAsActivity) this.activeRuntimeSessions.set(key, (this.activeRuntimeSessions.get(key) ?? 0) + 1);
+      if (blockOperations) this.operationBlockingRuntimeSessions.set(key, (this.operationBlockingRuntimeSessions.get(key) ?? 0) + 1);
+    }
     let active = true;
     const release = () => {
       if (!active) return;
       active = false;
       for (const key of keys) {
-        const count = this.activeRuntimeSessions.get(key) ?? 0;
-        if (count <= 1) this.activeRuntimeSessions.delete(key);
-        else this.activeRuntimeSessions.set(key, count - 1);
+        const leaseCount = this.leasedRuntimeSessions.get(key) ?? 0;
+        if (leaseCount <= 1) this.leasedRuntimeSessions.delete(key);
+        else this.leasedRuntimeSessions.set(key, leaseCount - 1);
+        if (countAsActivity) {
+          const activeCount = this.activeRuntimeSessions.get(key) ?? 0;
+          if (activeCount <= 1) this.activeRuntimeSessions.delete(key);
+          else this.activeRuntimeSessions.set(key, activeCount - 1);
+        }
+        if (blockOperations) {
+          const blockingCount = this.operationBlockingRuntimeSessions.get(key) ?? 0;
+          if (blockingCount <= 1) this.operationBlockingRuntimeSessions.delete(key);
+          else this.operationBlockingRuntimeSessions.set(key, blockingCount - 1);
+        }
       }
     };
     return { release, wasActive };
@@ -2197,7 +2670,7 @@ export class PiBridge {
       this.scheduleCachedSessionEviction(cache, key, cached);
       return;
     }
-    if (this.cachedSessionInUse(session)) {
+    if (this.leasedRuntimeSessions.has(key) || this.cachedSessionInUse(session)) {
       cached.expiresAt = Date.now() + SESSION_CACHE_BUSY_RETRY_MS;
       this.scheduleCachedSessionEviction(cache, key, cached);
       return;
@@ -2220,7 +2693,7 @@ export class PiBridge {
   private cachedSessionInUse(session: unknown) {
     const candidates = [session];
     if (session && typeof session === 'object') candidates.push((session as { session?: unknown }).session);
-    return candidates.some((candidate) => Boolean(candidate && typeof candidate === 'object' && this.extensionAsyncTasks.get(candidate)?.size))
+    return candidates.some((candidate) => Boolean(candidate && typeof candidate === 'object' && (this.extensionAsyncTasks.get(candidate)?.size || [...this.pendingExtensionCustomUi.values()].some((pending) => pending.session === candidate))))
       || this.cachedSessionHasSdkActivity(session);
   }
 
@@ -2297,24 +2770,8 @@ export class PiBridge {
   }
 
   private async getCommandSession(projectPath: string, sessionId?: string): Promise<any> {
-    if (this.closing) throw new Error('pi-web is shutting down.');
-    if (sessionId) return this.getSession(projectPath, sessionId);
-    const cached = this.getCachedSession(this.commandSessions, projectPath);
-    if (cached) return cached;
-
-    const sessionPromise = this.createSessionPromise(async () => {
-      const sdk = await this.loadSdk();
-      if (!sdk.createAgentSession || typeof sdk.SessionManager?.inMemory !== 'function') throw new Error('No supported pi SDK command session factory found');
-      const result = await sdk.createAgentSession({ cwd: projectPath, sessionManager: sdk.SessionManager.inMemory(projectPath) });
-      return result.session ?? result;
-    });
-    this.setCachedSession(this.commandSessions, projectPath, sessionPromise);
-    try {
-      return await sessionPromise;
-    } catch (error) {
-      if (this.commandSessions.get(projectPath)?.promise === sessionPromise) this.commandSessions.delete(projectPath);
-      throw error;
-    }
+    if (!sessionId) throw new Error('Missing session id');
+    return this.getSession(projectPath, sessionId);
   }
 
   private async getSession(projectPath: string, sessionId?: string): Promise<any> {
@@ -2377,8 +2834,9 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
     bridge.subscribe(key, socket);
     socket.on('message', (data: { toString(): string }) => {
       try {
-        const message = JSON.parse(data.toString()) as { type?: string };
+        const message = JSON.parse(data.toString()) as ExtensionCustomUiClientMessage;
         if (message.type === 'ping') sendWebSocketJson(socket, { type: 'pong' });
+        else bridge.handleExtensionCustomUiMessage(key, socket, message);
       } catch {
         sendWebSocketJson(socket, { type: 'error', message: 'Invalid websocket message' });
       }
@@ -2468,7 +2926,8 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
   });
 
   app.post<{ Params: { projectId: string }; Body: PromptBody }>('/api/projects/:projectId/agent/prompt', async (request, reply) => {
-    if (!request.body?.prompt?.trim()) return reply.code(400).send({ error: 'Missing prompt' });
+    if (!request.body?.sessionId) return reply.code(400).send({ error: 'Missing session' });
+    if (!request.body.prompt?.trim()) return reply.code(400).send({ error: 'Missing prompt' });
     if (request.body.streamingBehavior && request.body.streamingBehavior !== 'steer' && request.body.streamingBehavior !== 'followUp') return reply.code(400).send({ error: 'Invalid streaming behavior' });
     if (request.body.clientMessageId !== undefined && (typeof request.body.clientMessageId !== 'string' || !request.body.clientMessageId || request.body.clientMessageId.length > 200 || request.body.streamingBehavior !== 'steer')) return reply.code(400).send({ error: 'Invalid client message id' });
     if (request.body.streamingBehavior && (request.body.treeTargetId || request.body.treeSummary || 'branchFromId' in request.body)) return reply.code(400).send({ error: 'Streaming behavior cannot be combined with tree navigation or branching' });
@@ -2509,7 +2968,13 @@ export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRe
       if (request.body.awaitCompletion) {
         void preflight.catch(() => undefined);
         await promptTask;
-        return { ok: true };
+        const manager = await sessionManagerForSession(request.body.sessionId, project.path);
+        return {
+          ok: true,
+          messageEntryIds: manager.getEntries()
+            .filter((entry) => entry.type === 'message')
+            .map((entry) => entry.id),
+        };
       }
       await preflight;
       return { ok: true };
@@ -2590,6 +3055,10 @@ function streamKey(projectId: string, sessionId?: string) {
 
 function primaryStreamKey(key: string | string[]) {
   return Array.isArray(key) ? key[0] ?? '' : key;
+}
+
+function streamKeysInclude(keys: string | string[], key: string) {
+  return Array.isArray(keys) ? keys.includes(key) : keys === key;
 }
 
 function isPromiseLike(value: unknown): value is PromiseLike<unknown> {

@@ -105,6 +105,8 @@ import {
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
+import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
+import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -268,7 +270,7 @@ type LiveTranscriptSnapshot = { entryIds: string[]; userMessageCount: number; as
 type AssistantEntryPreview = { text: string; thinking: string; error: string };
 type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: number; latestAssistantId?: string };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
-type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: () => void; onDisconnect?: () => void; heartbeat?: boolean };
+type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: (send: ExtensionCustomUiSender) => void; onDisconnect?: () => void; heartbeat?: boolean };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
 const REVIEW_NOTES_FILTER_OPTIONS: SelectOption[] = [
   { value: 'relevant', label: 'Relevant' },
@@ -436,11 +438,24 @@ const RECENT_PROJECTS_KEY = 'pi-web-recent-projects';
 const RECENT_FILES_KEY_PREFIX = 'pi-web-recent-files:';
 const fileExplorerPaths = new Map<string, string>();
 const composerDrafts = new Map<string, ComposerDraft>();
+const composerDraftRecoveryListeners = new Map<string, Set<(draft: ComposerDraft) => boolean>>();
+const composerDraftUploadListeners = new Map<string, Set<(uploads: UploadAsset[]) => void>>();
+const composerDraftSessionClearListeners = new Map<string, Set<(sessionId: string) => void>>();
+const abandonedComposerDraftKeys = new Set<string>();
+const abandonedPendingSessionIds = new Map<string, Set<string>>();
+const abandonedPendingSessionAbortIds = new Map<string, Set<string>>();
+const abandonedPendingSessionRetryTimers = new Map<string, number>();
+const abandonedPendingSessionRetirements = new Map<string, Promise<void>>();
+const commandSessionPromises = new Map<string, Promise<string>>();
+const pendingAgentSelectionApplies = new Map<string, Promise<void>>();
 const OPEN_PROJECTS_KEY = 'pi-web-open-projects';
 const ACTIVE_PROJECT_KEY = 'pi-web-active-project';
 const PROJECT_QUERY_KEY = 'project';
 const WORKSPACE_QUERY_KEY = 'workspace';
 const SESSION_QUERY_KEY = 'session';
+const CUSTOM_UI_SESSION_IDS_KEY = 'pi-web-custom-ui-session-ids';
+const DRAFT_SESSION_IDS_KEY = 'pi-web-draft-session-ids';
+const ABANDONED_PENDING_SESSION_ABORT_IDS_KEY = 'pi-web-abandoned-pending-session-abort-ids';
 const WORKSPACES_ENABLED_KEY = 'pi-web-workspaces-enabled';
 const WORKSPACE_NOTIFICATIONS_KEY = 'pi-web-workspace-notifications';
 const WORKSPACE_NOTIFICATIONS_BROWSER_KEY = 'pi-web-browser-notifications-enabled';
@@ -733,10 +748,27 @@ function Shell() {
   const [sessionId, setSessionId] = createSignal<string | undefined>(initialActiveSessionId);
   const [requestedSessionId, setRequestedSessionId] = createSignal<string | undefined>(initialActiveSessionId);
   const [sessionWorkspaceId, setSessionWorkspaceId] = createSignal<string>();
+  const [sessionNavigationRevision, setSessionNavigationRevision] = createSignal(0);
+  const [newComposerRevisions, setNewComposerRevisions] = createSignal<Record<string, number>>({});
+  const [draftSessionIds, setDraftSessionIds] = createSignal<Record<string, string>>({ ...readDraftSessionIds(), ...readCustomUiSessionIds() });
   const [events, setEvents] = createSignal<string[]>([]);
   const [liveAgentActivity, setLiveAgentActivity] = createSignal<AgentActivity>(emptyAgentActivity());
   const [liveShellActivity, setLiveShellActivity] = createSignal<BashActivity>(emptyBashActivity());
   const [extensionUiRequests, setExtensionUiRequests] = createSignal<Record<string, ExtensionUiRequest>>({});
+  const [extensionCustomUis, setExtensionCustomUis] = createSignal<ExtensionCustomUiRequest[]>([]);
+  const extensionCustomUi = createMemo(() => extensionCustomUis().at(-1));
+  const [agentSocketSender, setAgentSocketSender] = createSignal<ExtensionCustomUiSender>();
+  createEffect(() => {
+    const send = agentSocketSender();
+    const requests = extensionCustomUis();
+    if (!send || !requests.length) return;
+    const keepAlive = () => requests.forEach(({ id }) => send({ type: 'agent:ui-custom-keepalive', id }));
+    keepAlive();
+    const timer = window.setInterval(keepAlive, 60_000);
+    onCleanup(() => window.clearInterval(timer));
+  });
+  const extensionCustomUiListeners = new Set<(event: ExtensionCustomUiEvent) => void>();
+  let extensionCustomUiGeneration = 0;
   const settledExtensionUiRequestIds = new Set<string>();
   const completedSessionRefreshes = new Set<string>();
   const recentWorkspaceNotificationEvents = new Map<string, number>();
@@ -782,6 +814,7 @@ function Shell() {
   const initialActiveWorkspacePath = readActiveWorkspacePath();
   const [pendingActiveWorkspacePath, setPendingActiveWorkspacePath] = createSignal(initialActiveWorkspacePath);
   let initialSessionRestorePending = Boolean(initialActiveSessionId);
+  let sessionNavigationTargetWorkspaceId: string | undefined;
   let workspaceSessionRestoredForId: string | undefined;
   let workspaceSessionRestoreRequest = 0;
   let workspaceSessionRestoreTarget: { workspaceId: string; sessionId: string; request: number } | undefined;
@@ -839,6 +872,25 @@ function Shell() {
     }
     return byId;
   });
+  const restoredAbandonedPendingSessionKeys = new Set<string>();
+  createEffect(() => {
+    const knownWorkspaceIds = new Set(Object.keys(workspaceLookup()));
+    for (const [storedProjectId, sessionIds] of Object.entries(readAbandonedPendingSessionAbortIds())) {
+      if (!knownWorkspaceIds.has(storedProjectId)) continue;
+      for (const storedSessionId of sessionIds) {
+        const key = `${storedProjectId}\0${storedSessionId}`;
+        if (restoredAbandonedPendingSessionKeys.has(key)) continue;
+        restoredAbandonedPendingSessionKeys.add(key);
+        const abandonedSessionIds = abandonedPendingSessionIds.get(storedProjectId) ?? new Set<string>();
+        abandonedSessionIds.add(storedSessionId);
+        abandonedPendingSessionIds.set(storedProjectId, abandonedSessionIds);
+        const abortSessionIds = abandonedPendingSessionAbortIds.get(storedProjectId) ?? new Set<string>();
+        abortSessionIds.add(storedSessionId);
+        abandonedPendingSessionAbortIds.set(storedProjectId, abortSessionIds);
+        void retireAbandonedPendingSession(storedProjectId, storedSessionId);
+      }
+    }
+  });
   const workspaceNotificationSummaries = createMemo(() => {
     const summaries: Record<string, WorkspaceNotificationSummary> = {};
     for (const workspaceId of Object.keys(workspaceLookup())) summaries[workspaceId] = workspaceNotificationSummary(workspaceNotificationStore()[workspaceId]);
@@ -880,6 +932,11 @@ function Shell() {
     const workspaceId = workspaceProject()?.id;
     return id && owner && workspaceId && owner === workspaceId ? id : undefined;
   });
+  const runtimeSessionId = createMemo(() => {
+    const workspaceId = workspaceProject()?.id;
+    return activeSessionId() ?? (workspaceId ? draftSessionIds()[workspaceId] : undefined);
+  });
+  const agentStreamProjectId = createMemo(() => workspaceProject()?.id);
   const currentSessionRunning = createMemo(() => {
     const project = workspaceProject();
     const id = activeSessionId();
@@ -902,6 +959,7 @@ function Shell() {
   let agentStatusRequestGeneration = 0;
   let agentUiRefreshGeneration = 0;
   const agentStatusReconciledGenerations = new Map<string, number>();
+  const ignoredActiveStreamSessionIds = new Map<string, Set<string>>();
   let agentConnectionGeneration = 0;
 
   function queueStoredAgentEvent(payload: string) {
@@ -1075,6 +1133,11 @@ function Shell() {
     });
   }
 
+  function subscribeExtensionCustomUi(listener: (event: ExtensionCustomUiEvent) => void) {
+    extensionCustomUiListeners.add(listener);
+    return () => extensionCustomUiListeners.delete(listener);
+  }
+
   const workspaceExtensionUiRequests = createMemo(() => Object.values(extensionUiRequests())
     .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)));
 
@@ -1087,7 +1150,21 @@ function Shell() {
     removeExtensionUiRequest(request.id);
   }
 
-  function setActiveSession(id: string | undefined, workspaceId = workspaceProject()?.id) {
+  function setDraftSessionId(workspaceId: string, sessionId: string | undefined) {
+    setDraftSessionIds((sessionIds) => {
+      if (sessionIds[workspaceId] === sessionId) return sessionIds;
+      const next = { ...sessionIds };
+      if (sessionId) next[workspaceId] = sessionId;
+      else delete next[workspaceId];
+      return next;
+    });
+  }
+
+  function setActiveSession(id: string | undefined, workspaceId = workspaceProject()?.id, options: { forceNavigation?: boolean } = {}) {
+    if (options.forceNavigation || requestedSessionId() !== id || sessionNavigationTargetWorkspaceId !== workspaceId) {
+      setSessionNavigationRevision((revision) => revision + 1);
+    }
+    sessionNavigationTargetWorkspaceId = workspaceId;
     setRequestedSessionId(id);
     setSessionWorkspaceId(id ? workspaceId : undefined);
     setSessionId(id);
@@ -1352,7 +1429,10 @@ function Shell() {
     });
 
     if ((event.type === 'agent:start' || event.type === 'bash:start') && sessionId) markSessionActivityStarted(completedSessionRefreshes, workspaceId, sessionId);
-    if ((event.type === 'agent:finish' || event.type === 'agent:error' || event.type === 'bash:finish' || event.type === 'bash:error') && sessionId) refreshCompletedSession(workspaceId, sessionId, event.operationId);
+    if ((event.type === 'agent:finish' || event.type === 'agent:error' || event.type === 'bash:finish' || event.type === 'bash:error') && sessionId) {
+      refreshCompletedSession(workspaceId, sessionId, event.operationId);
+      if (abandonedPendingSessionIds.get(workspaceId)?.has(sessionId)) void retireAbandonedPendingSession(workspaceId, sessionId);
+    }
 
     if (!notification) return;
     const actionNeeded = isActionNeededNotification(notification);
@@ -1726,26 +1806,39 @@ function Shell() {
     });
   });
 
+  let extensionUiTargetProjectId = workspaceProject()?.id;
   createEffect(() => {
-    workspaceProject();
-    setExtensionUiRequests({});
+    const targetProjectId = workspaceProject()?.id;
+    if (extensionUiTargetProjectId !== undefined && targetProjectId !== extensionUiTargetProjectId) {
+      setExtensionUiRequests({});
+      setExtensionCustomUis([]);
+    }
+    extensionUiTargetProjectId = targetProjectId;
+  });
+
+  let extensionCustomUiTargetSessionId = runtimeSessionId();
+  createEffect(() => {
+    const targetSessionId = runtimeSessionId();
+    if (targetSessionId !== extensionCustomUiTargetSessionId) setExtensionCustomUis((current) => current.filter((item) => item.sessionId === targetSessionId));
+    extensionCustomUiTargetSessionId = targetSessionId;
   });
 
   createEffect(() => {
-    const project = workspaceProject();
-    const currentActiveSessionId = activeSessionId();
-    if (!project) return;
+    const projectId = agentStreamProjectId();
+    const currentRuntimeSessionId = runtimeSessionId();
+    if (!projectId) return;
+    const project = { id: projectId };
     const connectionGeneration = ++agentConnectionGeneration;
     const refreshAgentQueries = () => {
       queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
-      if (!currentActiveSessionId) {
+      if (!currentRuntimeSessionId) {
         const socketGeneration = agentSocketEventGeneration;
         const refreshGeneration = ++agentUiRefreshGeneration;
         void apiAgentRefresh<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests`)
           .then(({ requests }) => {
             if (
               workspaceProject()?.id === project.id
-              && activeSessionId() === undefined
+              && runtimeSessionId() === undefined
               && socketGeneration === agentSocketEventGeneration
               && refreshGeneration === agentUiRefreshGeneration
               && connectionGeneration === agentConnectionGeneration
@@ -1757,38 +1850,38 @@ function Shell() {
 
       const statusEventGeneration = agentSocketEventGeneration;
       const statusRequestGeneration = ++agentStatusRequestGeneration;
-      void apiAgentRefresh<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
+      void apiAgentRefresh<{ status: AgentStatusInfo }>(`/api/projects/${project.id}/agent/status?sessionId=${encodeURIComponent(currentRuntimeSessionId)}`)
         .then(({ status }) => {
           if (
             workspaceProject()?.id === project.id
-            && activeSessionId() === currentActiveSessionId
+            && runtimeSessionId() === currentRuntimeSessionId
             && statusEventGeneration === agentSocketEventGeneration
             && statusRequestGeneration === agentStatusRequestGeneration
             && connectionGeneration === agentConnectionGeneration
           ) {
-            if (!status.running || status.recovery) queryClient.invalidateQueries({ queryKey: ['session', project.id, currentActiveSessionId] });
-            reconcileAuthoritativeAgentStatus(project.id, currentActiveSessionId, status);
+            if (!status.running || status.recovery) queryClient.invalidateQueries({ queryKey: ['session', project.id, currentRuntimeSessionId] });
+            reconcileAuthoritativeAgentStatus(project.id, currentRuntimeSessionId, status);
           }
         })
         .catch((error) => console.warn('Could not refresh agent status', error));
 
       const uiEventGeneration = agentSocketEventGeneration;
       const uiRefreshGeneration = ++agentUiRefreshGeneration;
-      const statusKey = `${project.id}\u0000${currentActiveSessionId}`;
+      const statusKey = `${project.id}\u0000${currentRuntimeSessionId}`;
       const statusGeneration = agentStatusReconciledGenerations.get(statusKey) ?? 0;
-      void apiAgentRefresh<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests?sessionId=${encodeURIComponent(currentActiveSessionId)}`)
+      void apiAgentRefresh<{ requests: ExtensionUiRequest[] }>(`/api/projects/${project.id}/agent/ui-requests?sessionId=${encodeURIComponent(currentRuntimeSessionId)}`)
         .then(({ requests }) => {
           if (
             workspaceProject()?.id !== project.id
-            || activeSessionId() !== currentActiveSessionId
+            || runtimeSessionId() !== currentRuntimeSessionId
             || uiEventGeneration !== agentSocketEventGeneration
             || uiRefreshGeneration !== agentUiRefreshGeneration
             || connectionGeneration !== agentConnectionGeneration
           ) return;
           const currentStatusGeneration = agentStatusReconciledGenerations.get(statusKey) ?? 0;
-          const status = queryClient.getQueryData<{ status: AgentStatusInfo }>(['agent-status', project.id, currentActiveSessionId])?.status;
-          if (shouldSuppressAgentUiRequests(statusGeneration, currentStatusGeneration, status)) removeSessionExtensionUiRequests(currentActiveSessionId);
-          else replaceSessionExtensionUiRequests(currentActiveSessionId, requests);
+          const status = queryClient.getQueryData<{ status: AgentStatusInfo }>(['agent-status', project.id, currentRuntimeSessionId])?.status;
+          if (shouldSuppressAgentUiRequests(statusGeneration, currentStatusGeneration, status)) removeSessionExtensionUiRequests(currentRuntimeSessionId);
+          else replaceSessionExtensionUiRequests(currentRuntimeSessionId, requests);
         })
         .catch((error) => console.warn('Could not load extension UI requests', error));
     };
@@ -1799,13 +1892,58 @@ function Shell() {
     const processAgentSocketPayload = (payload: string) => {
       try {
         const parsed = JSON.parse(payload) as AgentServerEvent & { sessionId?: string };
+        const customUiEvent = parsed.type === 'agent:ui-custom-start' || parsed.type === 'agent:ui-custom-end' || parsed.type === 'agent:ui-custom-ready' || parsed.type === 'agent:ui-custom-data';
+        if (
+          runtimeSessionId() !== currentRuntimeSessionId
+          && !(
+            customUiEvent
+            && parsed.sessionId === currentRuntimeSessionId
+            && workspaceProject()?.id === project.id
+            && !activeSessionId()
+            && readCustomUiSessionIds()[project.id] === currentRuntimeSessionId
+          )
+        ) return;
         const dataType = parsed.type === 'agent:event' ? agentEventDataType(parsed.data) : undefined;
+        const ignoredSessionIds = ignoredActiveStreamSessionIds.get(project.id);
+        if (!currentRuntimeSessionId && parsed.sessionId && ignoredSessionIds?.has(parsed.sessionId)) {
+          if (parsed.type && ['agent:finish', 'agent:error', 'bash:finish', 'bash:error'].includes(parsed.type)) {
+            ignoredSessionIds.delete(parsed.sessionId);
+            if (!ignoredSessionIds.size) ignoredActiveStreamSessionIds.delete(project.id);
+            if (abandonedPendingSessionIds.get(project.id)?.has(parsed.sessionId)) void retireAbandonedPendingSession(project.id, parsed.sessionId);
+          }
+          return;
+        }
+        const eventSessionId = parsed.sessionId ?? currentRuntimeSessionId;
+        if (customUiEvent) {
+          const data = parsed.data && typeof parsed.data === 'object' ? parsed.data as Record<string, unknown> : undefined;
+          const id = typeof data?.id === 'string' ? data.id : undefined;
+          if (!id) return;
+          if (parsed.type === 'agent:ui-custom-start') {
+            if (eventSessionId) rememberCustomUiSessionId(project.id, eventSessionId);
+            const request = { id, sessionId: eventSessionId, generation: ++extensionCustomUiGeneration };
+            setExtensionCustomUis((current) => {
+              const existingIndex = current.findIndex((item) => item.id === id);
+              if (data?.reclaim === true && existingIndex !== -1) return current.map((item, index) => index === existingIndex ? request : item);
+              return [...current.filter((item) => item.id !== id), request];
+            });
+          } else if (parsed.type === 'agent:ui-custom-end') {
+            setExtensionCustomUis((current) => {
+              const next = current.filter((item) => item.id !== id);
+              if (eventSessionId && !next.some((item) => item.sessionId === eventSessionId)) forgetCustomUiSessionId(project.id, eventSessionId);
+              return next;
+            });
+          }
+          else if (data && typeof data.epoch === 'number') {
+            const event = { type: parsed.type, sessionId: eventSessionId, data } as ExtensionCustomUiEvent;
+            for (const listener of extensionCustomUiListeners) listener(event);
+          }
+          return;
+        }
         const startsAgent = parsed.type === 'agent:start' || dataType === 'agent_start';
         const continuesCurrentOperation = startsAgent
           && Boolean(parsed.operationId && liveAgentActivityValue.running && parsed.operationId === liveAgentActivityValue.operationId);
         if (startsAgent && !continuesCurrentOperation) resetAgentEvents([payload]);
         else if (shouldHandleAgentEvent(parsed)) handleAgentEvent(payload, parsed);
-        const eventSessionId = parsed.sessionId ?? currentActiveSessionId;
         if (parsed.type === 'agent:ui-request') {
           const request = readExtensionUiRequest(parsed.data, eventSessionId);
           if (request) upsertExtensionUiRequest(request);
@@ -1835,6 +1973,7 @@ function Shell() {
           updateAgentRunningCache(project.id, eventSessionId, false);
           removeSessionExtensionUiRequests(eventSessionId);
           refreshCompletedSession(project.id, eventSessionId, parsed.operationId);
+          if (abandonedPendingSessionIds.get(project.id)?.has(eventSessionId)) void retireAbandonedPendingSession(project.id, eventSessionId);
         }
       } catch {
         if (shouldShowAgentEvent(payload)) handleAgentEvent(payload);
@@ -1882,11 +2021,16 @@ function Shell() {
       pendingAgentSocketOffset = 0;
     };
 
-    const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentActiveSessionId ? `?sessionId=${encodeURIComponent(currentActiveSessionId)}` : ''}`), {
+    const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentRuntimeSessionId ? `?sessionId=${encodeURIComponent(currentRuntimeSessionId)}` : ''}`), {
       heartbeat: true,
-      onOpen: refreshAgentQueries,
+      onOpen: (send) => {
+        if (connectionGeneration === agentConnectionGeneration) setAgentSocketSender(() => send);
+        refreshAgentQueries();
+      },
       onDisconnect: () => {
+        if (connectionGeneration === agentConnectionGeneration) setAgentSocketSender(undefined);
         flushPendingAgentSocketPayloads();
+        if (connectionGeneration === agentConnectionGeneration) setExtensionCustomUis([]);
         refreshAgentQueries();
       },
       onMessage: (event) => {
@@ -1895,7 +2039,8 @@ function Shell() {
         try {
           // The notification socket can refresh the persisted transcript before this RAF queue drains.
           // Apply the turn boundary now so Chat snapshots the transcript before completion arrives.
-          if ((JSON.parse(payload) as AgentServerEvent).type === 'agent:start') {
+          const type = (JSON.parse(payload) as AgentServerEvent).type;
+          if (type === 'agent:start' || type?.startsWith('agent:ui-custom-')) {
             flushPendingAgentSocketPayloads();
             processAgentSocketPayload(payload);
             return;
@@ -1908,7 +2053,10 @@ function Shell() {
       },
     });
     onCleanup(() => {
-      if (agentConnectionGeneration === connectionGeneration) agentConnectionGeneration += 1;
+      if (agentConnectionGeneration === connectionGeneration) {
+        agentConnectionGeneration += 1;
+        setAgentSocketSender(undefined);
+      }
       cleanup();
       flushPendingAgentSocketPayloads();
     });
@@ -2086,10 +2234,11 @@ function Shell() {
     });
   }
 
-  function selectSession(id: string, workspaceId = workspaceProject()?.id, expectedSessionId?: string | null) {
+  function selectSession(id: string, workspaceId = workspaceProject()?.id, expectedSessionId?: string | null, expectedNavigationRevision?: number) {
     const currentWorkspaceId = workspaceProject()?.id;
     const currentSessionId = activeSessionId();
-    if (expectedSessionId !== undefined && currentSessionId !== (expectedSessionId ?? undefined)) return;
+    if (expectedNavigationRevision !== undefined && sessionNavigationRevision() !== expectedNavigationRevision) return false;
+    if (expectedSessionId !== undefined && (currentWorkspaceId !== workspaceId || currentSessionId !== (expectedSessionId ?? undefined))) return false;
     workspaceSessionRestoreRequest += 1;
     const switchedWorkspace = Boolean(workspaceId && currentWorkspaceId !== workspaceId);
     if (workspaceId && currentWorkspaceId !== workspaceId) {
@@ -2098,10 +2247,11 @@ function Shell() {
       workspaceSessionRestoredForId = workspaceId;
     }
     if (workspaceId) rememberWorkspaceSession(workspaceId, id);
-    if (currentSessionId === id && !switchedWorkspace) return;
+    if (currentSessionId === id && !switchedWorkspace) return true;
     const keepEvents = eventsBelongToSession(events(), id);
     setActiveSession(id, workspaceId);
     if (!keepEvents) resetAgentEvents([]);
+    return true;
   }
 
   function handleSessionDeleted(id: string) {
@@ -2209,8 +2359,46 @@ function Shell() {
   function startNewSession(workspaceId?: string) {
     const targetWorkspaceId = workspaceId ?? workspaceProject()?.id;
     workspaceSessionRestoreRequest += 1;
-    if (targetWorkspaceId) forgetWorkspaceLastSession(targetWorkspaceId);
-    setActiveSession(undefined, targetWorkspaceId);
+    if (targetWorkspaceId) {
+      const rememberedSessionId = lastWorkspaceSessions()[targetWorkspaceId];
+      const persistedDraftSessionId = readDraftSessionIds()[targetWorkspaceId];
+      const persistedCustomUiSessionId = readCustomUiSessionIds()[targetWorkspaceId];
+      forgetWorkspaceLastSession(targetWorkspaceId);
+      forgetDraftSessionId(targetWorkspaceId);
+      forgetCustomUiSessionId(targetWorkspaceId);
+      const abandonedDraftKey = composerDraftKey(targetWorkspaceId, undefined, newComposerRevisions()[targetWorkspaceId] ?? 0);
+      const abandonedDraftSessionId = readComposerDraft(abandonedDraftKey).commandSessionId
+        ?? draftSessionIds()[targetWorkspaceId]
+        ?? persistedDraftSessionId
+        ?? persistedCustomUiSessionId;
+      const abandonedSessionId = abandonedDraftSessionId
+        ?? (workspaceProject()?.id === targetWorkspaceId ? activeSessionId() : undefined)
+        ?? rememberedSessionId;
+      abandonedComposerDraftKeys.add(abandonedDraftKey);
+      if (abandonedComposerDraftKeys.size > 256) abandonedComposerDraftKeys.delete(abandonedComposerDraftKeys.values().next().value!);
+      composerDrafts.delete(abandonedDraftKey);
+      setDraftSessionId(targetWorkspaceId, undefined);
+      if (abandonedSessionId) {
+        const abandonedSessionIds = abandonedPendingSessionIds.get(targetWorkspaceId) ?? new Set<string>();
+        abandonedSessionIds.add(abandonedSessionId);
+        abandonedPendingSessionIds.set(targetWorkspaceId, abandonedSessionIds);
+        if (abandonedSessionId === abandonedDraftSessionId) {
+          const abortSessionIds = abandonedPendingSessionAbortIds.get(targetWorkspaceId) ?? new Set<string>();
+          abortSessionIds.add(abandonedSessionId);
+          abandonedPendingSessionAbortIds.set(targetWorkspaceId, abortSessionIds);
+          rememberAbandonedPendingSessionAbortId(targetWorkspaceId, abandonedSessionId);
+        }
+        void retireAbandonedPendingSession(targetWorkspaceId, abandonedSessionId);
+      }
+      const ignoredSessionIds = ignoredActiveStreamSessionIds.get(targetWorkspaceId) ?? new Set<string>();
+      if (abandonedSessionId) ignoredSessionIds.add(abandonedSessionId);
+      if (workspaceProject()?.id === targetWorkspaceId && activeSessionId()) ignoredSessionIds.add(activeSessionId()!);
+      for (const runningSessionId of workspaceNotificationState(workspaceNotificationStore()[targetWorkspaceId]).runningSessionIds) ignoredSessionIds.add(runningSessionId);
+      while (ignoredSessionIds.size > 256) ignoredSessionIds.delete(ignoredSessionIds.values().next().value!);
+      if (ignoredSessionIds.size) ignoredActiveStreamSessionIds.set(targetWorkspaceId, ignoredSessionIds);
+      setNewComposerRevisions((revisions) => ({ ...revisions, [targetWorkspaceId]: (revisions[targetWorkspaceId] ?? 0) + 1 }));
+    }
+    setActiveSession(undefined, targetWorkspaceId, { forceNavigation: true });
     if (workspaceId) {
       setWorkspaceProjectId(workspaceId);
       workspaceSessionRestoredForId = workspaceId;
@@ -2447,7 +2635,16 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onSessionNotFound={handleSessionNotFound} onExtensionUiReply={replyExtensionUiRequest} beginAgentStatusRequest={beginAgentStatusRequest} invalidateAgentStatusRequests={invalidateAgentStatusRequests} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} sessionNavigationRevision={sessionNavigationRevision()} newComposerRevision={workspaceProject() ? newComposerRevisions()[workspaceProject()!.id] ?? 0 : 0} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onDraftSessionId={setDraftSessionId} onSessionNotFound={handleSessionNotFound} onExtensionUiReply={replyExtensionUiRequest} beginAgentStatusRequest={beginAgentStatusRequest} invalidateAgentStatusRequests={invalidateAgentStatusRequests} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <Show when={extensionCustomUi()} keyed>
+            {(request) => (
+              <div class="extension-custom-ui-layer">
+                <Suspense fallback={<div class="extension-custom-ui-loading">Loading extension interface…</div>}>
+                  <ExtensionCustomUiTerminal request={request} sender={agentSocketSender()} subscribe={subscribeExtensionCustomUi} themeMode={resolvedThemeMode()} />
+                </Suspense>
+              </div>
+            )}
+          </Show>
         </main>
       </div>
       <Show when={openProjectModal()}>
@@ -4935,7 +5132,7 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNavigationRevision: number; newComposerRevision: number; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null, expectedNavigationRevision?: number) => boolean; onDraftSessionId: (projectId: string, sessionId: string | undefined) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
@@ -5074,14 +5271,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
                     class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
                     style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
                   >
-                    <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
+                    <Chat project={project()} sessionId={props.sessionId} sessionNavigationRevision={props.sessionNavigationRevision} newComposerRevision={props.newComposerRevision} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onDraftSessionId={props.onDraftSessionId} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                     <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
                 <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
+                  <Chat project={project()} sessionId={props.sessionId} sessionNavigationRevision={props.sessionNavigationRevision} newComposerRevision={props.newComposerRevision} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onDraftSessionId={props.onDraftSessionId} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
                   <div
                     class="terminal-resize-handle"
                     role="separator"
@@ -5115,11 +5312,10 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; liveActiv
 
 type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; clientMessageId: string; attachments: UploadAsset[]; steering: boolean };
 
-function Chat(props: { project: Project; sessionId?: string; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; sessionNavigationRevision: number; newComposerRevision: number; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null, expectedNavigationRevision?: number) => boolean; onDraftSessionId: (projectId: string, sessionId: string | undefined) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
-  const commandSessionPromises = new Map<string, Promise<string | undefined>>();
   const clearedComposerDraftKeys = new Set<string>();
   let previousSearchKey = '';
   let handledSearchRequestSeq = props.searchRequest.seq;
@@ -5128,7 +5324,6 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let restoringComposerDraftTreeSelection: TreeSelection | undefined;
   let runningCommandToken: symbol | undefined;
   let localCommandGeneration = 0;
-  let pendingAgentSelectionApply: { sessionId: string; promise: Promise<void> } | undefined;
   let pendingUserMessageSequence = 0;
   const pendingTerminalRefreshCounts = new Map<string, number>();
   const pendingTerminalRefreshRetryTimers = new Map<string, number>();
@@ -5169,7 +5364,14 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const [highlightedCommandIndex, setHighlightedCommandIndex] = createSignal(0);
   const [highlightedCompletionIndex, setHighlightedCompletionIndex] = createSignal(0);
   const [runningCommand, setRunningCommand] = createSignal<string>();
-  const [commandSessionId, setCommandSessionId] = createSignal<string>();
+  const [commandSessionId, setCommandSessionId] = createSignal<string | undefined>(
+    props.sessionId
+      ? undefined
+      : readComposerDraft(composerDraftKey(props.project.id, undefined, props.newComposerRevision)).commandSessionId
+        ?? readDraftSessionIds()[props.project.id]
+        ?? readCustomUiSessionIds()[props.project.id],
+  );
+  const [commandSessionRetry, setCommandSessionRetry] = createSignal(0);
   const [pendingUserMessages, setPendingUserMessages] = createSignal<PendingUserMessage[]>([]);
   const [liveActivityPendingBoundary, setLiveActivityPendingBoundary] = createSignal(0);
   const [liveTurnDisplayEntries, setLiveTurnDisplayEntries] = createSignal<SessionEntry[]>();
@@ -5198,6 +5400,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   let voiceToastSequence = 0;
   let voiceToastTimeout: number | undefined;
   const autocompleteSessionId = createMemo(() => props.sessionId ?? commandSessionId());
+  createEffect(() => {
+    props.onDraftSessionId(props.project.id, props.sessionId ? undefined : commandSessionId());
+  });
   const session = createQuery(() => ({
     queryKey: ['session', props.project.id, props.sessionId],
     queryFn: ({ signal }) => api<SessionDetail>(`/api/projects/${props.project.id}/session?sessionId=${encodeURIComponent(props.sessionId!)}`, { signal }),
@@ -5218,12 +5423,10 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const slashCommands = createQuery(() => ({
     queryKey: ['commands', props.project.id, autocompleteSessionId()],
     queryFn: ({ signal }) => {
-      const params = new URLSearchParams();
-      const sessionId = autocompleteSessionId();
-      if (sessionId) params.set('sessionId', sessionId);
-      return api<{ commands: SlashCommand[] }>(`/api/projects/${props.project.id}/agent/commands${params.size ? `?${params}` : ''}`, { signal });
+      const sessionId = autocompleteSessionId()!;
+      return sessionRuntimeRequest(sessionId, () => api<{ commands: SlashCommand[] }>(`/api/projects/${props.project.id}/agent/commands?sessionId=${encodeURIComponent(sessionId)}`, { signal }));
     },
-    enabled: Boolean(slashCommandMention() || commandArgumentMention()),
+    enabled: Boolean(autocompleteSessionId() && (slashCommandMention() || commandArgumentMention())),
     staleTime: 60_000,
   }));
   const commandForArgument = createMemo(() => {
@@ -5234,12 +5437,11 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     queryKey: ['command-completions', props.project.id, autocompleteSessionId(), commandArgumentMention()?.commandName ?? '', commandArgumentMention()?.query ?? ''],
     queryFn: ({ signal }) => {
       const mention = commandArgumentMention()!;
-      const params = new URLSearchParams({ command: mention.commandName, prefix: mention.query });
-      const sessionId = autocompleteSessionId();
-      if (sessionId) params.set('sessionId', sessionId);
-      return api<{ completions: CommandCompletion[] }>(`/api/projects/${props.project.id}/agent/command-completions?${params}`, { signal });
+      const sessionId = autocompleteSessionId()!;
+      const params = new URLSearchParams({ command: mention.commandName, prefix: mention.query, sessionId });
+      return sessionRuntimeRequest(sessionId, () => api<{ completions: CommandCompletion[] }>(`/api/projects/${props.project.id}/agent/command-completions?${params}`, { signal }));
     },
-    enabled: Boolean(commandArgumentMention() && commandForArgument()?.hasArgumentCompletions),
+    enabled: Boolean(autocompleteSessionId() && commandArgumentMention() && commandForArgument()?.hasArgumentCompletions),
     staleTime: 60_000,
   }));
   const settings = createQuery(() => ({
@@ -5250,21 +5452,19 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   const models = createQuery(() => ({
     queryKey: ['models', props.project.id, autocompleteSessionId()],
     queryFn: ({ signal }) => {
-      const params = new URLSearchParams();
-      const sessionId = autocompleteSessionId();
-      if (sessionId) params.set('sessionId', sessionId);
-      return api<{ models: ModelListItem[] }>(`/api/projects/${props.project.id}/agent/models${params.size ? `?${params}` : ''}`, { signal });
+      const sessionId = autocompleteSessionId()!;
+      return sessionRuntimeRequest(sessionId, () => api<{ models: ModelListItem[] }>(`/api/projects/${props.project.id}/agent/models?sessionId=${encodeURIComponent(sessionId)}`, { signal }));
     },
+    enabled: Boolean(autocompleteSessionId()),
     staleTime: 5 * 60_000,
   }));
   const agents = createQuery(() => ({
     queryKey: ['agents', props.project.id, autocompleteSessionId()],
     queryFn: ({ signal }) => {
-      const params = new URLSearchParams();
-      const sessionId = autocompleteSessionId();
-      if (sessionId) params.set('sessionId', sessionId);
-      return api<AgentListResponse>(`/api/projects/${props.project.id}/agent/agents${params.size ? `?${params}` : ''}`, { signal });
+      const sessionId = autocompleteSessionId()!;
+      return sessionRuntimeRequest(sessionId, () => api<AgentListResponse>(`/api/projects/${props.project.id}/agent/agents?sessionId=${encodeURIComponent(sessionId)}`, { signal }));
     },
+    enabled: Boolean(autocompleteSessionId()),
     staleTime: 60_000,
   }));
   const effectiveSettings = createMemo(() => settings.data?.effective);
@@ -5374,7 +5574,8 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
               () => localCommandGeneration === localCommandGenerationAtRequest,
             )
           : undefined;
-        const response = await apiWithTimeout<{ status: AgentStatusInfo }>(`/api/projects/${props.project.id}/agent/status${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`, { signal });
+        const request = () => apiWithTimeout<{ status: AgentStatusInfo }>(`/api/projects/${props.project.id}/agent/status${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`, { signal });
+        const response = sessionId ? await sessionRuntimeRequest(sessionId, request) : await request();
         if (applyStatus && !applyStatus(response.status)) throw new StaleAgentStatusError('Agent status response was superseded');
         return response;
       },
@@ -5584,7 +5785,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   });
 
   createEffect(() => {
-    const nextComposerDraftKey = composerDraftKey(props.project.id, props.sessionId);
+    const nextComposerDraftKey = composerDraftKey(props.project.id, props.sessionId, props.newComposerRevision);
     const nextTreeSelection = props.treeSelection;
     if (activeComposerDraftKey === nextComposerDraftKey) {
       activeComposerDraftTreeSelection = nextTreeSelection;
@@ -5619,7 +5820,9 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setComposerHistory(readComposerHistory(props.project.id, 'normal'));
     setComposerShellHistory(readComposerHistory(props.project.id, 'shell'));
     setPendingUserMessages((pending) => pending.filter(({ projectId }) => projectId === props.project.id));
-    const controlsSessionId = props.sessionId ?? draft.commandSessionId;
+    const recoveredCommandSessionId = props.sessionId ? undefined : draft.commandSessionId ?? readDraftSessionIds()[props.project.id] ?? readCustomUiSessionIds()[props.project.id];
+    if (!props.sessionId && !draft.commandSessionId && recoveredCommandSessionId) saveComposerDraft(nextComposerDraftKey, { ...draft, commandSessionId: recoveredCommandSessionId });
+    const controlsSessionId = props.sessionId ?? recoveredCommandSessionId;
     const storedControls = controlsSessionId ? readSessionComposerControls(props.project.id, controlsSessionId) : undefined;
     const hasStoredAgent = Boolean(storedControls && 'agent' in storedControls);
     const hasDraftAgent = draft.agentExplicit === true || (draft.agentExplicit === undefined && Boolean(draft.agent));
@@ -5634,7 +5837,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setThinkingLevel(hasStoredThinking ? storedControls?.thinking ?? '' : hasDraftThinking ? draft.thinking ?? '' : '');
     setThinkingExplicit(hasStoredThinking || hasDraftThinking);
     setSessionControlsHydratedKey(undefined);
-    setCommandSessionId(props.sessionId ? undefined : draft.commandSessionId);
+    setCommandSessionId(recoveredCommandSessionId);
     if (runningCommandToken) {
       localCommandGeneration += 1;
       props.invalidateAgentStatusRequests();
@@ -5643,6 +5846,32 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setRunningCommand(undefined);
     setStickToBottom(true);
     scrollTranscriptToBottom(true);
+  });
+
+  createEffect(() => {
+    const draftKey = composerDraftKey(props.project.id, props.sessionId, props.newComposerRevision);
+    const unsubscribeRecovery = subscribeComposerDraftRecovery(draftKey, (draft) => {
+      if (activeComposerDraftKey !== draftKey || text().trim() || composerUploadAssets(uploads()).length) return false;
+      setText(draft.text);
+      setUploads(draft.uploads);
+      if (!props.sessionId) setCommandSessionId(draft.commandSessionId);
+      syncComposerLayout();
+      return true;
+    });
+    const unsubscribeSessionClear = subscribeComposerDraftSessionClear(draftKey, (sessionId) => {
+      if (activeComposerDraftKey === draftKey && commandSessionId() === sessionId) setCommandSessionId(undefined);
+    });
+    const unsubscribeUploads = subscribeComposerDraftUploads(draftKey, (nextUploads) => {
+      if (activeComposerDraftKey !== draftKey) return;
+      resetComposerHistory();
+      setUploads((current) => uniqueUploadAssets([...current, ...nextUploads]));
+      syncComposerLayout();
+    });
+    onCleanup(() => {
+      unsubscribeRecovery();
+      unsubscribeSessionClear();
+      unsubscribeUploads();
+    });
   });
 
   createEffect(() => {
@@ -5765,6 +5994,10 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
   });
 
   function saveActiveComposerDraft(key: string) {
+    if (abandonedComposerDraftKeys.has(key)) {
+      composerDrafts.delete(key);
+      return;
+    }
     const draft = {
       text: untrack(text),
       uploads: cloneUploadAssets(untrack(uploads)),
@@ -5780,7 +6013,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (clearedComposerDraftKeys.has(key)) {
       clearedComposerDraftKeys.delete(key);
       if (!draft.text && !draft.uploads.length) {
-        saveComposerDraft(key, { text: '', uploads: [] });
+        saveComposerDraft(key, { text: '', uploads: [], commandSessionId: draft.commandSessionId });
         return;
       }
     }
@@ -5859,58 +6092,130 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (transcriptPrependFrame !== undefined) cancelAnimationFrame(transcriptPrependFrame);
   });
 
-  async function ensureCommandSession(draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId)) {
-    const existing = autocompleteSessionId();
-    if (existing) return existing;
-    const pending = commandSessionPromises.get(draftKey);
-    if (pending) return pending;
-    const projectId = props.project.id;
-    const promise = (async () => {
-      const result = await api<{ session: SessionSummary }>(`/api/projects/${projectId}/sessions`, { method: 'POST' });
-      if (activeComposerDraftKey === draftKey) setCommandSessionId(result.session.id);
-      queryClient.invalidateQueries({ queryKey: ['sessions', projectId] });
-      return result.session.id;
-    })();
-    commandSessionPromises.set(draftKey, promise);
+  function clearCommandSessionReservation(draftKey: string, sessionId: string) {
+    const projectId = draftKey.split('\0', 1)[0] || props.project.id;
+    const draft = readComposerDraft(draftKey);
+    if (draft.commandSessionId === sessionId) saveComposerDraft(draftKey, { ...draft, commandSessionId: undefined });
+    forgetDraftSessionId(projectId, sessionId);
+    forgetCustomUiSessionId(projectId, sessionId);
+    for (const listener of composerDraftSessionClearListeners.get(draftKey) ?? []) listener(sessionId);
+    if (activeComposerDraftKey === draftKey && commandSessionId() === sessionId) setCommandSessionId(undefined);
+  }
+
+  async function invalidateUnknownCommandSessionReservation(draftKey: string, sessionId: string, error: unknown) {
+    if (!isUnknownSessionReservation(error)) return false;
+    const projectId = draftKey.split('\0', 1)[0] || props.project.id;
     try {
-      return await promise;
-    } finally {
-      if (commandSessionPromises.get(draftKey) === promise) commandSessionPromises.delete(draftKey);
+      await api<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}`);
+      return false;
+    } catch (resolutionError) {
+      if (apiErrorStatus(resolutionError) !== 404 || !isUnknownSessionReservation(resolutionError)) return false;
+      clearCommandSessionReservation(draftKey, sessionId);
+      return true;
     }
   }
 
+  async function sessionRuntimeRequest<T>(sessionId: string, request: () => Promise<T>) {
+    try {
+      return await request();
+    } catch (error) {
+      const draftKey = activeComposerDraftKey;
+      if (!props.sessionId && draftKey) await invalidateUnknownCommandSessionReservation(draftKey, sessionId, error);
+      throw error;
+    }
+  }
+
+  async function ensureCommandSession(draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId, props.newComposerRevision)) {
+    const existing = activeComposerDraftKey === draftKey
+      ? autocompleteSessionId()
+      : readComposerDraft(draftKey).commandSessionId;
+    const projectId = draftKey.split('\0', 1)[0] || props.project.id;
+    const sessionId = await ensureSessionReservation(commandSessionPromises, draftKey, existing, async () => {
+      const result = await api<{ session: SessionSummary }>(`/api/projects/${projectId}/sessions`, { method: 'POST' });
+      return result.session.id;
+    });
+    if (abandonedComposerDraftKeys.has(draftKey)) {
+      const sessionIds = abandonedPendingSessionIds.get(projectId) ?? new Set<string>();
+      sessionIds.add(sessionId);
+      abandonedPendingSessionIds.set(projectId, sessionIds);
+      await retireAbandonedPendingSession(projectId, sessionId);
+      throw new Error('Composer session was abandoned.');
+    }
+    if (!draftKey.split('\0')[1]) {
+      const draft = readComposerDraft(draftKey);
+      saveComposerDraft(draftKey, { ...draft, commandSessionId: sessionId });
+      rememberDraftSessionId(projectId, sessionId);
+      if (activeComposerDraftKey === draftKey && props.project.id === projectId && !props.sessionId) setCommandSessionId(sessionId);
+    }
+    return sessionId;
+  }
+
+  createEffect(() => {
+    commandSessionRetry();
+    const projectId = props.project.id;
+    const routeSessionId = props.sessionId;
+    const reservedSessionId = commandSessionId();
+    const draftKey = activeComposerDraftKey;
+    if (routeSessionId || reservedSessionId || !draftKey) return;
+    let cancelled = false;
+    let retryTimer: number | undefined;
+    void ensureCommandSession(draftKey).catch((error) => {
+      if (cancelled || props.project.id !== projectId || activeComposerDraftKey !== draftKey) return;
+      console.warn('Could not reserve a draft session', error);
+      retryTimer = window.setTimeout(() => setCommandSessionRetry((retry) => retry + 1), 2_000);
+    });
+    onCleanup(() => {
+      cancelled = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    });
+  });
+
+  createEffect(() => {
+    const projectId = props.project.id;
+    const routeSessionId = props.sessionId;
+    const reservedSessionId = commandSessionId();
+    const draftKey = activeComposerDraftKey;
+    if (routeSessionId || !reservedSessionId || !draftKey) return;
+    let cancelled = false;
+    void api<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(reservedSessionId)}`)
+      .catch((error) => {
+        if (!cancelled && apiErrorStatus(error) === 404 && isUnknownSessionReservation(error)) clearCommandSessionReservation(draftKey, reservedSessionId);
+      });
+    onCleanup(() => { cancelled = true; });
+  });
+
   async function attach(files: Array<globalThis.File> | null) {
     if (!files?.length || attachBusy()) return;
-    const draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId);
+    const draftKey = activeComposerDraftKey ?? composerDraftKey(props.project.id, props.sessionId, props.newComposerRevision);
     const draftSessionId = props.sessionId;
     const projectId = props.project.id;
+    const sessionWasAbandoned = (sessionId: string) => abandonedComposerDraftKeys.has(draftKey) || Boolean(abandonedPendingSessionIds.get(projectId)?.has(sessionId));
     setAttachBusy(true);
     dismissAttachErrorToast();
+    let sessionId = draftSessionId ?? commandSessionId();
     try {
-      let sessionId = draftSessionId ?? commandSessionId();
       if (!sessionId) sessionId = await ensureCommandSession(draftKey);
       if (!sessionId) throw new Error('Could not create a session for attachments.');
-      if (!draftSessionId && props.project.id === projectId && !props.sessionId) setCommandSessionId(sessionId);
+      if (sessionWasAbandoned(sessionId)) {
+        await retireAbandonedPendingSession(projectId, sessionId);
+        if (abandonedComposerDraftKeys.has(draftKey)) await retireCommandSessionReservation(projectId, sessionId);
+        return;
+      }
+      if (!draftSessionId && props.project.id === projectId && !props.sessionId && activeComposerDraftKey === draftKey) setCommandSessionId(sessionId);
       const form = new FormData();
       files.forEach((file) => form.append('file', file));
       const result = await api<{ uploaded: Array<{ filename: string; path: string; bytes: number }> }>(`/api/projects/${projectId}/uploads?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST', body: form });
       const uploaded = composerUploadAssets(result.uploaded);
       if (!uploaded.length) throw new Error('No files were uploaded.');
-      const activeSessionMatchesUpload = props.project.id === projectId && (props.sessionId === sessionId || (!props.sessionId && commandSessionId() === sessionId));
-      if (activeComposerDraftKey === draftKey || activeSessionMatchesUpload) {
-        resetComposerHistory();
-        setUploads((items) => composerUploadAssets([...items, ...uploaded]));
-        syncComposerLayout();
+      if (sessionWasAbandoned(sessionId)) {
+        await retireAbandonedPendingSession(projectId, sessionId);
+        if (abandonedComposerDraftKeys.has(draftKey)) await retireCommandSessionReservation(projectId, sessionId);
         return;
       }
-      if (!draftKey) return;
-      const draft = readComposerDraft(draftKey);
-      saveComposerDraft(draftKey, {
-        ...draft,
-        uploads: uniqueUploadAssets([...draft.uploads, ...uploaded]),
-        commandSessionId: draft.commandSessionId ?? (draftSessionId ? undefined : sessionId),
-      });
+      publishComposerDraftUploads(draftKey, uploaded, draftSessionId ? undefined : sessionId);
     } catch (error) {
+      if (sessionId && abandonedPendingSessionIds.get(projectId)?.has(sessionId)) await retireAbandonedPendingSession(projectId, sessionId);
+      else if (!draftSessionId && sessionId) await invalidateUnknownCommandSessionReservation(draftKey, sessionId, error);
       console.error('Could not attach files', error);
       showAttachErrorToast(errorMessage(error, 'Could not attach files'));
     } finally {
@@ -6486,7 +6791,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (!commandName) return false;
     const cached = slashCommands.data?.commands.find((command) => command.name === commandName);
     if (cached) return cached.source === 'extension';
-    const result = await api<{ commands: SlashCommand[] }>(`/api/projects/${projectId}/agent/commands?sessionId=${encodeURIComponent(sessionId)}`);
+    const result = await sessionRuntimeRequest(sessionId, () => api<{ commands: SlashCommand[] }>(`/api/projects/${projectId}/agent/commands?sessionId=${encodeURIComponent(sessionId)}`));
     return result.commands.find((command) => command.name === commandName)?.source === 'extension';
   }
 
@@ -6495,13 +6800,19 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     setAgent(value);
     setAgentExplicit(true);
     saveComposerControls(composerControlsForAgent(value));
-    const sessionId = props.sessionId ?? commandSessionId();
+    const projectId = props.project.id;
+    const routeSessionId = props.sessionId;
+    const sessionId = routeSessionId ?? commandSessionId();
     if (!sessionId) return;
-    const previous = pendingAgentSelectionApply?.sessionId === sessionId ? pendingAgentSelectionApply.promise : undefined;
-    const promise = (previous ?? Promise.resolve()).then(() => applyAgentSelection(sessionId, value));
-    pendingAgentSelectionApply = { sessionId, promise };
+    const draftKey = activeComposerDraftKey;
+    const selectionKey = composerDraftKey(projectId, sessionId);
+    const promise = (pendingAgentSelectionApplies.get(selectionKey) ?? Promise.resolve())
+      .then(() => applyAgentSelection(projectId, sessionId, value, !routeSessionId));
+    pendingAgentSelectionApplies.set(selectionKey, promise);
     void promise.finally(() => {
-      if (pendingAgentSelectionApply?.promise === promise) pendingAgentSelectionApply = undefined;
+      if (pendingAgentSelectionApplies.get(selectionKey) === promise) pendingAgentSelectionApplies.delete(selectionKey);
+      if (abandonedPendingSessionIds.get(projectId)?.has(sessionId)) void retireAbandonedPendingSession(projectId, sessionId);
+      else if (!routeSessionId && draftKey && abandonedComposerDraftKeys.has(draftKey)) void retireCommandSessionReservation(projectId, sessionId);
     });
   }
 
@@ -6542,25 +6853,45 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     if (sessionId) writeSessionComposerControls(props.project.id, sessionId, controls);
   }
 
-  async function currentAgentList() {
-    if (agents.data) return agents.data;
-    const sessionId = autocompleteSessionId();
-    const params = new URLSearchParams();
-    if (sessionId) params.set('sessionId', sessionId);
+  async function loadAgentList(projectId: string, sessionId: string) {
     return queryClient.fetchQuery({
-      queryKey: ['agents', props.project.id, sessionId],
-      queryFn: () => api<AgentListResponse>(`/api/projects/${props.project.id}/agent/agents${params.size ? `?${params}` : ''}`),
+      queryKey: ['agents', projectId, sessionId],
+      queryFn: () => sessionRuntimeRequest(sessionId, () => api<AgentListResponse>(`/api/projects/${projectId}/agent/agents?sessionId=${encodeURIComponent(sessionId)}`)),
       staleTime: 60_000,
     });
   }
 
-  async function applyAgentSelection(sessionId: string, value: string) {
+  async function currentAgentList(projectId = props.project.id, draftKey = activeComposerDraftKey ?? composerDraftKey(projectId, props.sessionId, props.newComposerRevision)) {
+    const currentTarget = props.project.id === projectId && activeComposerDraftKey === draftKey;
+    const existingSessionId = currentTarget ? autocompleteSessionId() : readComposerDraft(draftKey).commandSessionId;
+    if (currentTarget && existingSessionId && agents.data) return agents.data;
+    return loadAgentList(projectId, existingSessionId ?? await ensureCommandSession(draftKey));
+  }
+
+  async function refreshComposerModels() {
+    const projectId = props.project.id;
+    const draftKey = activeComposerDraftKey ?? composerDraftKey(projectId, props.sessionId, props.newComposerRevision);
     try {
-      if (!(await currentAgentList()).supported) return;
-      await api(`/api/projects/${props.project.id}/agent/prompt`, {
+      const sessionId = autocompleteSessionId() ?? await ensureCommandSession(draftKey);
+      if (props.project.id !== projectId || activeComposerDraftKey !== draftKey) return false;
+      await queryClient.fetchQuery({
+        queryKey: ['models', projectId, sessionId],
+        queryFn: () => sessionRuntimeRequest(sessionId, () => api<{ models: ModelListItem[] }>(`/api/projects/${projectId}/agent/models?sessionId=${encodeURIComponent(sessionId)}`)),
+        staleTime: 0,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function applyAgentSelection(projectId: string, sessionId: string, value: string, mirrorActiveStream: boolean) {
+    try {
+      if (!(await loadAgentList(projectId, sessionId)).supported) return;
+      await api(`/api/projects/${projectId}/agent/prompt`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId, prompt: agentSelectionPrompt(value), mirrorActiveStream: !props.sessionId, awaitCompletion: true }),
+        body: JSON.stringify({ sessionId, prompt: agentSelectionPrompt(value), mirrorActiveStream, awaitCompletion: true }),
       });
     } catch (error) {
       console.warn('Could not apply agent selection', error);
@@ -6573,10 +6904,11 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     return stored && 'thinking' in stored ? defaultThinkingLevel ?? 'medium' : undefined;
   }
 
-  async function handleComposerAgentCommand(argument: string) {
+  async function handleComposerAgentCommand(argument: string, projectId: string, draftKey: string, navigationRevision: number) {
     const requested = argument.trim();
     if (!requested) return false;
-    const list = await currentAgentList().catch(() => undefined);
+    const list = await currentAgentList(projectId, draftKey).catch(() => undefined);
+    if (props.sessionNavigationRevision !== navigationRevision || props.project.id !== projectId || activeComposerDraftKey !== draftKey) return 'stale';
     if (!list?.supported) return false;
     const reset = ['default', 'reset', 'none', 'off'].includes(requested.toLowerCase());
     const nextAgent = reset
@@ -6689,25 +7021,33 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined && !agentCommand;
     if (!prompt || attachBusy() || aborting() || pendingTerminalRefreshActive() || (busy() && !steeringSubmit)) return;
     stopVoiceRecognition(true);
-    if (agentCommand && await handleComposerAgentCommand(agentCommand.argument)) {
-      resetComposerHistory();
-      setText('');
-      setFileMention(undefined);
-      setSlashCommandMention(undefined);
-      setCommandArgumentMention(undefined);
-      syncComposerLayout();
-      if (activeComposerDraftKey) saveActiveComposerDraft(activeComposerDraftKey);
-      return;
-    }
-    const activeAgentApply = pendingAgentSelectionApply;
-    const activeSessionId = props.sessionId ?? commandSessionId();
-    if (activeAgentApply && activeSessionId && activeAgentApply.sessionId === activeSessionId) await activeAgentApply.promise;
     const projectId = props.project.id;
     const routeSessionId = props.sessionId;
-    const submittedDraftKey = activeComposerDraftKey;
+    const submittedNavigationRevision = props.sessionNavigationRevision;
+    const submittedDraftKey = activeComposerDraftKey ?? composerDraftKey(projectId, routeSessionId, props.newComposerRevision);
+    const submissionTargetStillActive = () => props.sessionNavigationRevision === submittedNavigationRevision && props.project.id === projectId && props.sessionId === routeSessionId && activeComposerDraftKey === submittedDraftKey;
+    if (agentCommand) {
+      const result = await handleComposerAgentCommand(agentCommand.argument, projectId, submittedDraftKey, submittedNavigationRevision);
+      if (!submissionTargetStillActive() || result === 'stale') return;
+      if (result) {
+        resetComposerHistory();
+        setText('');
+        setFileMention(undefined);
+        setSlashCommandMention(undefined);
+        setCommandArgumentMention(undefined);
+        syncComposerLayout();
+        saveActiveComposerDraft(submittedDraftKey);
+        return;
+      }
+    }
+    const activeSessionId = routeSessionId ?? commandSessionId();
+    const activeAgentApply = activeSessionId ? pendingAgentSelectionApplies.get(composerDraftKey(projectId, activeSessionId)) : undefined;
+    if (activeAgentApply) await activeAgentApply;
+    if (!submissionTargetStillActive()) return;
     const submittedTreeSelection = props.treeSelection ?? activeComposerDraftTreeSelection;
     const submittedAgent = agent();
-    const submittedAgentList = agentExplicit() && !agents.data ? await currentAgentList().catch(() => undefined) : agents.data;
+    const submittedAgentList = agentExplicit() && !agents.data ? await currentAgentList(projectId, submittedDraftKey).catch(() => undefined) : agents.data;
+    if (!submissionTargetStillActive()) return;
     const submittedAgentExplicit = Boolean(agentExplicit() && submittedAgentList?.supported);
     const submittedAgentProfile = submittedAgent ? submittedAgentList?.agents.find((item) => item.value === submittedAgent) : undefined;
     const shouldUseAgentModel = Boolean(submittedAgentExplicit && submittedAgent && (!submittedAgentProfile || submittedAgentProfile.model));
@@ -6721,7 +7061,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
     let submittedCommandSessionId = commandSessionId();
     let sessionId = routeSessionId ?? commandSessionId();
     const mirrorActiveStream = !routeSessionId;
-    if (compactCommand !== undefined && !sessionId) return;
+    if (compactCommand !== undefined && !routeSessionId) return;
     if (!sessionId) {
       try {
         sessionId = await ensureCommandSession(submittedDraftKey);
@@ -6729,10 +7069,11 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
         console.error('Could not create chat session', error);
         return;
       }
-      if (!sessionId) return;
+      if (!sessionId || !submissionTargetStillActive()) return;
     }
     const submittedSessionId = sessionId;
     if (mirrorActiveStream) submittedCommandSessionId = submittedSessionId;
+    const submittedRuntimeStillCurrent = () => !mirrorActiveStream || commandSessionId() === submittedSessionId;
     const storedSubmittedControls = readSessionComposerControls(projectId, submittedSessionId);
     const submittedControls: SessionComposerControls = {
       ...(submittedAgentExplicit ? { agent: submittedAgent } : {}),
@@ -6740,14 +7081,46 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       ...(submittedThinkingExplicit ? { thinking: submittedThinkingLevel } : storedSubmittedControls && 'thinking' in storedSubmittedControls ? { thinking: storedSubmittedControls.thinking ?? '' } : {}),
     };
     if (Object.keys(submittedControls).length) writeSessionComposerControls(projectId, submittedSessionId, submittedControls);
-    const extensionCommand = !shellCommand && compactCommand === undefined
-      ? await isExtensionComposerCommand(projectId, submittedSessionId, prompt).catch(() => false)
-      : false;
-    if (steeringSubmit && extensionCommand) return;
-    const submittedComposerStillActive = () => activeComposerDraftKey === submittedDraftKey;
-    const submittedWorkspaceStillCurrent = () => props.project.id === projectId && (!props.sessionId || props.sessionId === submittedSessionId);
-    const selectSubmittedSession = () => {
-      if (mirrorActiveStream && submittedWorkspaceStillCurrent()) props.onSession(submittedSessionId, projectId, routeSessionId ?? null);
+    let extensionCommand = false;
+    let extensionMessageEntryIds = new Set<string>();
+    if (!shellCommand && compactCommand === undefined) {
+      try {
+        extensionCommand = await isExtensionComposerCommand(projectId, submittedSessionId, prompt);
+        if (extensionCommand) {
+          extensionMessageEntryIds = new Set((await apiAgentRefresh<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(submittedSessionId)}`)).entries
+            .filter((entry) => entry.type === 'message')
+            .map((entry) => entry.id));
+        }
+      } catch (error) {
+        console.warn('Could not classify composer command', error);
+        return;
+      }
+    }
+    if (!submissionTargetStillActive() || !submittedRuntimeStillCurrent() || (steeringSubmit && extensionCommand)) return;
+    const submittedComposerStillActive = submissionTargetStillActive;
+    const selectSubmittedSession = async (messageEntryIds?: string[]) => {
+      if (abandonedPendingSessionIds.get(projectId)?.has(submittedSessionId)) {
+        clearCommandSessionReservation(submittedDraftKey, submittedSessionId);
+        await retireAbandonedPendingSession(projectId, submittedSessionId);
+        return;
+      }
+      if (!mirrorActiveStream) return;
+      const selected = props.onSession(submittedSessionId, projectId, routeSessionId ?? null, submittedNavigationRevision);
+      if (selected) {
+        clearCommandSessionReservation(submittedDraftKey, submittedSessionId);
+        return;
+      }
+      if (abandonedComposerDraftKeys.has(submittedDraftKey)) {
+        clearCommandSessionReservation(submittedDraftKey, submittedSessionId);
+        await retireCommandSessionReservation(projectId, submittedSessionId);
+        return;
+      }
+      if (shellCommand) return;
+      if (!extensionCommand) {
+        clearCommandSessionReservation(submittedDraftKey, submittedSessionId);
+        return;
+      }
+      if (!messageEntryIds || messageEntryIds.some((id) => !extensionMessageEntryIds.has(id))) clearCommandSessionReservation(submittedDraftKey, submittedSessionId);
     };
     let submittedPendingUserMessageId: number | undefined;
     let submittedPendingUserMessageClientId: string | undefined;
@@ -6763,16 +7136,18 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       setStickToBottom(true);
       if (!steeringSubmit) scrollTranscriptToBottom(true);
     }
-    if (submittedDraftKey) {
-      clearedComposerDraftKeys.add(submittedDraftKey);
-      saveComposerDraft(submittedDraftKey, { text: '', uploads: [] });
-    }
+    clearedComposerDraftKeys.add(submittedDraftKey);
+    saveComposerDraft(submittedDraftKey, {
+      text: '',
+      uploads: [],
+      commandSessionId: mirrorActiveStream ? submittedCommandSessionId : undefined,
+    });
 
     try {
       if (shellCommand) {
         addComposerHistory({ text: prompt, uploads: [] }, 'shell', projectId);
         await executeShellCommand(projectId, submittedSessionId, shellCommand, mirrorActiveStream, submittedComposerStillActive);
-        selectSubmittedSession();
+        await selectSubmittedSession();
         if (submittedComposerStillActive()) {
           props.onTreeSelection(undefined);
           scrollTranscriptToBottom(true);
@@ -6782,14 +7157,19 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
       if (compactCommand !== undefined) {
         addComposerHistory({ text: prompt, uploads: [] }, 'normal', projectId);
         await compactSession(projectId, submittedSessionId, compactCommand, mirrorActiveStream);
-        selectSubmittedSession();
+        await selectSubmittedSession();
         if (submittedComposerStillActive()) {
           props.onTreeSelection(undefined);
           scrollTranscriptToBottom(true);
         }
         return;
       }
-      const attachmentAssets = uniqueUploadAssets([...uploadAssets, ...await resolveComposerFileReferenceAssets(projectId, prompt)]);
+      const fileReferenceAssets = await resolveComposerFileReferenceAssets(projectId, prompt);
+      if (!submissionTargetStillActive()) {
+        submissionInterruptedByTerminalRefresh = true;
+        throw new Error('Composer navigation interrupted submission');
+      }
+      const attachmentAssets = uniqueUploadAssets([...uploadAssets, ...fileReferenceAssets]);
       if (aborting() || pendingTerminalRefreshActive() || submissionTerminalGeneration !== terminalSubmissionGeneration) {
         submissionInterruptedByTerminalRefresh = true;
         throw new Error('Conversation refresh interrupted submission');
@@ -6814,11 +7194,11 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
         }]);
         if (steeringSubmit) scrollTranscriptToBottom(true);
       }
-      if (aborting() || pendingTerminalRefreshActive() || submissionTerminalGeneration !== terminalSubmissionGeneration) {
+      if (!submissionTargetStillActive() || !submittedRuntimeStillCurrent() || aborting() || pendingTerminalRefreshActive() || submissionTerminalGeneration !== terminalSubmissionGeneration) {
         submissionInterruptedByTerminalRefresh = true;
         throw new Error('Conversation refresh interrupted submission');
       }
-      await api(`/api/projects/${projectId}/agent/prompt`, {
+      const promptResult = await api<{ ok: true; messageEntryIds?: string[] }>(`/api/projects/${projectId}/agent/prompt`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -6833,26 +7213,43 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
           thinking: submittedThinkingExplicit || !shouldUseAgentThinking ? promptThinkingOverride(submittedThinkingLevel, submittedSessionId, projectId, submittedDefaultThinkingLevel) : undefined,
           streamingBehavior: steeringSubmit && !extensionCommand ? 'steer' : undefined,
           clientMessageId: steeringSubmit && !extensionCommand ? submittedPendingUserMessageClientId : undefined,
+          awaitCompletion: extensionCommand || undefined,
         }),
       });
       if (submittedPendingUserMessageId !== undefined) {
         const pendingMessageId = submittedPendingUserMessageId;
         setPendingUserMessages((pending) => pending.map((message) => message.id === pendingMessageId ? { ...message, accepted: true } : message));
       }
-      selectSubmittedSession();
+      await selectSubmittedSession(promptResult.messageEntryIds);
       if (submittedComposerStillActive()) {
         props.onTreeSelection(undefined);
         if (!steeringSubmit) scrollTranscriptToBottom(true);
       }
     } catch (error) {
-      if (submittedDraftKey) clearedComposerDraftKeys.delete(submittedDraftKey);
+      clearedComposerDraftKeys.delete(submittedDraftKey);
       if (submittedPendingUserMessageId !== undefined) setPendingUserMessages((pending) => pending.filter(({ id }) => id !== submittedPendingUserMessageId));
-      if (activeComposerDraftKey === submittedDraftKey && !text().trim() && composerUploadAssets(uploads()).length === 0) {
+      const restoreActiveComposer = props.project.id === projectId
+        && props.sessionId === routeSessionId
+        && activeComposerDraftKey === submittedDraftKey
+        && !text().trim()
+        && composerUploadAssets(uploads()).length === 0;
+      if (restoreActiveComposer) {
         setText(prompt);
         setUploads(uploadAssets);
         syncComposerLayout();
-      } else if (submittedDraftKey && !composerDrafts.has(submittedDraftKey)) {
-        saveComposerDraft(submittedDraftKey, { text: prompt, uploads: uploadAssets, commandSessionId: submittedCommandSessionId, treeSelection: submittedTreeSelection, agent: submittedAgentExplicit ? submittedAgent : undefined, agentExplicit: submittedAgentExplicit, model: submittedModelExplicit ? submittedModel : undefined, modelExplicit: submittedModelExplicit, thinking: submittedThinkingExplicit ? submittedThinkingLevel : undefined, thinkingExplicit: submittedThinkingExplicit });
+      }
+      const currentDraft = readComposerDraft(submittedDraftKey);
+      if (restoreActiveComposer || (activeComposerDraftKey !== submittedDraftKey && !currentDraft.text && !currentDraft.uploads.length)) {
+        restoreComposerDraft(submittedDraftKey, { ...currentDraft, text: prompt, uploads: uploadAssets, commandSessionId: submittedCommandSessionId, treeSelection: submittedTreeSelection, agent: submittedAgentExplicit ? submittedAgent : undefined, agentExplicit: submittedAgentExplicit, model: submittedModelExplicit ? submittedModel : undefined, modelExplicit: submittedModelExplicit, thinking: submittedThinkingExplicit ? submittedThinkingLevel : undefined, thinkingExplicit: submittedThinkingExplicit });
+      }
+      if (abandonedPendingSessionIds.get(projectId)?.has(submittedSessionId)) {
+        clearCommandSessionReservation(submittedDraftKey, submittedSessionId);
+        await retireAbandonedPendingSession(projectId, submittedSessionId);
+      } else if (mirrorActiveStream && abandonedComposerDraftKeys.has(submittedDraftKey)) {
+        clearCommandSessionReservation(submittedDraftKey, submittedSessionId);
+        await retireCommandSessionReservation(projectId, submittedSessionId);
+      } else if (mirrorActiveStream) {
+        await invalidateUnknownCommandSessionReservation(submittedDraftKey, submittedSessionId, error);
       }
       if (!submissionInterruptedByTerminalRefresh) console.error('Could not send chat message', error);
     }
@@ -7042,7 +7439,7 @@ function Chat(props: { project: Project; sessionId?: string; liveActivity: Agent
               <Show when={showAgentSelect()}>
                 <UiSelect searchable compact class="composer-agent-select" contentWidth="content" triggerWidth="content" value={agent()} onChange={handleAgentChange} options={agentOptions()} ariaLabel="Agent" />
               </Show>
-              <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} onOpen={async () => !(await models.refetch()).isError} options={modelOptions()} ariaLabel="Model" />
+              <UiSelect searchable compact class="composer-model-select" contentWidth="content" triggerWidth="content" value={model()} onChange={handleModelChange} onOpen={refreshComposerModels} options={modelOptions()} ariaLabel="Model" />
               <UiSelect
                 compact
                 class="composer-thinking-select"
@@ -12876,8 +13273,8 @@ function composerFileReferencePaths(value: string) {
   return paths;
 }
 
-function composerDraftKey(projectId: string, sessionId?: string) {
-  return `${projectId}\0${sessionId ?? ''}`;
+function composerDraftKey(projectId: string, sessionId?: string, newComposerRevision = 0) {
+  return `${projectId}\0${sessionId ?? ''}\0${sessionId ? '' : newComposerRevision}`;
 }
 
 function readComposerDraft(key: string): ComposerDraft {
@@ -12886,12 +13283,120 @@ function readComposerDraft(key: string): ComposerDraft {
 }
 
 function saveComposerDraft(key: string, draft: ComposerDraft) {
+  if (abandonedComposerDraftKeys.has(key)) {
+    composerDrafts.delete(key);
+    return;
+  }
   const uploads = composerUploadAssets(draft.uploads);
-  if (!draft.text && !uploads.length && !draft.treeSelection && !draft.agentExplicit && !draft.agent && !draft.modelExplicit && !draft.model && !draft.thinkingExplicit && !draft.thinking) {
+  if (!draft.text && !uploads.length && !draft.commandSessionId && !draft.treeSelection && !draft.agentExplicit && !draft.agent && !draft.modelExplicit && !draft.model && !draft.thinkingExplicit && !draft.thinking) {
     composerDrafts.delete(key);
     return;
   }
   composerDrafts.set(key, { text: draft.text, uploads, commandSessionId: draft.commandSessionId, treeSelection: draft.treeSelection, agent: draft.agent, agentExplicit: draft.agentExplicit, model: draft.model, modelExplicit: draft.modelExplicit, thinking: draft.thinking, thinkingExplicit: draft.thinkingExplicit });
+}
+
+async function retireCommandSessionReservation(projectId: string, sessionId: string) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await apiWithTimeout(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}&pendingOnly=true`, { method: 'DELETE' }, 5_000);
+      forgetDraftSessionId(projectId, sessionId);
+      forgetCustomUiSessionId(projectId, sessionId);
+      return true;
+    } catch (error) {
+      const status = apiErrorStatus(error);
+      if (status === 404 || (error instanceof Error && /already been persisted/i.test(error.message))) {
+        forgetDraftSessionId(projectId, sessionId);
+        forgetCustomUiSessionId(projectId, sessionId);
+        return true;
+      }
+      if (attempt < 4) await new Promise<void>((resolve) => window.setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  return false;
+}
+
+async function retireAbandonedPendingSession(projectId: string, sessionId: string) {
+  if (!(abandonedPendingSessionIds.get(projectId)?.has(sessionId))) return;
+  const retryKey = `${projectId}\0${sessionId}`;
+  const existing = abandonedPendingSessionRetirements.get(retryKey);
+  if (existing) return existing;
+  const retirement = (async () => {
+    if (abandonedPendingSessionAbortIds.get(projectId)?.has(sessionId)) {
+      await apiWithTimeout(`/api/projects/${projectId}/agent/abort`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      }, 5_000).catch(() => undefined);
+    }
+    if (await retireCommandSessionReservation(projectId, sessionId)) {
+      const retryTimer = abandonedPendingSessionRetryTimers.get(retryKey);
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      abandonedPendingSessionRetryTimers.delete(retryKey);
+      const sessionIds = abandonedPendingSessionIds.get(projectId);
+      sessionIds?.delete(sessionId);
+      if (!sessionIds?.size) abandonedPendingSessionIds.delete(projectId);
+      const abortSessionIds = abandonedPendingSessionAbortIds.get(projectId);
+      abortSessionIds?.delete(sessionId);
+      if (!abortSessionIds?.size) abandonedPendingSessionAbortIds.delete(projectId);
+      forgetAbandonedPendingSessionAbortId(projectId, sessionId);
+      return;
+    }
+    if (abandonedPendingSessionRetryTimers.has(retryKey)) return;
+    abandonedPendingSessionRetryTimers.set(retryKey, window.setTimeout(() => {
+      abandonedPendingSessionRetryTimers.delete(retryKey);
+      void retireAbandonedPendingSession(projectId, sessionId);
+    }, 5_000));
+  })().finally(() => {
+    if (abandonedPendingSessionRetirements.get(retryKey) === retirement) abandonedPendingSessionRetirements.delete(retryKey);
+  });
+  abandonedPendingSessionRetirements.set(retryKey, retirement);
+  return retirement;
+}
+
+function restoreComposerDraft(key: string, draft: ComposerDraft) {
+  const listeners = composerDraftRecoveryListeners.get(key);
+  if (listeners?.size && ![...listeners].some((listener) => listener(draft))) return;
+  saveComposerDraft(key, draft);
+}
+
+function subscribeComposerDraftRecovery(key: string, listener: (draft: ComposerDraft) => boolean) {
+  const listeners = composerDraftRecoveryListeners.get(key) ?? new Set<(draft: ComposerDraft) => boolean>();
+  listeners.add(listener);
+  composerDraftRecoveryListeners.set(key, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (!listeners.size) composerDraftRecoveryListeners.delete(key);
+  };
+}
+
+function subscribeComposerDraftSessionClear(key: string, listener: (sessionId: string) => void) {
+  const listeners = composerDraftSessionClearListeners.get(key) ?? new Set<(sessionId: string) => void>();
+  listeners.add(listener);
+  composerDraftSessionClearListeners.set(key, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (!listeners.size) composerDraftSessionClearListeners.delete(key);
+  };
+}
+
+function publishComposerDraftUploads(key: string, uploads: UploadAsset[], commandSessionId?: string) {
+  const draft = readComposerDraft(key);
+  saveComposerDraft(key, {
+    ...draft,
+    uploads: uniqueUploadAssets([...draft.uploads, ...uploads]),
+    commandSessionId: draft.commandSessionId ?? commandSessionId,
+  });
+  for (const listener of composerDraftUploadListeners.get(key) ?? []) listener(uploads);
+}
+
+function subscribeComposerDraftUploads(key: string, listener: (uploads: UploadAsset[]) => void) {
+  const listeners = composerDraftUploadListeners.get(key) ?? new Set<(uploads: UploadAsset[]) => void>();
+  listeners.add(listener);
+  composerDraftUploadListeners.set(key, listeners);
+  return () => {
+    listeners.delete(listener);
+    if (!listeners.size) composerDraftUploadListeners.delete(key);
+  };
 }
 
 function uploadAssetLabel(asset: UploadAsset) {
@@ -13482,6 +13987,85 @@ function readActiveSessionId() {
   return new URLSearchParams(location.search).get(SESSION_QUERY_KEY) || undefined;
 }
 
+function readDraftSessionIds() {
+  return readSessionReservationIds(sessionStorage, DRAFT_SESSION_IDS_KEY);
+}
+
+function rememberDraftSessionId(projectId: string, sessionId: string) {
+  rememberSessionReservationId(sessionStorage, DRAFT_SESSION_IDS_KEY, projectId, sessionId);
+}
+
+function forgetDraftSessionId(projectId: string, sessionId?: string) {
+  forgetSessionReservationId(sessionStorage, DRAFT_SESSION_IDS_KEY, projectId, sessionId);
+}
+
+function readCustomUiSessionIds() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(CUSTOM_UI_SESSION_IDS_KEY) ?? '{}') as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => Boolean(entry[0]) && typeof entry[1] === 'string' && Boolean(entry[1])));
+  } catch {
+    return {};
+  }
+}
+
+function writeCustomUiSessionIds(sessionIds: Record<string, string>) {
+  try {
+    if (Object.keys(sessionIds).length) sessionStorage.setItem(CUSTOM_UI_SESSION_IDS_KEY, JSON.stringify(sessionIds));
+    else sessionStorage.removeItem(CUSTOM_UI_SESSION_IDS_KEY);
+  } catch {
+    // Storage can be unavailable in restricted browsing contexts.
+  }
+}
+
+function rememberCustomUiSessionId(projectId: string, sessionId: string) {
+  writeCustomUiSessionIds({ ...readCustomUiSessionIds(), [projectId]: sessionId });
+}
+
+function forgetCustomUiSessionId(projectId: string, sessionId?: string) {
+  const sessionIds = readCustomUiSessionIds();
+  if (!(projectId in sessionIds) || (sessionId && sessionIds[projectId] !== sessionId)) return;
+  delete sessionIds[projectId];
+  writeCustomUiSessionIds(sessionIds);
+}
+
+function readAbandonedPendingSessionAbortIds(): Record<string, string[]> {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(ABANDONED_PENDING_SESSION_ABORT_IDS_KEY) ?? '{}') as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).flatMap(([projectId, value]) => {
+      if (!projectId || !Array.isArray(value)) return [];
+      const sessionIds = value.filter((sessionId): sessionId is string => typeof sessionId === 'string' && Boolean(sessionId));
+      return sessionIds.length ? [[projectId, [...new Set(sessionIds)]]] : [];
+    }));
+  } catch {
+    return {};
+  }
+}
+
+function writeAbandonedPendingSessionAbortIds(sessionIdsByProject: Record<string, string[]>) {
+  try {
+    if (Object.keys(sessionIdsByProject).length) sessionStorage.setItem(ABANDONED_PENDING_SESSION_ABORT_IDS_KEY, JSON.stringify(sessionIdsByProject));
+    else sessionStorage.removeItem(ABANDONED_PENDING_SESSION_ABORT_IDS_KEY);
+  } catch {
+    // Storage can be unavailable in restricted browsing contexts.
+  }
+}
+
+function rememberAbandonedPendingSessionAbortId(projectId: string, sessionId: string) {
+  const stored = readAbandonedPendingSessionAbortIds();
+  writeAbandonedPendingSessionAbortIds({ ...stored, [projectId]: [...new Set([...(stored[projectId] ?? []), sessionId])] });
+}
+
+function forgetAbandonedPendingSessionAbortId(projectId: string, sessionId: string) {
+  const stored = readAbandonedPendingSessionAbortIds();
+  if (!stored[projectId]?.includes(sessionId)) return;
+  const remaining = stored[projectId].filter((storedSessionId) => storedSessionId !== sessionId);
+  if (remaining.length) stored[projectId] = remaining;
+  else delete stored[projectId];
+  writeAbandonedPendingSessionAbortIds(stored);
+}
+
 function writeActiveSessionId(sessionId?: string) {
   const url = new URL(location.href);
   if (sessionId) url.searchParams.set(SESSION_QUERY_KEY, sessionId);
@@ -13697,7 +14281,16 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
     current.addEventListener('open', () => {
       if (disposed || socket !== current) return;
       reconnectAttempt = 0;
-      options.onOpen?.();
+      options.onOpen?.((message) => {
+        if (disposed || socket !== current || current.readyState !== WebSocket.OPEN) return false;
+        try {
+          current.send(JSON.stringify(message));
+          return true;
+        } catch {
+          closeSocket(current);
+          return false;
+        }
+      });
       startHeartbeat();
     });
     current.addEventListener('message', (event) => {

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { promisify } from 'node:util';
 import Fastify from 'fastify';
+import { registerFileRoutes } from '../../src/server/files.js';
 import { getGitHeadRevision, getGitStatus, getReviewableHeadFiles } from '../../src/server/git.js';
 import { ProjectRegistry } from '../../src/server/projects.js';
 import {
@@ -443,6 +444,106 @@ test('retains the pending SessionManager and review UUID through first persisten
   assert.equal(identityAfter.sessionUuid, identityBefore.sessionUuid);
   const afterPersistence = await getReviewThreads(projectPath, sessionId);
   assert.equal(afterPersistence.threads[0].id, beforePersistence.threads[0].id);
+});
+
+test('session uploads hold the session mutation lock through multipart writes', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-upload-lock-'));
+  const projectPath = path.join(root, 'project');
+  const sessionDir = path.join(root, 'sessions');
+  await Promise.all([mkdir(projectPath), mkdir(sessionDir)]);
+  const previousSessionDir = process.env[PI_SESSION_DIR_ENV];
+  process.env[PI_SESSION_DIR_ENV] = sessionDir;
+
+  let rejectLock = false;
+  let lockReleased = false;
+  const app = Fastify({ logger: false });
+  const registry = new ProjectRegistry(projectPath);
+  await registerFileRoutes(app, registry, {
+    lockSessionMutation: async () => rejectLock ? undefined : () => { lockReleased = true; },
+  });
+  await app.ready();
+  t.after(async () => {
+    await app.close();
+    if (previousSessionDir === undefined) delete process.env[PI_SESSION_DIR_ENV];
+    else process.env[PI_SESSION_DIR_ENV] = previousSessionDir;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const project = registry.list()[0];
+  const sessionId = sessionIdFromPath(await createSessionFile(projectPath));
+  const boundary = 'pi-web-upload-lock-boundary';
+  const payload = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="locked.txt"\r\nContent-Type: text/plain\r\n\r\nlocked upload\r\n--${boundary}--\r\n`);
+  const uploaded = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/uploads?sessionId=${encodeURIComponent(sessionId)}`,
+    headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+    payload,
+  });
+  assert.equal(uploaded.statusCode, 200, uploaded.body);
+  assert.equal(lockReleased, true);
+  const uploadedPath = uploaded.json<{ uploaded: Array<{ path: string }> }>().uploaded[0].path;
+  assert.equal(await readFile(path.join(projectPath, uploadedPath), 'utf8'), 'locked upload');
+
+  rejectLock = true;
+  const rejected = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/uploads?sessionId=${encodeURIComponent(sessionId)}`,
+    headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+    payload,
+  });
+  assert.equal(rejected.statusCode, 409, rejected.body);
+});
+
+test('pending-only session deletion preserves an already-persisted first turn', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-pending-delete-'));
+  const projectPath = path.join(root, 'project');
+  const sessionDir = path.join(root, 'sessions');
+  await Promise.all([mkdir(projectPath), mkdir(sessionDir)]);
+  const previousSessionDir = process.env[PI_SESSION_DIR_ENV];
+  process.env[PI_SESSION_DIR_ENV] = sessionDir;
+
+  const app = Fastify({ logger: false });
+  const registry = new ProjectRegistry(projectPath);
+  await registerSessionRoutes(app, registry);
+  await app.ready();
+  t.after(async () => {
+    await app.close();
+    if (previousSessionDir === undefined) delete process.env[PI_SESSION_DIR_ENV];
+    else process.env[PI_SESSION_DIR_ENV] = previousSessionDir;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const project = registry.list()[0];
+  const pendingPath = await createSessionFile(projectPath);
+  const pendingId = (await resolveSessionIdentity(sessionIdFromPath(pendingPath), projectPath)).sessionUuid;
+  const deletedPending = await app.inject({
+    method: 'DELETE',
+    url: `/api/projects/${project.id}/session?sessionId=${encodeURIComponent(pendingId)}&pendingOnly=true`,
+  });
+  assert.equal(deletedPending.statusCode, 200, deletedPending.body);
+  await assert.rejects(resolveSessionIdentity(pendingId, projectPath), /Unknown session/);
+
+  const persistedPath = await createSessionFile(projectPath);
+  const persistedId = (await resolveSessionIdentity(sessionIdFromPath(persistedPath), projectPath)).sessionUuid;
+  const manager = await resolveSessionManager(persistedId, projectPath);
+  manager.appendMessage({ role: 'user', content: 'Keep this turn', timestamp: Date.now() } as any);
+  manager.appendMessage({
+    role: 'assistant',
+    content: [],
+    api: 'test',
+    provider: 'test',
+    model: 'test',
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: 'stop',
+    timestamp: Date.now(),
+  } as any);
+
+  const preservedPersisted = await app.inject({
+    method: 'DELETE',
+    url: `/api/projects/${project.id}/session?sessionId=${encodeURIComponent(persistedId)}&pendingOnly=true`,
+  });
+  assert.equal(preservedPersisted.statusCode, 409, preservedPersisted.body);
+  assert.equal((await resolveSessionIdentity(persistedId, projectPath)).filePath, persistedPath);
 });
 
 test('excludes reserved Pi Web state from git discovery', async (t) => {

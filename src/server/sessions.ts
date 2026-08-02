@@ -394,13 +394,14 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
     }
   });
 
-  app.delete<{ Params: { projectId: string; sessionId: string } }>('/api/projects/:projectId/sessions/:sessionId', async (request, reply) => {
+  app.delete<{ Params: { projectId: string; sessionId: string }; Querystring: { pendingOnly?: string } }>('/api/projects/:projectId/sessions/:sessionId', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
       const filePath = await resolveSessionFile(request.params.sessionId, project.path);
       const releaseDeleteLock = await bridge?.lockSessionDeletion(project.path, request.params.sessionId, filePath);
       if (bridge && !releaseDeleteLock) return reply.code(409).send({ error: 'Session is running. Stop it before deleting.' });
       try {
+        if (request.query.pendingOnly === 'true' && existsSync(filePath)) return reply.code(409).send({ error: 'Session has already been persisted.' });
         const deleted = await deleteSessionFile(request.params.sessionId, project.path);
         await bridge?.disposeSession(project.path, request.params.sessionId, deleted.path).catch((error) => request.log.warn({ err: error }, 'Could not dispose cached session'));
         await deleteSessionUploads(project.path, sessionUploadIdsFromDeletedSession(deleted, request.params.sessionId)).catch((error) => request.log.warn({ err: error }, 'Could not delete session uploads'));
@@ -414,7 +415,7 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
     }
   });
 
-  app.delete<{ Params: { projectId: string }; Querystring: { sessionId?: string } }>('/api/projects/:projectId/session', async (request, reply) => {
+  app.delete<{ Params: { projectId: string }; Querystring: { sessionId?: string; pendingOnly?: string } }>('/api/projects/:projectId/session', async (request, reply) => {
     try {
       if (!request.query.sessionId) return reply.code(400).send({ error: 'Missing sessionId' });
       const project = registry.get(request.params.projectId);
@@ -422,6 +423,7 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
       const releaseDeleteLock = await bridge?.lockSessionDeletion(project.path, request.query.sessionId, filePath);
       if (bridge && !releaseDeleteLock) return reply.code(409).send({ error: 'Session is running. Stop it before deleting.' });
       try {
+        if (request.query.pendingOnly === 'true' && existsSync(filePath)) return reply.code(409).send({ error: 'Session has already been persisted.' });
         const deleted = await deleteSessionFile(request.query.sessionId, project.path);
         await bridge?.disposeSession(project.path, request.query.sessionId, deleted.path).catch((error) => request.log.warn({ err: error }, 'Could not dispose cached session'));
         await deleteSessionUploads(project.path, sessionUploadIdsFromDeletedSession(deleted, request.query.sessionId)).catch((error) => request.log.warn({ err: error }, 'Could not delete session uploads'));

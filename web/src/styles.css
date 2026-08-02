@@ -1265,6 +1265,33 @@ body {
     @apply min-w-0 pb-3;
   }
 
+  .extension-custom-ui-layer {
+    @apply pointer-events-none absolute inset-x-4 bottom-4 z-40 flex justify-center xl:inset-x-6;
+  }
+
+  .extension-custom-ui,
+  .extension-custom-ui-loading {
+    @apply pointer-events-auto w-full max-w-5xl overflow-hidden rounded-2xl border border-yellow-500/30 bg-card shadow-floating ring-1 ring-yellow-500/10;
+  }
+
+  .extension-custom-ui-loading {
+    @apply p-4 text-sm text-muted-foreground;
+  }
+
+  .extension-custom-ui-toolbar {
+    @apply flex h-9 items-center justify-between border-b border-border/70 px-3 text-xs font-semibold uppercase tracking-wide text-yellow-700 dark:text-yellow-300;
+  }
+
+  .extension-custom-ui-terminal {
+    height: min(45vh, 25rem);
+    height: min(45dvh, 25rem);
+    @apply bg-white p-2 dark:bg-[#141414];
+  }
+
+  .extension-custom-ui-terminal .xterm {
+    height: 100%;
+  }
+
   .extension-ui-dock {
     @apply mx-auto flex w-full max-w-5xl flex-col gap-3 overflow-y-auto rounded-2xl border border-yellow-500/30 bg-card p-4 text-sm shadow-floating ring-1 ring-yellow-500/10;
     max-height: min(50vh, 32rem);

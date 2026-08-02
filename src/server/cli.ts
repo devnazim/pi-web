@@ -36,7 +36,7 @@ try {
         console.error(`Timed out shutting down after ${signal}`);
         process.exit(1);
       }
-      process.exitCode = 0;
+      process.exit(0);
     } catch (error) {
       console.error(`Could not shut down after ${signal}:`, error);
       process.exit(1);
