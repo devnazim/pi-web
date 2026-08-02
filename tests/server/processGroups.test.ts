@@ -135,6 +135,57 @@ test('pauses PTY output until the browser acknowledges rendered data', { skip: p
   }
 });
 
+test('a reconnect separates a carried query from a new live query', { skip: process.platform === 'win32' }, async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const url = `${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal`;
+  const firstSocket = new WebSocket(url);
+  let firstOutput = '';
+  firstSocket.addEventListener('message', (event) => {
+    const message = JSON.parse(String(event.data)) as { type?: string; data?: string };
+    if (message.type === 'data' && message.data) firstOutput += message.data;
+  });
+  await new Promise<void>((resolve, reject) => {
+    firstSocket.addEventListener('open', () => resolve(), { once: true });
+    firstSocket.addEventListener('error', () => reject(new Error('First terminal WebSocket failed')), { once: true });
+  });
+
+  firstSocket.send(JSON.stringify({ type: 'input', data: 'stty -echo\n' }));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  firstSocket.send(JSON.stringify({
+    type: 'input',
+    data: `node -e "process.stdout.write(String.fromCharCode(27,93,52,59,49,59,63,59,50,59));setTimeout(()=>process.stdout.write(String.fromCharCode(63,7,27,91,62,99,76,73,86,69,95,68,79,78,69,10)),1000)"\n`,
+  }));
+  assert.equal(await waitUntil(() => firstOutput.includes('\x1b]4;1;?;2;'), 2_000), true);
+
+  const secondSocket = new WebSocket(url);
+  const secondMessages: { data: string; replay: boolean; responseQuery?: string }[] = [];
+  secondSocket.addEventListener('message', (event) => {
+    const message = JSON.parse(String(event.data)) as { type?: string; data?: string; replay?: boolean; responseQuery?: string };
+    if (message.type === 'data' && message.data) secondMessages.push({ data: message.data, replay: message.replay === true, responseQuery: message.responseQuery });
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      secondSocket.addEventListener('open', () => resolve(), { once: true });
+      secondSocket.addEventListener('error', () => reject(new Error('Second terminal WebSocket failed')), { once: true });
+    });
+    assert.equal(await waitUntil(() => secondMessages.some(({ data }) => data.includes('LIVE_DONE')), 3_000), true);
+    const output = secondMessages.map(({ data }) => data).join('');
+    assert.equal(output.includes('\x1b]4;1;?;2;?\x07\x1b[>cLIVE_DONE'), true, JSON.stringify(secondMessages));
+    assert.equal(secondMessages.some(({ data, replay, responseQuery }) => replay && data === '\x1b]4;1;?;2;?\x07' && responseQuery === data), true);
+    assert.equal(secondMessages.some(({ data, replay }) => !replay && data.includes('\x1b[>cLIVE_DONE')), true);
+  } finally {
+    firstSocket.close();
+    secondSocket.close();
+    await app.close();
+  }
+});
+
 test('a new terminal connection replaces the previous browser controller', async () => {
   const app = Fastify();
   await app.register(websocket);

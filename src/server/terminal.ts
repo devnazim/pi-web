@@ -5,6 +5,7 @@ import { basename } from 'node:path';
 import * as pty from 'node-pty';
 import { clearProjectFileCaches } from './files.js';
 import type { ProjectRegistry } from './projects.js';
+import { createTerminalReplaySanitizerState, sanitizeTerminalReplayChunk, terminalReplaySanitizerIsGround, trimTerminalReplay, type TerminalReplaySanitizerState } from './terminalReplay.js';
 import { resolveWithin } from './util.js';
 
 const MAX_COMMAND_LENGTH = 4000;
@@ -44,6 +45,8 @@ type TerminalClientMessage = {
   title?: unknown;
 };
 
+type TerminalOutputSegment = { data: string; replay: boolean; responseQuery?: string };
+
 type TerminalSession = {
   key: string;
   id: string;
@@ -55,7 +58,10 @@ type TerminalSession = {
   terminal: pty.IPty;
   sockets: Set<WebSocket>;
   replay: string;
-  pendingData: string;
+  replaySanitizerState: TerminalReplaySanitizerState;
+  pendingOutput: TerminalOutputSegment[];
+  pendingDataLength: number;
+  replayCatchup: boolean;
   cols: number;
   rows: number;
   flowControlSocket?: WebSocket;
@@ -193,7 +199,10 @@ function createTerminalSession(sessions: Map<string, TerminalSession>, key: stri
     terminal,
     sockets: new Set(),
     replay: '',
-    pendingData: '',
+    replaySanitizerState: createTerminalReplaySanitizerState(),
+    pendingOutput: [],
+    pendingDataLength: 0,
+    replayCatchup: false,
     cols,
     rows,
     sentDataOffset: 0,
@@ -218,6 +227,7 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
   session.sockets.clear();
   session.sockets.add(socket);
   resetTerminalFlowControl(session, socket);
+  session.replayCatchup = !terminalReplaySanitizerIsGround(session.replaySanitizerState);
   resizeTerminalSession(session, cols, rows);
   sendTerminalMessage(socket, { type: 'ready', cwd: session.cwd, title: session.title, shell: session.shell, shellName: session.shellName, terminalId: session.id, persistent: true });
   if (session.replay) sendTerminalMessage(socket, { type: 'data', data: session.replay, replay: true });
@@ -261,11 +271,8 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
     }
 
     if (message.type === 'clear') {
-      if (session.dataFlush) {
-        clearImmediate(session.dataFlush);
-        session.dataFlush = undefined;
-      }
-      session.pendingData = '';
+      // Flush first so clearing history cannot cut the live VT stream mid-sequence.
+      flushTerminalData(session);
       session.replay = '';
       broadcastTerminalMessage(session, { type: 'clear' });
       return;
@@ -288,9 +295,24 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
 
 function queueTerminalData(session: TerminalSession, data: string) {
   if (session.disposed) return;
-  session.replay = trimTerminalReplay(session.replay + data);
-  session.pendingData += data;
-  if (session.pendingData.length >= MAX_TERMINAL_PENDING_DATA_LENGTH) {
+  const replayCatchup = session.replayCatchup;
+  const replay = sanitizeTerminalReplayChunk(session.replaySanitizerState, data);
+  session.replaySanitizerState = replay.state;
+  session.replay = trimTerminalReplay(session.replay + replay.data, MAX_TERMINAL_REPLAY_LENGTH);
+  session.pendingDataLength += data.length;
+
+  if (!replayCatchup) {
+    queueTerminalOutput(session, data, false);
+  } else if (!replay.settled) {
+    queueTerminalOutput(session, replay.data, true);
+  } else {
+    queueTerminalOutput(session, replay.data.slice(0, replay.settled.dataLength), true);
+    if (replay.settled.responseQuery) queueTerminalOutput(session, replay.settled.responseQuery, true, replay.settled.responseQuery);
+    queueTerminalOutput(session, replay.settled.livePrefix + data.slice(replay.settled.consumed), false);
+    session.replayCatchup = false;
+  }
+
+  if (session.pendingDataLength >= MAX_TERMINAL_PENDING_DATA_LENGTH) {
     flushTerminalData(session);
     return;
   }
@@ -302,19 +324,30 @@ function queueTerminalData(session: TerminalSession, data: string) {
   session.dataFlush.unref();
 }
 
+function queueTerminalOutput(session: TerminalSession, data: string, replay: boolean, responseQuery?: string) {
+  if (!data) return;
+  const previous = session.pendingOutput.at(-1);
+  if (!responseQuery && !previous?.responseQuery && previous?.replay === replay) previous.data += data;
+  else session.pendingOutput.push({ data, replay, ...(responseQuery ? { responseQuery } : {}) });
+}
+
 function flushTerminalData(session: TerminalSession) {
   if (session.dataFlush) {
     clearImmediate(session.dataFlush);
     session.dataFlush = undefined;
   }
-  if (session.disposed || !session.pendingData) return;
-  const data = session.pendingData;
-  session.pendingData = '';
+  if (session.disposed || !session.pendingDataLength) return;
+  const output = session.pendingOutput;
+  session.pendingOutput = [];
+  session.pendingDataLength = 0;
   clearProjectFileCaches(session.projectId);
-  const dataOffset = session.sentDataOffset + data.length;
-  if (!broadcastTerminalMessage(session, { type: 'data', data, dataOffset })) return;
 
-  session.sentDataOffset = dataOffset;
+  for (const segment of output) {
+    const dataOffset = session.sentDataOffset + segment.data.length;
+    if (!broadcastTerminalMessage(session, { type: 'data', data: segment.data, dataOffset, replay: segment.replay || undefined, responseQuery: segment.responseQuery })) continue;
+    session.sentDataOffset = dataOffset;
+  }
+
   if (!session.outputPaused && session.sentDataOffset - session.acknowledgedDataOffset > TERMINAL_FLOW_CONTROL_HIGH_WATERMARK) {
     try {
       session.terminal.pause();
@@ -398,7 +431,10 @@ function disposeTerminalSession(sessions: Map<string, TerminalSession>, session:
     clearImmediate(session.dataFlush);
     session.dataFlush = undefined;
   }
-  session.pendingData = '';
+  session.pendingOutput = [];
+  session.pendingDataLength = 0;
+  session.replaySanitizerState = createTerminalReplaySanitizerState();
+  session.replayCatchup = false;
   session.dataDisposable?.dispose();
   session.exitDisposable?.dispose();
   session.dataDisposable = undefined;
@@ -506,10 +542,6 @@ function normalizeTerminalMetadata(value: unknown) {
   if (typeof value !== 'string') return undefined;
   const normalized = value.replace(/[\u0000-\u001f\u007f]/g, '').trim();
   return normalized ? normalized.slice(0, MAX_TERMINAL_METADATA_LENGTH) : undefined;
-}
-
-function trimTerminalReplay(value: string) {
-  return value.length > MAX_TERMINAL_REPLAY_LENGTH ? value.slice(-MAX_TERMINAL_REPLAY_LENGTH) : value;
 }
 
 function sendTerminalMessage(socket: WebSocket, message: Record<string, unknown>) {

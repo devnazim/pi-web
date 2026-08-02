@@ -2,12 +2,13 @@ import { SquareTerminal, X } from 'lucide-solid';
 import { createEffect, createMemo, createSignal, For, onCleanup } from 'solid-js';
 import type { Terminal as XTermTerminal } from '@xterm/xterm';
 import { appWebSocketUrl } from './appUrl';
+import { isTerminalGeneratedReply, terminalQueriesExpectingReplies, terminalReplyMatchesQuery } from './terminalReplay';
 import './terminal-font.css';
 
 type TerminalProject = { id: string; path: string };
 type ResolvedThemeMode = 'light' | 'dark';
 type TerminalStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
-type TerminalServerMessage = { type?: string; data?: string; dataOffset?: number; replay?: boolean; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
+type TerminalServerMessage = { type?: string; data?: string; dataOffset?: number; replay?: boolean; responseQuery?: string; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
 type TerminalRuntime = { Terminal: typeof import('@xterm/xterm').Terminal; FitAddon: typeof import('@xterm/addon-fit').FitAddon };
 type Disposable = { dispose(): void };
 type TerminalModifier = 'ctrl' | 'alt' | 'shift';
@@ -140,6 +141,13 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     else setShiftSticky((value) => !value);
     focusTerminal();
   };
+  const clearTerminal = () => {
+    const activeTerminal = terminal;
+    activeTerminal?.write('', () => {
+      if (terminal === activeTerminal) activeTerminal.clear();
+    });
+    sendTerminalClientMessage(terminalSocket, { type: 'clear' });
+  };
   const reconnectTerminal = () => {
     autoReconnectAttempts = 0;
     setReconnectKey((key) => key + 1);
@@ -202,7 +210,8 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let pendingInput = '';
     let pendingMetadata: { cwd?: string; title?: string } = {};
     let terminalExited = false;
-    let replayClipboardSuppression = 0;
+    let replaySideEffectSuppression = 0;
+    const expectedReplayReplies: { query: string }[] = [];
     let resizeTerminal: ((immediate?: boolean, forceRefresh?: boolean) => void) | undefined;
     let scheduleResizeTerminal: (() => void) | undefined;
 
@@ -260,16 +269,27 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (sendTerminalClientMessage(socket, { type: 'input', data })) return;
           if (socket?.readyState === WebSocket.CONNECTING) pendingInput = trimTerminalQueuedInput(pendingInput + data);
         };
-        const writeTerminalData = (data: string, replay = false, dataOffset?: number) => {
+        const writeTerminalData = (data: string, replay = false, dataOffset?: number, responseQuery?: string) => {
+          if (!xterm) return;
           if (!replay) {
-            xterm?.write(data, () => {
+            xterm.write(data, () => {
               if (Number.isSafeInteger(dataOffset)) sendTerminalClientMessage(socket, { type: 'ack', dataOffset });
             });
             return;
           }
-          replayClipboardSuppression += 1;
-          xterm?.write(data, () => {
-            replayClipboardSuppression = Math.max(0, replayClipboardSuppression - 1);
+          // Historical queries stay inert, except a query that was incomplete when this client attached.
+          const expectedReplies = responseQuery
+            ? terminalQueriesExpectingReplies(responseQuery).map((query) => ({ query }))
+            : [];
+          expectedReplayReplies.push(...expectedReplies);
+          replaySideEffectSuppression += 1;
+          xterm.write(data, () => {
+            replaySideEffectSuppression = Math.max(0, replaySideEffectSuppression - 1);
+            for (const expectedReply of expectedReplies) {
+              const index = expectedReplayReplies.indexOf(expectedReply);
+              if (index >= 0) expectedReplayReplies.splice(index, 1);
+            }
+            if (Number.isSafeInteger(dataOffset)) sendTerminalClientMessage(socket, { type: 'ack', dataOffset });
           });
         };
         sendInputRef = sendTerminalInput;
@@ -280,7 +300,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           return true;
         });
         osc52Disposable = xterm.parser.registerOscHandler(52, (data) => {
-          if (replayClipboardSuppression === 0) {
+          if (replaySideEffectSuppression === 0) {
             const clipboard = terminalClipboardTextFromOsc52(data);
             if (clipboard) void writeTerminalClipboardText(clipboard.selection, clipboard.text);
           }
@@ -409,6 +429,11 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         window.addEventListener('focus', resumeHeartbeat);
 
         inputDisposable = xterm.onData((data) => {
+          if (replaySideEffectSuppression > 0 && isTerminalGeneratedReply(data)) {
+            const expectedReplyIndex = expectedReplayReplies.findIndex(({ query }) => terminalReplyMatchesQuery(query, data));
+            if (expectedReplyIndex < 0) return;
+            expectedReplayReplies.splice(expectedReplyIndex, 1);
+          }
           const modifiers = { ctrl: ctrlSticky(), alt: altSticky(), shift: shiftSticky() };
           const modifiedData = terminalModifiedInputSequence(data, modifiers);
           if (modifiedData !== undefined) {
@@ -463,12 +488,15 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             if (nextCwd) setCwd(nextCwd);
           } else if (message.type === 'data' && typeof message.data === 'string') {
             props.onFilesystemActivity?.();
-            writeTerminalData(message.data, message.replay === true, message.dataOffset);
+            writeTerminalData(message.data, message.replay === true, message.dataOffset, message.responseQuery);
           } else if (message.type === 'error') {
             setStatus('error');
             xterm.writeln(`\r\n\x1b[31m${message.message ?? 'Terminal error'}\x1b[0m`);
           } else if (message.type === 'clear') {
-            xterm.clear();
+            const activeTerminal = xterm;
+            activeTerminal.write('', () => {
+              if (xterm === activeTerminal) activeTerminal.clear();
+            });
           } else if (message.type === 'exit') {
             terminalExited = true;
             props.onFilesystemActivity?.();
@@ -567,10 +595,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             <button
               class="ghost h-7 px-2 text-xs"
               type="button"
-              onClick={() => {
-                terminal?.clear();
-                sendTerminalClientMessage(terminalSocket, { type: 'clear' });
-              }}
+              onClick={clearTerminal}
             >Clear</button>
             <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={reconnectTerminal}>Reconnect</button>
             <button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClose}><X class="size-4" /></button>
@@ -586,7 +611,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           </div>
           <div class="terminal-toolbar-row">
             <span class={`terminal-status ${statusClass()}`}>{statusText()}</span>
-            <button class="ghost h-7 px-2 text-xs" type="button" onClick={() => { terminal?.clear(); sendTerminalClientMessage(terminalSocket, { type: 'clear' }); }}>Clear</button>
+            <button class="ghost h-7 px-2 text-xs" type="button" onClick={clearTerminal}>Clear</button>
             <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={reconnectTerminal}>Reconnect</button>
           </div>
           <div class="terminal-toolbar-row terminal-mobile-keys">
