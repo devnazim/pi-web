@@ -17,6 +17,9 @@ type TerminalRuntime = { Terminal: typeof import('@xterm/xterm').Terminal; FitAd
 type Disposable = { dispose(): void };
 
 const FONT_FAMILY = '"Pi GeistMono Nerd Font Mono", "GeistMono Nerd Font Mono", "JetBrains Mono", "Noto Color Emoji", monospace';
+const FONT_MEASURE_FAMILY = 'Pi GeistMono Nerd Font Mono';
+const FONT_SIZE = 14;
+const LINE_HEIGHT = 1.25;
 let runtimePromise: Promise<TerminalRuntime> | undefined;
 
 export default function ExtensionCustomUiTerminal(props: {
@@ -42,10 +45,14 @@ export default function ExtensionCustomUiTerminal(props: {
     if (!terminal || !props.sender) return;
     send({ type: 'agent:ui-custom-attach', cols: terminal.cols, rows: terminal.rows });
   };
-  const resize = () => {
+  const resize = (forceRefresh = false) => {
     if (!terminal || !fit || !host?.isConnected) return;
     try {
       fit.fit();
+      if (forceRefresh && terminal.rows > 0) {
+        terminal.clearTextureAtlas();
+        terminal.refresh(0, terminal.rows - 1);
+      }
       if (epoch !== undefined) send({ type: 'agent:ui-custom-resize', epoch, cols: terminal.cols, rows: terminal.rows });
     } catch {
       // Layout can disappear while the surrounding custom UI is closing.
@@ -66,6 +73,7 @@ export default function ExtensionCustomUiTerminal(props: {
       expectedSeq = 1;
       terminal.reset();
       terminal.focus();
+      scheduleResize();
       return;
     }
     if (event.data.epoch !== epoch || typeof event.data.seq !== 'number' || typeof event.data.ansi !== 'string') return;
@@ -106,10 +114,12 @@ export default function ExtensionCustomUiTerminal(props: {
         cursorBlink: false,
         customGlyphs: true,
         fontFamily: FONT_FAMILY,
-        fontSize: 14,
+        fontSize: FONT_SIZE,
         fontWeight: 400,
         fontWeightBold: 600,
-        lineHeight: 1.2,
+        letterSpacing: 0,
+        lineHeight: LINE_HEIGHT,
+        rescaleOverlappingGlyphs: true,
         scrollback: 1000,
         theme: terminalTheme(props.themeMode),
       });
@@ -124,6 +134,13 @@ export default function ExtensionCustomUiTerminal(props: {
       resize();
       attach();
       terminal.focus();
+      const activeTerminal = terminal;
+      void document.fonts.load(`${FONT_SIZE}px "${FONT_MEASURE_FAMILY}"`)
+        .then(() => {
+          if (disposed || terminal !== activeTerminal) return;
+          resize(true);
+        })
+        .catch(() => undefined);
     }).catch((error) => {
       if (disposed || !host) return;
       send({ type: 'agent:ui-custom-abandon' });
