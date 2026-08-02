@@ -27,8 +27,8 @@ const FILE_WATCH_DEBOUNCE_MS = 250;
 const FILE_WATCH_RESCAN_DEBOUNCE_MS = 1_000;
 const MAX_FILE_WATCH_DIRECTORIES = 5_000;
 const SKIPPED_SEARCH_DIRS = new Set(['.git', 'node_modules', '.pi-web']);
-const FILE_WATCH_SKIPPED_DIRS = new Set(['.git', 'node_modules']);
-const PROTECTED_FILE_ACTION_ROOTS = new Set(['.git', 'node_modules']);
+const FILE_WATCH_SKIPPED_DIRS = new Set(['.git', 'node_modules', '.pi-web']);
+const PROTECTED_FILE_ACTION_ROOTS = new Set(['.git', 'node_modules', '.pi-web']);
 
 type FileSearchResult = { path: string; name: string; directory: string };
 type FileSearchEntry = FileSearchResult & { searchText: string; nameSearch: string };
@@ -136,12 +136,14 @@ export async function registerFileRoutes(app: FastifyInstance, registry: Project
   app.get<{ Params: { projectId: string }; Querystring: { path?: string } }>('/api/projects/:projectId/files', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
-      const target = resolveWithin(project.path, request.query.path ?? '.');
-      const entries = await readDirectoryWithin(project.path, target);
+      const relativePath = projectDirectoryRelativePath(request.query.path ?? '', 'list');
+      const target = await assertRealPathWithin(project.path, resolveWithin(project.path, relativePath || '.'));
+      await assertAccessibleRealProjectPath(project.path, target, 'list');
+      const entries = await readDirectoryWithin(project.path, target, 'list');
       return {
-        path: projectRelativePathFromAbsolute(project.path, target),
+        path: relativePath,
         entries: entries
-          .filter((entry) => !['.git', 'node_modules'].includes(entry.name))
+          .filter((entry) => !['.git', 'node_modules', '.pi-web'].includes(entry.name))
           .map((entry) => ({ name: entry.name, type: entry.isDirectory() ? 'directory' : 'file' }))
           .sort((a, b) => Number(b.type === 'directory') - Number(a.type === 'directory') || a.name.localeCompare(b.name)),
       };
@@ -154,7 +156,9 @@ export async function registerFileRoutes(app: FastifyInstance, registry: Project
     if (!request.query.path) return reply.code(400).send({ error: 'Missing path' });
     try {
       const project = registry.get(request.params.projectId);
-      const target = resolveWithin(project.path, request.query.path);
+      const relativePath = readableProjectFileRelativePath(request.query.path, 'read');
+      const target = await assertRealPathWithin(project.path, resolveWithin(project.path, relativePath));
+      await assertAccessibleRealProjectPath(project.path, target, 'read', { allowPiWebUploads: true });
       const preview = await readTextPreview(project.path, target);
       return { path: request.query.path, ...preview };
     } catch (error) {
@@ -172,13 +176,15 @@ export async function registerFileRoutes(app: FastifyInstance, registry: Project
     if (request.body.contentHash !== undefined && typeof request.body.contentHash !== 'string') return reply.code(400).send({ error: 'Invalid file version' });
     try {
       const project = registry.get(request.params.projectId);
-      const target = resolveWithin(project.path, request.query.path);
+      const relativePath = mutableProjectRelativePath(request.query.path, 'write');
+      const target = resolveWithin(project.path, relativePath);
       const realTarget = await assertRealPathWithin(project.path, target);
+      await assertAccessibleRealProjectPath(project.path, realTarget, 'write');
 
       const file = await open(realTarget, constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       let fileStat!: Stats;
       try {
-        await assertOpenHandleWithin(project.path, file, realTarget);
+        await assertAccessibleOpenHandleWithin(project.path, file, realTarget, 'write');
         fileStat = await file.stat();
         if (!fileStat.isFile()) throw new Error('Path is not a file');
         const changedSincePreview = typeof request.body.contentHash === 'string' || fileChangedSinceVersion(fileStat, request.body.mtimeMs, request.body.etag);
@@ -247,12 +253,14 @@ export async function registerFileRoutes(app: FastifyInstance, registry: Project
     if (!request.query.path) return reply.code(400).send({ error: 'Missing path' });
     try {
       const project = registry.get(request.params.projectId);
-      const target = resolveWithin(project.path, request.query.path);
+      const relativePath = readableProjectFileRelativePath(request.query.path, 'read');
+      const target = resolveWithin(project.path, relativePath);
       const realTarget = await assertRealPathWithin(project.path, target);
+      await assertAccessibleRealProjectPath(project.path, realTarget, 'read', { allowPiWebUploads: true });
       const file = await open(realTarget, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       let streamOwnsFile = false;
       try {
-        await assertOpenHandleWithin(project.path, file, realTarget);
+        await assertAccessibleOpenHandleWithin(project.path, file, realTarget, 'read', { allowPiWebUploads: true });
         const fileStat = await file.stat();
         if (!fileStat.isFile()) throw new Error('Path is not a file');
         const etag = assetEtag(fileStat.size, fileStat.mtimeMs);
@@ -485,6 +493,12 @@ async function assertOpenHandleWithin(root: string, file: FileHandle, expectedPa
   return assertOpenHandleMatchesPath(root, file, expectedPath);
 }
 
+async function assertAccessibleOpenHandleWithin(root: string, file: FileHandle, expectedPath: string, action: FileMutationAction, options?: { allowPiWebUploads?: boolean }) {
+  const handlePath = await assertOpenHandleWithin(root, file, expectedPath);
+  await assertAccessibleRealProjectPath(root, handlePath.realPath, action, options);
+  return handlePath;
+}
+
 async function fileHandlePathWithin(root: string, file: FileHandle) {
   const resolvedRoot = await realpath(root);
   const handlePath = await fileHandlePath(file);
@@ -554,9 +568,10 @@ async function openDirectoryPathWithin(root: string, target: string): Promise<Op
   }
 }
 
-async function readDirectoryWithin(root: string, target: string) {
+async function readDirectoryWithin(root: string, target: string, action?: FileMutationAction) {
   const directory = await openDirectoryPathWithin(root, target);
   try {
+    if (action) await assertAccessibleRealProjectPath(root, directory.realPath, action);
     return await readdir(directory.path, { withFileTypes: true });
   } finally {
     await directory.close();
@@ -566,6 +581,7 @@ async function readDirectoryWithin(root: string, target: string) {
 async function createFileWithin(root: string, relativeDir: string, name: string) {
   const directory = await openDirectoryPathWithin(root, resolveWithin(root, relativeDir || '.'));
   try {
+    await assertAccessibleRealProjectPath(root, directory.realPath, 'create');
     const file = await createFileHandleWithin(root, directory, name, 0o644).catch((error) => {
       if (isErrorCode(error, 'EEXIST')) throw fileExistsError();
       throw error;
@@ -599,6 +615,7 @@ async function createFileHandleWithin(root: string, directory: OpenDirectoryPath
 async function renameEntryWithin(root: string, relativePath: string, nextRelativePath: string): Promise<FileEntryType> {
   const sourceDirectory = await openDirectoryPathWithin(root, resolveWithin(root, parentRelativePath(relativePath) || '.'));
   try {
+    await assertAccessibleRealProjectPath(root, sourceDirectory.realPath, 'rename');
     const sourceName = entryNameFromRelativePath(relativePath);
     const sourcePath = path.join(sourceDirectory.path, sourceName);
     const sourceStat = await lstat(sourcePath);
@@ -607,6 +624,7 @@ async function renameEntryWithin(root: string, relativePath: string, nextRelativ
 
     const destinationDirectory = await openDirectoryPathWithin(root, resolveWithin(root, parentRelativePath(nextRelativePath) || '.'));
     try {
+      await assertAccessibleRealProjectPath(root, destinationDirectory.realPath, 'rename');
       const destinationName = entryNameFromRelativePath(nextRelativePath);
       const destinationPath = path.join(destinationDirectory.path, destinationName);
       if (sourceName === destinationName) return sourceStat.isDirectory() ? 'directory' : 'file';
@@ -744,6 +762,7 @@ async function renamedEntryType(root: string, target: string): Promise<FileEntry
 async function deleteEntryWithin(root: string, relativePath: string) {
   const directory = await openDirectoryPathWithin(root, resolveWithin(root, parentRelativePath(relativePath) || '.'));
   try {
+    await assertAccessibleRealProjectPath(root, directory.realPath, 'delete');
     const target = path.join(directory.path, entryNameFromRelativePath(relativePath));
     const targetStat = await lstat(target);
     if (targetStat.isFile()) {
@@ -770,6 +789,7 @@ async function writeFileInPlaceWithin(root: string, target: string, expectedStat
     let tempStat: Stats | undefined;
     let replaced = false;
     try {
+      await assertAccessibleRealProjectPath(root, directory.realPath, 'write');
       const temp = await writeTempSaveFileWithin(root, directory, expectedStat, content);
       tempPath = temp.path;
       tempStat = temp.stat;
@@ -1059,12 +1079,25 @@ function mutableProjectRelativePath(value: string, action: FileMutationAction) {
   return normalized;
 }
 
-type FileMutationAction = 'create' | 'rename' | 'delete';
+type FileMutationAction = 'create' | 'rename' | 'delete' | 'list' | 'read' | 'write';
 
-function assertNoProtectedPathSegments(value: string, action: FileMutationAction) {
+function readableProjectFileRelativePath(value: string, action: 'read') {
+  const normalized = path.posix.normalize(value.replace(/\\/g, '/'));
+  if (!normalized || normalized === '.') throw new Error(`Cannot ${action} the workspace root`);
+  if (path.posix.isAbsolute(normalized) || normalized === '..' || normalized.startsWith('../')) throw new Error('Path escapes workspace');
+  assertNoProtectedPathSegments(normalized, action, { allowPiWebUploads: true });
+  return normalized;
+}
+
+function assertNoProtectedPathSegments(value: string, action: FileMutationAction, options?: { allowPiWebUploads?: boolean }) {
+  const piWebUpload = options?.allowPiWebUploads && value.startsWith('.pi-web/uploads/');
   for (const segment of value.split('/')) {
-    if (PROTECTED_FILE_ACTION_ROOTS.has(segment)) throw new Error(`Cannot ${action} ${segment}`);
+    if (PROTECTED_FILE_ACTION_ROOTS.has(segment) && !(segment === '.pi-web' && piWebUpload)) throw new Error(`Cannot ${action} ${segment}`);
   }
+}
+
+async function assertAccessibleRealProjectPath(projectPath: string, target: string, action: FileMutationAction, options?: { allowPiWebUploads?: boolean }) {
+  assertNoProtectedPathSegments(projectRelativePathFromAbsolute(await realpath(projectPath), target), action, options);
 }
 
 function cleanEntryName(value: string, action?: FileMutationAction) {
@@ -1324,7 +1357,7 @@ async function readTextPreview(root: string, target: string) {
   const realTarget = await assertRealPathWithin(root, target);
   const file = await open(realTarget, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    await assertOpenHandleWithin(root, file, realTarget);
+    await assertAccessibleOpenHandleWithin(root, file, realTarget, 'read', { allowPiWebUploads: true });
     const fileStat = await file.stat();
     if (!fileStat.isFile()) throw new Error('Path is not a file');
     const buffer = Buffer.alloc(Math.min(fileStat.size, MAX_TEXT_BYTES));
@@ -1341,7 +1374,7 @@ async function openFileContentUnchangedOrEquals(root: string, target: string, ex
   let file: FileHandle | undefined;
   try {
     file = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    await assertOpenHandleWithin(root, file, target);
+    await assertAccessibleOpenHandleWithin(root, file, target, 'write');
     const fileStat = await file.stat();
     if (!sameFileIdentity(fileStat, expectedStat) || fileStat.size > MAX_TEXT_BYTES) return false;
     const buffer = Buffer.alloc(fileStat.size);

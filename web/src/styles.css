@@ -1091,19 +1091,22 @@ body {
     @apply opacity-100;
   }
 
-  .review-workspace {
+  .review-workspace,
+  .file-workspace {
     @apply rounded-2xl border border-border;
     height: calc(100% - 5rem);
     margin: 4rem 1rem 1rem;
   }
 
   .tool-panel,
-  .review-workspace {
+  .review-workspace,
+  .file-workspace {
     box-shadow: 0 18px 42px -20px oklch(0 0 0 / 0.26), 0 6px 16px -8px oklch(0 0 0 / 0.14);
   }
 
   .dark .tool-panel,
-  .dark .review-workspace {
+  .dark .review-workspace,
+  .dark .file-workspace {
     box-shadow: none;
   }
 
@@ -1162,11 +1165,120 @@ body {
     min-height: 0;
   }
 
+  .file-workspace-explorer-backdrop {
+    display: none;
+  }
+
   @media (max-width: 900px) {
     .review-workspace.review-source-hidden {
       grid-template-rows: minmax(0, 1fr);
       overflow: hidden;
     }
+
+    .file-workspace.file-workspace {
+      @apply relative;
+      grid-template-columns: minmax(0, 1fr) !important;
+    }
+
+    .file-workspace-resize-handle {
+      display: none;
+    }
+
+    .file-workspace-explorer-backdrop {
+      @apply absolute inset-0 z-20 block bg-black/45;
+    }
+
+    .file-workspace-explorer {
+      @apply absolute inset-y-0 right-0 z-30 border-l border-border shadow-2xl;
+      width: min(22rem, 88vw);
+    }
+  }
+
+  .file-workspace-tab-bar {
+    @apply flex min-w-0 items-stretch border-b border-border bg-card;
+  }
+
+  .file-workspace-tab-scroll {
+    @apply flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+  }
+
+  .file-workspace-tab {
+    @apply flex h-11 w-44 min-w-28 max-w-44 shrink-0 items-stretch border-r border-border text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground;
+  }
+
+  .file-workspace-tab-active {
+    @apply bg-background text-foreground;
+    box-shadow: inset 0 -2px 0 oklch(var(--primary));
+  }
+
+  .file-workspace-tab-main {
+    @apply flex min-w-0 flex-1 items-center gap-2 px-3 text-left text-xs outline-none focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50;
+  }
+
+  .file-workspace-tab-close {
+    @apply grid w-8 shrink-0 place-items-center text-muted-foreground opacity-60 outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50;
+  }
+
+  .file-workspace-tab:hover .file-workspace-tab-close,
+  .file-workspace-tab-active .file-workspace-tab-close {
+    @apply opacity-100;
+  }
+
+  .file-workspace-dirty-dot {
+    @apply size-2 shrink-0 rounded-full bg-foreground/70;
+  }
+
+  .file-workspace-tab-empty {
+    @apply flex h-11 items-center px-4 text-xs text-muted-foreground;
+  }
+
+  .file-workspace-tab-actions {
+    @apply flex shrink-0 items-center gap-1 border-l border-border px-2;
+  }
+
+  .file-workspace-file-bar {
+    @apply flex min-w-0 items-center justify-between gap-3 border-b border-border bg-card px-4 py-2.5;
+  }
+
+  .file-workspace-content {
+    @apply min-h-0 min-w-0 overflow-hidden bg-card;
+  }
+
+  .file-workspace-empty {
+    @apply grid h-full min-h-0 place-items-center gap-3 p-6 text-center text-sm text-muted-foreground;
+    align-content: center;
+  }
+
+  .file-workspace-tree {
+    @apply min-h-0 overflow-auto py-2;
+    overscroll-behavior: contain;
+  }
+
+  .file-tree-row {
+    @apply flex min-w-0 items-center pr-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground;
+  }
+
+  .file-tree-row-active {
+    @apply bg-accent text-accent-foreground;
+  }
+
+  .file-tree-row-main {
+    @apply flex h-7 min-w-0 flex-1 items-center gap-1.5 text-left outline-none focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50;
+  }
+
+  .file-tree-row .file-row-menu-button {
+    @apply size-7;
+  }
+
+  .file-tree-row:hover .file-row-menu-button,
+  .file-tree-row-active .file-row-menu-button {
+    @apply opacity-100;
+  }
+
+  .file-tree-state {
+    @apply flex min-h-7 items-center gap-2 pr-3 text-xs text-muted-foreground;
   }
 
   .tool-panel-header {
@@ -2845,7 +2957,8 @@ body {
     box-shadow: none;
   }
 
-  main .review-workspace {
+  main .review-workspace,
+  main .file-workspace {
     position: fixed;
     inset: 0;
     z-index: 50;

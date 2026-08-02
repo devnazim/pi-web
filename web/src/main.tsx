@@ -14,7 +14,6 @@ import {
   ChevronRight,
   CodeXml,
   Copy,
-  CornerUpLeft,
   Database,
   Ellipsis,
   ExternalLink,
@@ -104,6 +103,7 @@ import {
 } from './liveActivity';
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
+import { activePathAfterRemoval, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot } from './fileWorkspace';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
@@ -178,6 +178,25 @@ type ProjectFileEntry = { name: string; type: 'directory' | 'file' };
 type ProjectFilesResponse = { path: string; entries: ProjectFileEntry[] };
 type ProjectFilePreview = { path: string; content: string; truncated?: boolean; mtimeMs?: number; size?: number; etag?: string; contentHash?: string };
 type ProjectFileSearchEntry = { path: string; name: string; directory: string };
+type FileEditorViewState = import('monaco-editor').editor.ICodeEditorViewState;
+type FileEditorModel = import('monaco-editor').editor.ITextModel;
+type FileWorkspaceTab = Omit<ProjectFilePreview, 'content'> & {
+  savedContent?: string;
+  draftContent?: string;
+  loaded: boolean;
+  externalChange?: boolean;
+  saveError?: string;
+  editorViewState?: FileEditorViewState;
+};
+type FileWorkspaceState = {
+  tabs: FileWorkspaceTab[];
+  activePath?: string;
+  expandedDirectories: Record<string, boolean>;
+  selectedDirectory: string;
+  explorerOpen: boolean;
+  explorerWidth: number;
+};
+type FileWorkspaceController = { requestClose: (afterClose: () => void, onCancel?: () => void) => void };
 type ToolPanel = 'terminal' | 'tree' | 'review' | 'files';
 type ProjectMenuState = { project: Project; x: number; y: number };
 type TreeNodeMenuState = { entry: SessionEntry; label?: string; hasChildren: boolean; collapsed: boolean; x: number; y: number };
@@ -422,10 +441,10 @@ const TREE_PANEL_DEFAULT_WIDTH = 560;
 const TREE_PANEL_MIN_WIDTH = 360;
 const TREE_PANEL_CHAT_MIN_WIDTH = 420;
 const TREE_PANEL_RESIZE_KEY_STEP = 24;
-const FILE_EXPLORER_DEFAULT_WIDTH = 420;
-const FILE_EXPLORER_MIN_WIDTH = 300;
-const FILE_EXPLORER_CHAT_MIN_WIDTH = 420;
-const FILE_EXPLORER_RESIZE_KEY_STEP = 24;
+const FILE_WORKSPACE_EXPLORER_DEFAULT_WIDTH = 340;
+const FILE_WORKSPACE_EXPLORER_MIN_WIDTH = 260;
+const FILE_WORKSPACE_PREVIEW_MIN_WIDTH = 420;
+const FILE_WORKSPACE_EXPLORER_RESIZE_KEY_STEP = 24;
 const REVIEW_SOURCE_CONTROL_DEFAULT_WIDTH = 340;
 const REVIEW_SOURCE_CONTROL_MIN_WIDTH = 260;
 const REVIEW_PREVIEW_MIN_WIDTH = 420;
@@ -434,9 +453,9 @@ const REVIEW_EDITOR_SCROLL_BEYOND_LAST_COLUMN = 24;
 const REVIEW_CONTEXT_LINE_COUNT = 3;
 let reviewEditorModelSequence = 0;
 let reviewTextareaSequence = 0;
+let unsavedFileDialogSequence = 0;
 const RECENT_PROJECTS_KEY = 'pi-web-recent-projects';
 const RECENT_FILES_KEY_PREFIX = 'pi-web-recent-files:';
-const fileExplorerPaths = new Map<string, string>();
 const composerDrafts = new Map<string, ComposerDraft>();
 const composerDraftRecoveryListeners = new Map<string, Set<(draft: ComposerDraft) => boolean>>();
 const composerDraftUploadListeners = new Map<string, Set<(uploads: UploadAsset[]) => void>>();
@@ -637,6 +656,16 @@ function createResizableDimension(options: {
   return { size, resizing, maxSize: options.maxSize, setClampedSize, startResize, resizeWithKeyboard };
 }
 
+function createFileWorkspaceState(): FileWorkspaceState {
+  return {
+    tabs: [],
+    expandedDirectories: { '': true },
+    selectedDirectory: '',
+    explorerOpen: true,
+    explorerWidth: FILE_WORKSPACE_EXPLORER_DEFAULT_WIDTH,
+  };
+}
+
 function createReviewWorkspaceState(): ReviewWorkspaceState {
   return {
     sourceControlOpen: true,
@@ -742,6 +771,8 @@ function setProjectTileDragData(dataTransfer: DataTransfer, dragEl: HTMLElement)
 
 
 function Shell() {
+  let fileWorkspaceController: FileWorkspaceController | undefined;
+  let bypassFileWorkspaceCloseGuard = false;
   const initialActiveSessionId = readActiveSessionId();
   const [projectId, setProjectId] = createSignal<string>();
   const [workspaceProjectId, setWorkspaceProjectId] = createSignal<string>();
@@ -1443,6 +1474,7 @@ function Shell() {
 
   function openWorkspaceNotification(notification: WorkspaceNotificationItem) {
     const workspace = workspaceLookup()[notification.workspaceId];
+    if (workspace && workspace.workspace.id !== workspaceProject()?.id && requestFileWorkspaceLeave(() => openWorkspaceNotification(notification))) return;
     if (workspace) {
       setPendingActiveWorkspacePath(undefined);
       setActiveSession(undefined, workspace.workspace.id);
@@ -2119,6 +2151,7 @@ function Shell() {
   });
 
   async function openProject(projectPath: string, options?: { closeProjectId?: string }) {
+    if (requestFileWorkspaceLeave(() => void openProject(projectPath, options))) return;
     try {
       const { project } = await api<{ project: Project }>('/api/projects', {
         method: 'POST',
@@ -2148,6 +2181,17 @@ function Shell() {
   async function saveProjectEdit(project: Project, input: ProjectEditInput) {
     const projectPath = input.path.trim();
     if (!projectPath) throw new Error('Workspace path is required');
+    if (toolPanel() === 'files' && fileWorkspaceController && !bypassFileWorkspaceCloseGuard) {
+      await new Promise<void>((resolve, reject) => {
+        fileWorkspaceController!.requestClose(() => {
+          bypassFileWorkspaceCloseGuard = true;
+          const operation = saveProjectEdit(project, input);
+          bypassFileWorkspaceCloseGuard = false;
+          void operation.then(resolve, reject);
+        }, resolve);
+      });
+      return;
+    }
 
     let nextProject = project;
     if (projectPath !== project.path) {
@@ -2193,6 +2237,7 @@ function Shell() {
   }
 
   async function closeProject(project: Project) {
+    if (project.id === projectId() && requestFileWorkspaceLeave(() => void closeProject(project))) return;
     await api(`/api/projects/${project.id}`, { method: 'DELETE' });
     forgetOpenProject(project.path);
     await queryClient.invalidateQueries({ queryKey: ['projects'] });
@@ -2213,6 +2258,7 @@ function Shell() {
 
   function selectProject(id: string) {
     if (id === projectId()) return;
+    if (requestFileWorkspaceLeave(() => selectProject(id))) return;
     setPendingActiveWorkspacePath(undefined);
     setActiveSession(undefined);
     setProjectId(id);
@@ -2239,6 +2285,7 @@ function Shell() {
     const currentSessionId = activeSessionId();
     if (expectedNavigationRevision !== undefined && sessionNavigationRevision() !== expectedNavigationRevision) return false;
     if (expectedSessionId !== undefined && (currentWorkspaceId !== workspaceId || currentSessionId !== (expectedSessionId ?? undefined))) return false;
+    if (workspaceId && currentWorkspaceId !== workspaceId && requestFileWorkspaceLeave(() => selectSession(id, workspaceId, expectedSessionId, expectedNavigationRevision))) return false;
     workspaceSessionRestoreRequest += 1;
     const switchedWorkspace = Boolean(workspaceId && currentWorkspaceId !== workspaceId);
     if (workspaceId && currentWorkspaceId !== workspaceId) {
@@ -2358,6 +2405,7 @@ function Shell() {
 
   function startNewSession(workspaceId?: string) {
     const targetWorkspaceId = workspaceId ?? workspaceProject()?.id;
+    if (targetWorkspaceId && targetWorkspaceId !== workspaceProject()?.id && requestFileWorkspaceLeave(() => startNewSession(workspaceId))) return;
     workspaceSessionRestoreRequest += 1;
     if (targetWorkspaceId) {
       const rememberedSessionId = lastWorkspaceSessions()[targetWorkspaceId];
@@ -2408,6 +2456,7 @@ function Shell() {
   }
 
   function resetWorkspaceSelection(id: string) {
+    if (id !== workspaceProjectId() && requestFileWorkspaceLeave(() => resetWorkspaceSelection(id))) return;
     if (
       workspaceSessionRestoreTarget?.workspaceId === id
       && workspaceSessionRestoreTarget.request === workspaceSessionRestoreRequest
@@ -2442,10 +2491,12 @@ function Shell() {
 
   function selectWorkspace(id: string) {
     if (id === workspaceProjectId()) return;
+    if (requestFileWorkspaceLeave(() => selectWorkspace(id))) return;
     resetWorkspaceSelection(id);
   }
 
   async function toggleWorkspaces(project: Project) {
+    if (project.id === activeProject()?.id && requestFileWorkspaceLeave(() => void toggleWorkspaces(project))) return;
     const enabled = Boolean(workspacesEnabledByPath()[project.path]);
     if (!enabled) {
       try {
@@ -2472,6 +2523,7 @@ function Shell() {
   async function createWorkspace() {
     const project = activeProject();
     if (!project) return;
+    if (requestFileWorkspaceLeave(() => void createWorkspace())) return;
     try {
       const { workspace } = await api<{ workspace: ProjectWorkspace }>(`/api/projects/${project.id}/workspaces`, {
         method: 'POST',
@@ -2488,6 +2540,7 @@ function Shell() {
   async function deleteWorkspace(workspace: ProjectWorkspace, options?: { force?: boolean }) {
     const project = activeProject();
     if (!project || workspace.local) return;
+    if (workspace.id === workspaceProjectId() && requestFileWorkspaceLeave(() => void deleteWorkspace(workspace, options))) return;
     await api(`/api/projects/${project.id}/workspaces/${workspace.id}${options?.force ? '?force=true' : ''}`, { method: 'DELETE' });
     queryClient.removeQueries({ queryKey: ['sessions', workspace.id] });
     queryClient.removeQueries({ queryKey: ['session', workspace.id] });
@@ -2509,17 +2562,33 @@ function Shell() {
     setSessionSidebar(!sessionSidebarOpen());
   }
 
+  function requestFileWorkspaceLeave(afterClose: () => void) {
+    if (toolPanel() !== 'files' || !fileWorkspaceController || bypassFileWorkspaceCloseGuard) return false;
+    fileWorkspaceController.requestClose(() => {
+      bypassFileWorkspaceCloseGuard = true;
+      try {
+        afterClose();
+      } finally {
+        bypassFileWorkspaceCloseGuard = false;
+      }
+    });
+    return true;
+  }
+
   function setWorkspaceToolPanel(panel?: ToolPanel) {
     const currentPanel = toolPanel();
+    if (currentPanel === 'files' && panel !== 'files' && requestFileWorkspaceLeave(() => setWorkspaceToolPanel(panel))) return;
+    const currentImmersive = currentPanel === 'review' || currentPanel === 'files';
+    const nextImmersive = panel === 'review' || panel === 'files';
     if (panel !== 'files' || currentPanel !== 'files') setFileSearchRequest(0);
-    if (currentPanel === 'review' && panel !== 'review') {
+    if (currentImmersive && !nextImmersive) {
       const initialSidebarOpen = reviewInitialSessionSidebarOpen();
       setToolPanel(panel);
       setReviewInitialSessionSidebarOpen(undefined);
       if (initialSidebarOpen !== undefined) setSessionSidebar(initialSidebarOpen);
       return;
     }
-    if (currentPanel !== 'review' && panel === 'review') {
+    if (!currentImmersive && nextImmersive) {
       setReviewInitialSessionSidebarOpen(sessionSidebarOpen());
       if (sessionSidebarOpen()) setSessionSidebarOpen(false);
     }
@@ -2635,7 +2704,7 @@ function Shell() {
         </Show>
         <main class={`relative min-h-0 min-w-0 overflow-hidden bg-background ${sessionSidebarOpen() ? 'rounded-l-2xl max-md:rounded-none' : ''}`}>
           <Topbar project={workspaceProject()} sessionId={activeSessionId()} sessionSidebarOpen={sessionSidebarOpen()} searchQuery={chatSearchInput()} searchState={chatSearchState()} notificationSummary={workspaceProject() ? workspaceNotificationSummaries()[workspaceProject()!.id] : undefined} menuOpen={sessionMenuOpen()} shareFeedback={shareFeedback()} sessionRunning={currentSessionRunning()} onSearchQuery={setChatSearchInput} onSearchNavigate={navigateChatSearch} onSearchClear={clearChatSearch} onToggleSidebar={toggleSessionSidebar} onOpenNotifications={() => workspaceProject() && toggleWorkspaceNotifications(workspaceProject()!.id)} onMenuOpen={() => setSessionMenuOpen(true)} onMenuClose={() => setSessionMenuOpen(false)} onRename={() => { setRenameValue(currentSessionName()); setSessionActionError(''); setSessionRenameOpen(true); }} onDelete={() => { setSessionActionError(currentSessionRunning() ? 'Session is running. Stop it before deleting.' : ''); setSessionDeleteOpen(true); }} onShare={shareCurrentSession} toolPanel={toolPanel()} setToolPanel={setWorkspaceToolPanel} onMobileMenu={() => setMobileMenuOpen(true)} onMobileToolPopover={() => setMobileToolPopover((v) => !v)} />
-          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} sessionNavigationRevision={sessionNavigationRevision()} newComposerRevision={workspaceProject() ? newComposerRevisions()[workspaceProject()!.id] ?? 0 : 0} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onDraftSessionId={setDraftSessionId} onSessionNotFound={handleSessionNotFound} onExtensionUiReply={replyExtensionUiRequest} beginAgentStatusRequest={beginAgentStatusRequest} invalidateAgentStatusRequests={invalidateAgentStatusRequests} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
+          <WorkspaceMain project={workspaceProject()} sessionId={activeSessionId()} sessionNavigationRevision={sessionNavigationRevision()} newComposerRevision={workspaceProject() ? newComposerRevisions()[workspaceProject()!.id] ?? 0 : 0} liveActivity={liveAgentActivity()} liveShellActivity={liveShellActivity()} extensionUiRequests={workspaceExtensionUiRequests()} toolPanel={toolPanel()} themeMode={resolvedThemeMode()} contrastUserMessages={contrastUserMessages()} searchQuery={chatSearchQuery()} searchRequest={chatSearchRequest()} fileSearchRequest={fileSearchRequest()} onSearchState={setChatSearchState} onSession={selectSession} onDraftSessionId={setDraftSessionId} onSessionNotFound={handleSessionNotFound} onExtensionUiReply={replyExtensionUiRequest} beginAgentStatusRequest={beginAgentStatusRequest} invalidateAgentStatusRequests={invalidateAgentStatusRequests} onFileWorkspaceController={(controller) => { fileWorkspaceController = controller; }} onClosePanel={() => setWorkspaceToolPanel(undefined)} />
           <Show when={extensionCustomUi()} keyed>
             {(request) => (
               <div class="extension-custom-ui-layer">
@@ -2988,6 +3057,7 @@ function ProjectEditModal(props: { project: Project; preference: ProjectPreferen
     setError('');
     try {
       await props.onSave({ path: projectPath(), color: color() || undefined, imageFile: imageFile(), clearImage: clearImage() });
+      setBusy(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save workspace');
       setBusy(false);
@@ -5132,12 +5202,21 @@ function MobileMenu(props: {
   );
 }
 
-function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNavigationRevision: number; newComposerRevision: number; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null, expectedNavigationRevision?: number) => boolean; onDraftSessionId: (projectId: string, sessionId: string | undefined) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onClosePanel: () => void }) {
+function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNavigationRevision: number; newComposerRevision: number; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; toolPanel?: ToolPanel; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; fileSearchRequest: number; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null, expectedNavigationRevision?: number) => boolean; onDraftSessionId: (projectId: string, sessionId: string | undefined) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onFileWorkspaceController: (controller?: FileWorkspaceController) => void; onClosePanel: () => void }) {
   let terminalSplitRef: HTMLDivElement | undefined;
   let workspaceSplitRef: HTMLDivElement | undefined;
   let terminalFileInvalidationTimer: number | undefined;
   let terminalServerFileInvalidationTimer: number | undefined;
+  const fileWorkspaceStates = new Map<string, FileWorkspaceState>();
   const reviewWorkspaceStates = new Map<string, ReviewWorkspaceState>();
+  function fileWorkspaceState(projectId: string) {
+    let state = fileWorkspaceStates.get(projectId);
+    if (!state) {
+      state = createFileWorkspaceState();
+      fileWorkspaceStates.set(projectId, state);
+    }
+    return state;
+  }
   function reviewWorkspaceState(projectId: string) {
     let state = reviewWorkspaceStates.get(projectId);
     if (!state) {
@@ -5146,6 +5225,15 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
     }
     return state;
   }
+  createEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (![...fileWorkspaceStates.values()].some((state) => state.tabs.some(fileWorkspaceTabDirty))) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    onCleanup(() => window.removeEventListener('beforeunload', onBeforeUnload));
+  });
   const terminalFileInvalidationProjectIds = new Set<string>();
   const terminalServerFileInvalidationProjectIds = new Set<string>();
   const [treeSelection, setTreeSelection] = createSignal<TreeSelection>();
@@ -5171,18 +5259,6 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
     decreaseKey: 'ArrowRight',
     cursor: 'ew-resize',
   });
-  const fileExplorer = createResizableDimension({
-    defaultSize: FILE_EXPLORER_DEFAULT_WIDTH,
-    minSize: FILE_EXPLORER_MIN_WIDTH,
-    maxSize: () => Math.max(FILE_EXPLORER_MIN_WIDTH, (workspaceSplitRef?.getBoundingClientRect().width ?? window.innerWidth) - FILE_EXPLORER_CHAT_MIN_WIDTH),
-    keyStep: FILE_EXPLORER_RESIZE_KEY_STEP,
-    axis: 'x',
-    dragMultiplier: -1,
-    increaseKey: 'ArrowLeft',
-    decreaseKey: 'ArrowRight',
-    cursor: 'ew-resize',
-  });
-
   function scheduleTerminalFileInvalidation(projectId: string) {
     terminalFileInvalidationProjectIds.add(projectId);
     terminalServerFileInvalidationProjectIds.add(projectId);
@@ -5239,19 +5315,6 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
   });
 
   createEffect(() => {
-    if (props.toolPanel !== 'files' || !workspaceSplitRef) return;
-    const clampWidth = () => fileExplorer.setClampedSize(fileExplorer.size());
-    const observer = new ResizeObserver(clampWidth);
-    observer.observe(workspaceSplitRef);
-    window.addEventListener('resize', clampWidth);
-    queueMicrotask(clampWidth);
-    onCleanup(() => {
-      observer.disconnect();
-      window.removeEventListener('resize', clampWidth);
-    });
-  });
-
-  createEffect(() => {
     props.sessionId;
     setTreeSelection(undefined);
   });
@@ -5261,19 +5324,18 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
       <Show when={props.project} fallback={<div class="grid h-full place-items-center text-sm text-muted-foreground">Open a project to start.</div>}>
         {(project) => (
           <Show
-            when={props.toolPanel === 'review'}
+            when={props.toolPanel === 'review' || props.toolPanel === 'files'}
             fallback={
               <Show
                 when={props.toolPanel === 'terminal'}
                 fallback={
                   <div
                     ref={workspaceSplitRef}
-                    class={props.toolPanel === 'tree' || props.toolPanel === 'files' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
-                    style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : props.toolPanel === 'files' ? { 'grid-template-columns': `minmax(0, 1fr) ${fileExplorer.size()}px` } : {}}
+                    class={props.toolPanel === 'tree' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
+                    style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : {}}
                   >
                     <Chat project={project()} sessionId={props.sessionId} sessionNavigationRevision={props.sessionNavigationRevision} newComposerRevision={props.newComposerRevision} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onDraftSessionId={props.onDraftSessionId} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
                     <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
-                    <Show when={props.toolPanel === 'files'}><FileExplorer project={project()} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} resizing={fileExplorer.resizing()} onResizeStart={fileExplorer.startResize} onResizeKeyDown={fileExplorer.resizeWithKeyboard} onResizeReset={() => fileExplorer.setClampedSize(FILE_EXPLORER_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
                   </div>
                 }
               >
@@ -5300,8 +5362,17 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
               </Show>
             }
           >
-            <Show when={project()} keyed>
-              {(reviewProject) => <ReviewWorkspace project={reviewProject} sessionId={props.sessionId} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} agentRunning={props.liveActivity.running} onClose={props.onClosePanel} />}
+            <Show
+              when={props.toolPanel === 'review'}
+              fallback={
+                <Show when={project()} keyed>
+                  {(fileProject) => <FileWorkspace project={fileProject} state={fileWorkspaceState(fileProject.id)} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} onController={props.onFileWorkspaceController} onClose={props.onClosePanel} />}
+                </Show>
+              }
+            >
+              <Show when={project()} keyed>
+                {(reviewProject) => <ReviewWorkspace project={reviewProject} sessionId={props.sessionId} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} agentRunning={props.liveActivity.running} onClose={props.onClosePanel} />}
+              </Show>
             </Show>
           </Show>
         )}
@@ -7816,10 +7887,45 @@ function AssetPreviewModal(props: { project: Project; path: string; themeMode: R
   );
 }
 
-function UnsavedFileDialog(props: { saving: boolean; error: string; onSave: () => void; onDiscard: () => void; onCancel: () => void }) {
+function UnsavedFileDialog(props: { saving: boolean; error: string; description?: string; onSave: () => void; onDiscard: () => void; onCancel: () => void }) {
+  let dialogRef: HTMLDivElement | undefined;
+  let cancelRef: HTMLButtonElement | undefined;
+  const titleId = `unsaved-file-dialog-title-${++unsavedFileDialogSequence}`;
+
+  onMount(() => {
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+    queueMicrotask(() => cancelRef?.focus());
+    onCleanup(() => {
+      if (previousFocus?.isConnected) previousFocus.focus();
+    });
+  });
+
   createEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !props.saving) props.onCancel();
+      if (event.key === 'Escape' && !props.saving) {
+        event.preventDefault();
+        props.onCancel();
+        return;
+      }
+      if (event.key !== 'Tab' || !dialogRef) return;
+      const focusable = [...dialogRef.querySelectorAll<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialogRef.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable.at(-1)!;
+      if (!dialogRef.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     onCleanup(() => window.removeEventListener('keydown', onKeyDown));
@@ -7827,14 +7933,14 @@ function UnsavedFileDialog(props: { saving: boolean; error: string; onSave: () =
 
   return (
     <div class="confirm-modal-backdrop" onMouseDown={(event) => { event.stopPropagation(); if (!props.saving) props.onCancel(); }}>
-      <div class="confirm-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <h2 class="text-base font-medium leading-none">Unsaved changes</h2>
-        <p class="mt-2 text-sm leading-6 text-muted-foreground">Save your changes before closing this file?</p>
+      <div ref={dialogRef} class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+        <h2 id={titleId} class="text-base font-medium leading-none">Unsaved changes</h2>
+        <p class="mt-2 text-sm leading-6 text-muted-foreground">{props.description ?? 'Save your changes before closing this file?'}</p>
         <Show when={props.error}>
-          <div class="mt-4 rounded-2xl bg-destructive/10 px-3 py-2 text-sm text-destructive ring-1 ring-destructive/20">{props.error}</div>
+          <div class="mt-4 rounded-2xl bg-destructive/10 px-3 py-2 text-sm text-destructive ring-1 ring-destructive/20" role="alert">{props.error}</div>
         </Show>
         <div class="dialog-footer justify-end">
-          <button class="button-secondary" disabled={props.saving} onClick={props.onCancel}>Cancel</button>
+          <button ref={cancelRef} class="button-secondary" disabled={props.saving} onClick={props.onCancel}>Cancel</button>
           <button class="button-danger" disabled={props.saving} onClick={props.onDiscard}>Discard</button>
           <button class="button" disabled={props.saving} onClick={props.onSave}>{props.saving ? 'Saving...' : 'Save'}</button>
         </div>
@@ -7843,7 +7949,7 @@ function UnsavedFileDialog(props: { saving: boolean; error: string; onSave: () =
   );
 }
 
-function CodePreview(props: { path: string; content: string; readOnly?: boolean; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme; onContent: (content: string) => void; onSave: () => void }) {
+function CodePreview(props: { path: string; content: string; readOnly?: boolean; viewState?: FileEditorViewState; model?: FileEditorModel; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme; onContent: (content: string) => void; onSave: () => void; onViewState?: (viewState: FileEditorViewState) => void; onModel?: (model: FileEditorModel) => void }) {
   let containerRef: HTMLDivElement | undefined;
   let monacoApi: MonacoApi | undefined;
   let editor: import('monaco-editor').editor.IStandaloneCodeEditor | undefined;
@@ -7858,7 +7964,14 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
       if (disposed || !containerRef) return;
       monacoApi = monaco;
       defineMonacoPreviewThemes(monaco);
-      model = monaco.editor.createModel(props.content, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'file', path: `/${props.path}` }));
+      model = props.model;
+      if (model) {
+        if (model.getValue() !== props.content) model.setValue(props.content);
+        monaco.editor.setModelLanguage(model, monacoLanguage(props.path));
+      } else {
+        model = monaco.editor.createModel(props.content, monacoLanguage(props.path), monaco.Uri.from({ scheme: 'file', path: `/${props.path}` }));
+      }
+      props.onModel?.(model);
       editor = monaco.editor.create(containerRef, {
         model,
         readOnly: Boolean(props.readOnly),
@@ -7882,14 +7995,17 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
         padding: { top: 14, bottom: 14 },
         scrollbar: { useShadows: false, horizontal: 'auto', vertical: 'auto' },
       });
+      if (props.viewState) editor.restoreViewState(props.viewState);
       editor.onDidChangeModelContent(() => props.onContent(model?.getValue() ?? ''));
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, props.onSave);
     });
     onCleanup(() => {
       disposed = true;
       disposeFindHoverGuard?.();
+      const viewState = editor?.saveViewState();
+      if (viewState) props.onViewState?.(viewState);
       editor?.dispose();
-      model?.dispose();
+      if (!props.onModel) model?.dispose();
     });
   });
 
@@ -7900,8 +8016,8 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
   });
 
   createEffect(() => {
-    if (!editor) return;
-    editor.updateOptions({ readOnly: Boolean(props.readOnly), domReadOnly: Boolean(props.readOnly) });
+    const readOnly = Boolean(props.readOnly);
+    if (editor) editor.updateOptions({ readOnly, domReadOnly: readOnly });
   });
 
   createEffect(() => {
@@ -8539,34 +8655,72 @@ async function copyText(text: string) {
   }
 }
 
-function FileExplorer(props: { project: Project; themeMode: ResolvedThemeMode; searchRequest: number; resizing: boolean; onResizeStart: (event: PointerEvent) => void; onResizeKeyDown: (event: KeyboardEvent) => void; onResizeReset: () => void; onClose: () => void }) {
-  const [currentPath, setCurrentPath] = createSignal(fileExplorerPaths.get(props.project.id) ?? '');
-  const [selectedFile, setSelectedFile] = createSignal<string>();
-  const [previewPath, setPreviewPath] = createSignal<string>();
+function FileWorkspace(props: { project: Project; state: FileWorkspaceState; themeMode: ResolvedThemeMode; searchRequest: number; onController: (controller?: FileWorkspaceController) => void; onClose: () => void }) {
+  let workspaceRef: HTMLElement | undefined;
+  let viewStatePathRemap: { previousRoot: string; nextRoot: string } | undefined;
+  const tabElements = new Map<string, HTMLDivElement>();
+  const editorModels = new Map<string, FileEditorModel>();
+  const initialActivePath = props.state.tabs.some((tab) => tab.path === props.state.activePath) ? props.state.activePath : props.state.tabs[0]?.path;
+  const [tabs, setTabs] = createSignal(props.state.tabs);
+  const [activePath, setActivePath] = createSignal(initialActivePath);
+  const [expandedDirectories, setExpandedDirectories] = createSignal(props.state.expandedDirectories);
+  const [selectedDirectory, setSelectedDirectory] = createSignal(props.state.selectedDirectory);
+  const [explorerOpen, setExplorerOpen] = createSignal(props.state.explorerOpen);
   const [entryMenu, setEntryMenu] = createSignal<FileEntryMenuState>();
   const [renameTarget, setRenameTarget] = createSignal<FileEntryMenuState>();
   const [deleteTarget, setDeleteTarget] = createSignal<FileEntryMenuState>();
   const [createFileDir, setCreateFileDir] = createSignal<string>();
+  const [closeTabPath, setCloseTabPath] = createSignal<string>();
+  const [confirmWorkspaceClose, setConfirmWorkspaceClose] = createSignal(false);
+  const [pendingCloseAction, setPendingCloseAction] = createSignal<() => void>();
+  const [pendingCloseCancel, setPendingCloseCancel] = createSignal<() => void>();
   const [fileSearchOpen, setFileSearchOpen] = createSignal(false);
+  const [savingPath, setSavingPath] = createSignal<string>();
   const [deleteBusy, setDeleteBusy] = createSignal(false);
   const [deleteError, setDeleteError] = createSignal('');
-  const files = createQuery(() => ({
-    queryKey: ['files', props.project.id, currentPath()],
-    queryFn: ({ signal }) => api<ProjectFilesResponse>(`/api/projects/${props.project.id}/files?path=${encodeURIComponent(currentPath())}`, { signal }),
-    staleTime: 0,
-    refetchOnWindowFocus: true,
+  const explorer = createResizableDimension({
+    defaultSize: props.state.explorerWidth,
+    minSize: FILE_WORKSPACE_EXPLORER_MIN_WIDTH,
+    maxSize: () => Math.max(FILE_WORKSPACE_EXPLORER_MIN_WIDTH, (workspaceRef?.getBoundingClientRect().width ?? window.innerWidth) - FILE_WORKSPACE_PREVIEW_MIN_WIDTH),
+    keyStep: FILE_WORKSPACE_EXPLORER_RESIZE_KEY_STEP,
+    axis: 'x',
+    dragMultiplier: -1,
+    increaseKey: 'ArrowLeft',
+    decreaseKey: 'ArrowRight',
+    cursor: 'ew-resize',
+  });
+  const activeTab = createMemo(() => tabs().find((tab) => tab.path === activePath()));
+  const dirtyTabs = createMemo(() => tabs().filter(fileWorkspaceTabDirty));
+  const settings = createQuery(() => ({
+    queryKey: ['settings', props.project.id],
+    queryFn: ({ signal }) => api<PiSettingsResponse>(`/api/projects/${props.project.id}/settings`, { signal }),
+    staleTime: SETTINGS_CACHE_STALE_TIME_MS,
   }));
+  const activeFile = createQuery(() => {
+    const path = activePath() ?? '';
+    return {
+      queryKey: ['file-preview', props.project.id, path],
+      queryFn: ({ signal }: { signal: AbortSignal }) => api<ProjectFilePreview>(`/api/projects/${props.project.id}/file?path=${encodeURIComponent(path)}`, { signal }),
+      enabled: Boolean(path && isTextPath(path)),
+      staleTime: 0,
+      refetchOnWindowFocus: true,
+    };
+  });
 
-  createEffect(() => {
-    const projectId = props.project.id;
-    setCurrentPath(fileExplorerPaths.get(projectId) ?? '');
-    setSelectedFile(undefined);
-    setPreviewPath(undefined);
-    setEntryMenu(undefined);
-    setRenameTarget(undefined);
-    setDeleteTarget(undefined);
-    setCreateFileDir(undefined);
-    setFileSearchOpen(false);
+  createEffect(() => { props.state.tabs = tabs(); });
+  createEffect(() => { props.state.activePath = activePath(); });
+  createEffect(() => { props.state.expandedDirectories = expandedDirectories(); });
+  createEffect(() => { props.state.selectedDirectory = selectedDirectory(); });
+  createEffect(() => { props.state.explorerOpen = explorerOpen(); });
+  createEffect(() => { props.state.explorerWidth = explorer.size(); });
+
+  onMount(() => {
+    props.onController({ requestClose });
+    onCleanup(() => {
+      props.onController(undefined);
+      for (const model of editorModels.values()) model.dispose();
+      editorModels.clear();
+    });
   });
 
   createEffect(() => {
@@ -8574,55 +8728,255 @@ function FileExplorer(props: { project: Project; themeMode: ResolvedThemeMode; s
   });
 
   createEffect(() => {
-    fileExplorerPaths.set(props.project.id, currentPath());
+    const path = activePath();
+    if (!path) return;
+    queueMicrotask(() => tabElements.get(path)?.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
   });
 
   createEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const target = shortcutTargetElement(event);
-      if (event.defaultPrevented || event.isComposing || !matchBinding('searchFiles', event) || target?.closest('.terminal-host, .monaco-editor') || hasBlockingShortcutDialog()) return;
-      event.preventDefault();
-      setFileSearchOpen(true);
-    };
-    window.addEventListener('keydown', onKeyDown);
-    onCleanup(() => window.removeEventListener('keydown', onKeyDown));
+    if (!workspaceRef) return;
+    const clampWidth = () => explorer.setClampedSize(explorer.size());
+    const observer = new ResizeObserver(clampWidth);
+    observer.observe(workspaceRef);
+    window.addEventListener('resize', clampWidth);
+    queueMicrotask(clampWidth);
+    onCleanup(() => {
+      observer.disconnect();
+      window.removeEventListener('resize', clampWidth);
+    });
   });
 
-  function openFile(path: string) {
-    setSelectedFile(path);
-    setPreviewPath(path);
-    rememberRecentFile(props.project.id, fileSearchEntryFromPath(path));
+  createEffect(() => {
+    const preview = activeFile.data;
+    const path = activePath();
+    const currentTab = activeTab();
+    currentTab?.draftContent;
+    currentTab?.savedContent;
+    if (!preview || !path || preview.path !== path) return;
+    setTabs((current) => current.map((tab) => {
+      if (tab.path !== path) return tab;
+      if (fileWorkspaceTabDirty(tab)) {
+        return preview.etag && tab.etag && preview.etag !== tab.etag && !tab.externalChange ? { ...tab, externalChange: true } : tab;
+      }
+      if (tab.loaded && tab.savedContent === preview.content && tab.etag === preview.etag && tab.contentHash === preview.contentHash && tab.truncated === preview.truncated && !tab.externalChange && !tab.saveError) return tab;
+      return {
+        ...tab,
+        savedContent: preview.content,
+        draftContent: preview.content,
+        truncated: preview.truncated,
+        mtimeMs: preview.mtimeMs,
+        size: preview.size,
+        etag: preview.etag,
+        contentHash: preview.contentHash,
+        loaded: true,
+        externalChange: false,
+        saveError: '',
+      };
+    }));
+  });
+
+  function updateTab(path: string, update: (tab: FileWorkspaceTab) => FileWorkspaceTab) {
+    setTabs((current) => {
+      const next = current.map((tab) => tab.path === path ? update(tab) : tab);
+      props.state.tabs = next;
+      return next;
+    });
   }
 
-  function openEntry(path: string, type: ProjectFileEntry['type']) {
-    if (type === 'directory') {
-      setCurrentPath(path);
+  function saveEditorViewState(path: string, viewState: FileEditorViewState) {
+    const remappedPath = viewStatePathRemap ? remapPathRoot(path, viewStatePathRemap.previousRoot, viewStatePathRemap.nextRoot) : path;
+    updateTab(remappedPath, (tab) => ({ ...tab, editorViewState: viewState }));
+  }
+
+  function expandFileAncestors(path: string) {
+    setExpandedDirectories((current) => {
+      const next = { ...current };
+      for (const directory of fileAncestorDirectories(path)) next[directory] = true;
+      return next;
+    });
+  }
+
+  function activateOpenTab(path: string) {
+    setActivePath(path);
+    setSelectedDirectory(parentPath(path));
+    expandFileAncestors(path);
+  }
+
+  function openFile(path: string) {
+    if (!tabs().some((tab) => tab.path === path)) setTabs((current) => [...current, { path, loaded: false }]);
+    activateOpenTab(path);
+    rememberRecentFile(props.project.id, fileSearchEntryFromPath(path));
+    if (window.matchMedia('(max-width: 900px)').matches) setExplorerOpen(false);
+  }
+
+  function handleTabKeyDown(event: KeyboardEvent, path: string) {
+    const paths = tabs().map((tab) => tab.path);
+    const index = paths.indexOf(path);
+    let nextPath: string | undefined;
+    if (event.key === 'ArrowLeft') nextPath = paths[(index - 1 + paths.length) % paths.length];
+    else if (event.key === 'ArrowRight') nextPath = paths[(index + 1) % paths.length];
+    else if (event.key === 'Home') nextPath = paths[0];
+    else if (event.key === 'End') nextPath = paths.at(-1);
+    if (!nextPath) return;
+    event.preventDefault();
+    activateOpenTab(nextPath);
+    queueMicrotask(() => tabElements.get(nextPath)?.querySelector<HTMLButtonElement>('.file-workspace-tab-main')?.focus());
+  }
+
+  function disposeEditorModels(removed: (path: string) => boolean) {
+    const released: FileEditorModel[] = [];
+    for (const [path, model] of editorModels) {
+      if (!removed(path)) continue;
+      editorModels.delete(path);
+      released.push(model);
+    }
+    if (released.length) queueMicrotask(() => released.forEach((model) => model.dispose()));
+  }
+
+  function removeTabs(removed: (path: string) => boolean) {
+    const currentTabs = tabs();
+    const nextActivePath = activePathAfterRemoval(currentTabs.map((tab) => tab.path), activePath(), removed);
+    disposeEditorModels(removed);
+    setTabs(currentTabs.filter((tab) => !removed(tab.path)));
+    setActivePath(nextActivePath);
+  }
+
+  function requestTabClose(path: string) {
+    const tab = tabs().find((candidate) => candidate.path === path);
+    if (tab && fileWorkspaceTabDirty(tab)) {
+      setCloseTabPath(path);
       return;
     }
-    openFile(path);
+    removeTabs((candidate) => candidate === path);
   }
 
-  function openEntryMenu(entry: ProjectFileEntry, entryPath: string, event: MouseEvent) {
+  async function saveFile(path: string) {
+    if (savingPath()) return false;
+    const tab = tabs().find((candidate) => candidate.path === path);
+    if (!tab || !fileWorkspaceTabDirty(tab)) return true;
+    if (tab.truncated || tab.draftContent === undefined) return false;
+    const content = tab.draftContent;
+    setSavingPath(path);
+    updateTab(path, (current) => ({ ...current, saveError: '' }));
+    try {
+      const saved = await api<ProjectFilePreview>(`/api/projects/${props.project.id}/file?path=${encodeURIComponent(path)}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ content, mtimeMs: tab.mtimeMs, etag: tab.etag, contentHash: tab.contentHash }),
+      });
+      let clean = false;
+      updateTab(path, (current) => {
+        clean = current.draftContent === content;
+        return {
+          ...current,
+          savedContent: saved.content,
+          draftContent: clean ? saved.content : current.draftContent,
+          truncated: saved.truncated,
+          mtimeMs: saved.mtimeMs,
+          size: saved.size,
+          etag: saved.etag,
+          contentHash: saved.contentHash,
+          loaded: true,
+          externalChange: false,
+          saveError: '',
+        };
+      });
+      queryClient.setQueryData(['file-preview', props.project.id, path], saved);
+      invalidateProjectFileListQueries(props.project.id);
+      return clean;
+    } catch (error) {
+      updateTab(path, (current) => ({ ...current, saveError: errorMessage(error, 'Could not save file') }));
+      return false;
+    } finally {
+      setSavingPath((current) => current === path ? undefined : current);
+    }
+  }
+
+  async function saveAndCloseTab(path: string) {
+    if (!(await saveFile(path))) return;
+    setCloseTabPath(undefined);
+    removeTabs((candidate) => candidate === path);
+  }
+
+  async function saveAllAndClose() {
+    for (const tab of dirtyTabs()) {
+      if (!(await saveFile(tab.path))) {
+        const onCancel = pendingCloseCancel();
+        setActivePath(tab.path);
+        setConfirmWorkspaceClose(false);
+        setPendingCloseAction(undefined);
+        setPendingCloseCancel(undefined);
+        onCancel?.();
+        return;
+      }
+    }
+    const afterClose = pendingCloseAction();
+    setConfirmWorkspaceClose(false);
+    setPendingCloseAction(undefined);
+    setPendingCloseCancel(undefined);
+    afterClose?.();
+  }
+
+  function discardAllAndClose() {
+    setTabs((current) => current.map((tab) => fileWorkspaceTabDirty(tab) ? {
+      ...tab,
+      savedContent: undefined,
+      draftContent: undefined,
+      loaded: false,
+      externalChange: false,
+      saveError: '',
+    } : tab));
+    invalidateProjectFileQueries(props.project.id);
+    const afterClose = pendingCloseAction();
+    setConfirmWorkspaceClose(false);
+    setPendingCloseAction(undefined);
+    setPendingCloseCancel(undefined);
+    afterClose?.();
+  }
+
+  function requestClose(afterClose: () => void, onCancel?: () => void) {
+    if (dirtyTabs().length > 0) {
+      setPendingCloseAction(() => afterClose);
+      setPendingCloseCancel(() => onCancel);
+      setConfirmWorkspaceClose(true);
+      return;
+    }
+    afterClose();
+  }
+
+  function toggleDirectory(path: string) {
+    setSelectedDirectory(path);
+    setExpandedDirectories((current) => ({ ...current, [path]: !current[path] }));
+  }
+
+  function openEntryMenu(entry: ProjectFileEntry, path: string, event: MouseEvent) {
     event.stopPropagation();
     const rect = event.currentTarget instanceof HTMLElement ? event.currentTarget.getBoundingClientRect() : { left: event.clientX, bottom: event.clientY };
-    setEntryMenu({ path: entryPath, name: entry.name, type: entry.type, x: rect.left, y: rect.bottom + 6 });
-  }
-
-  function invalidateFileExplorerQueries() {
-    invalidateProjectFileQueries(props.project.id);
+    setEntryMenu({ path, name: entry.name, type: entry.type, x: rect.left, y: rect.bottom + 6 });
   }
 
   async function renameEntry(target: FileEntryMenuState, name: string) {
+    if (savingPath() && pathIsAtOrBelow(savingPath()!, target.path)) throw new Error('Wait for the affected file to finish saving before renaming it');
+    const nextPath = joinRelativePath(parentPath(target.path), name);
+    const affectedDirtyTab = tabs().find((tab) => pathIsAtOrBelow(tab.path, target.path) && fileWorkspaceTabDirty(tab));
+    if (target.type === 'file' && affectedDirtyTab && isTextPath(target.path) !== isTextPath(nextPath)) throw new Error('Save or discard this file before changing its file type');
     const renamed = await api<{ path: string; name: string; type: ProjectFileEntry['type'] }>(`/api/projects/${props.project.id}/file?path=${encodeURIComponent(target.path)}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name }),
     });
-    if (selectedFile() === target.path) setSelectedFile(renamed.path);
-    else if (selectedFile()?.startsWith(`${target.path}/`)) setSelectedFile(`${renamed.path}${selectedFile()!.slice(target.path.length)}`);
-    if (previewPath() === target.path) setPreviewPath(renamed.path);
-    else if (previewPath()?.startsWith(`${target.path}/`)) setPreviewPath(`${renamed.path}${previewPath()!.slice(target.path.length)}`);
-    invalidateFileExplorerQueries();
+    const pathRemap = { previousRoot: target.path, nextRoot: renamed.path };
+    viewStatePathRemap = pathRemap;
+    disposeEditorModels((path) => pathIsAtOrBelow(path, target.path));
+    setTabs((current) => current.map((tab) => ({ ...tab, path: remapPathRoot(tab.path, target.path, renamed.path) })));
+    const nextActivePath = activePath() ? remapPathRoot(activePath()!, target.path, renamed.path) : undefined;
+    setActivePath(nextActivePath);
+    if (nextActivePath) expandFileAncestors(nextActivePath);
+    setSelectedDirectory((current) => remapPathRoot(current, target.path, renamed.path));
+    setExpandedDirectories((current) => Object.fromEntries(Object.entries(current).map(([path, open]) => [remapPathRoot(path, target.path, renamed.path), open])));
+    localStorage.setItem(`${RECENT_FILES_KEY_PREFIX}${props.project.id}`, JSON.stringify(readRecentFiles(props.project.id).map((file) => fileSearchEntryFromPath(remapPathRoot(file.path, target.path, renamed.path)))));
+    invalidateProjectFileQueries(props.project.id);
+    queueMicrotask(() => { if (viewStatePathRemap === pathRemap) viewStatePathRemap = undefined; });
     setRenameTarget(undefined);
   }
 
@@ -8632,20 +8986,25 @@ function FileExplorer(props: { project: Project; themeMode: ResolvedThemeMode; s
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name, directory }),
     });
-    setCurrentPath(parentPath(created.path));
     openFile(created.path);
-    invalidateFileExplorerQueries();
+    invalidateProjectFileQueries(props.project.id);
     setCreateFileDir(undefined);
   }
 
   async function deleteEntry(target: FileEntryMenuState) {
+    if (savingPath() && pathIsAtOrBelow(savingPath()!, target.path)) {
+      setDeleteError('Wait for the affected file to finish saving before deleting it.');
+      return;
+    }
     setDeleteBusy(true);
     setDeleteError('');
     try {
       await api(`/api/projects/${props.project.id}/file?path=${encodeURIComponent(target.path)}`, { method: 'DELETE' });
-      if (selectedFile() === target.path || selectedFile()?.startsWith(`${target.path}/`)) setSelectedFile(undefined);
-      if (previewPath() === target.path || previewPath()?.startsWith(`${target.path}/`)) setPreviewPath(undefined);
-      invalidateFileExplorerQueries();
+      removeTabs((path) => pathIsAtOrBelow(path, target.path));
+      setSelectedDirectory((current) => pathIsAtOrBelow(current, target.path) ? parentPath(target.path) : current);
+      setExpandedDirectories((current) => Object.fromEntries(Object.entries(current).filter(([path]) => !pathIsAtOrBelow(path, target.path))));
+      localStorage.setItem(`${RECENT_FILES_KEY_PREFIX}${props.project.id}`, JSON.stringify(readRecentFiles(props.project.id).filter((file) => !pathIsAtOrBelow(file.path, target.path))));
+      invalidateProjectFileQueries(props.project.id);
       setDeleteTarget(undefined);
     } catch (error) {
       setDeleteError(errorMessage(error, 'Could not delete file'));
@@ -8655,63 +9014,158 @@ function FileExplorer(props: { project: Project; themeMode: ResolvedThemeMode; s
   }
 
   return (
-    <aside class="tool-panel file-explorer-panel">
-      <div
-        class="side-panel-resize-handle"
-        role="separator"
-        aria-label="Resize file explorer"
-        aria-orientation="vertical"
-        aria-valuemin={FILE_EXPLORER_MIN_WIDTH}
-        tabIndex={0}
-        data-dragging={props.resizing ? 'true' : 'false'}
-        onDblClick={props.onResizeReset}
-        onKeyDown={props.onResizeKeyDown}
-        onPointerDown={props.onResizeStart}
-      />
-      <div class="tool-panel-header">
-        <div class="min-w-0 flex-1">
-          <div class="font-semibold">Explorer</div>
-          <div class="truncate text-xs text-muted-foreground">{currentPath() || props.project.name}</div>
-        </div>
-        <div class="flex shrink-0 items-center gap-1">
-          <button class="ghost" title="Go to project root" disabled={!currentPath()} onClick={() => setCurrentPath('')}><Home class="size-4" /></button>
-          <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => setFileSearchOpen(true)}><Search class="size-4" /></button>
-          <button class="ghost" title="Create file in current folder" onClick={() => setCreateFileDir(currentPath())}><FilePlus class="size-4" /></button>
-          <button class="ghost" title="Close file explorer" onClick={props.onClose}><X class="size-4" /></button>
-        </div>
-      </div>
-      <div class="min-h-0 overflow-auto p-3">
-        <Show when={currentPath()}>
-          <button class="file-row mb-1" onClick={() => setCurrentPath(parentPath(currentPath()))}><CornerUpLeft class="size-4 shrink-0 text-muted-foreground" /><span>Parent folder</span></button>
-        </Show>
-        <Show when={files.isLoading}>
-          <div class="file-explorer-state">Loading files...</div>
-        </Show>
-        <Show when={files.error}>
-          <div class="file-explorer-state file-explorer-state-error">
-            <div>{errorMessage(files.error, 'Could not list files')}</div>
-            <button class="button-secondary mt-3 h-8 px-3 text-xs" onClick={() => void files.refetch()}>Retry</button>
-          </div>
-        </Show>
-        <Show when={!files.isLoading && !files.error}>
-          <Show when={(files.data?.entries.length ?? 0) > 0} fallback={<div class="file-explorer-state">This folder is empty.</div>}>
-            <For each={files.data?.entries ?? []}>
-              {(entry) => {
-                const entryPath = () => joinRelativePath(currentPath(), entry.name);
-                return (
-                  <div class={`file-row file-row-entry ${selectedFile() === entryPath() ? 'file-row-active' : ''}`}>
-                    <button class="file-row-main" onClick={() => openEntry(entryPath(), entry.type)}>
-                      <span class="grid w-5 shrink-0 place-items-center">{entry.type === 'directory' ? <DirectoryTypeIcon name={entry.name} class="size-4" /> : <FileTypeIcon name={entry.name} class="size-4" />}</span>
-                      <span class="truncate">{entry.name}</span>
-                    </button>
-                    <button class="file-row-menu-button" title={`${entry.type === 'directory' ? 'Folder' : 'File'} options`} onClick={(event) => openEntryMenu(entry, entryPath(), event)}><Ellipsis class="size-4" /></button>
-                  </div>
-                );
-              }}
+    <section
+      ref={workspaceRef}
+      class={`file-workspace grid min-h-0 overflow-hidden bg-background ${explorerOpen() ? '' : 'file-workspace-explorer-hidden'}`}
+      style={{ 'grid-template-columns': explorerOpen() ? `minmax(0,1fr) auto ${explorer.size()}px` : 'minmax(0,1fr)' }}
+    >
+      <main class="grid min-h-0 min-w-0 grid-rows-[auto_auto_minmax(0,1fr)] overflow-hidden bg-card">
+        <div class="file-workspace-tab-bar">
+          <div class="file-workspace-tab-scroll" role="tablist" aria-label="Open files">
+            <For each={tabs()} fallback={<div class="file-workspace-tab-empty">No files open</div>}>
+              {(tab) => (
+                <div ref={(element) => tabElements.set(tab.path, element)} class={`file-workspace-tab ${activePath() === tab.path ? 'file-workspace-tab-active' : ''}`}>
+                  <button
+                    class="file-workspace-tab-main"
+                    role="tab"
+                    aria-selected={activePath() === tab.path}
+                    tabIndex={activePath() === tab.path ? 0 : -1}
+                    title={tab.path}
+                    onClick={() => activateOpenTab(tab.path)}
+                    onKeyDown={(event) => handleTabKeyDown(event, tab.path)}
+                    onAuxClick={(event) => { if (event.button === 1) requestTabClose(tab.path); }}
+                  >
+                    <FileTypeIcon name={tab.path} class="size-4 shrink-0" />
+                    <span class="truncate">{tab.path.split('/').at(-1) ?? tab.path}</span>
+                    <Show when={fileWorkspaceTabDirty(tab)}><span class="file-workspace-dirty-dot" title="Unsaved changes" /></Show>
+                  </button>
+                  <button class="file-workspace-tab-close" title={`Close ${tab.path}`} aria-label={`Close ${tab.path}`} onClick={() => requestTabClose(tab.path)}><X class="size-3.5" /></button>
+                </div>
+              )}
             </For>
+          </div>
+          <div class="file-workspace-tab-actions">
+            <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => setFileSearchOpen(true)}><Search class="size-4" /></button>
+            <button class={`ghost ${explorerOpen() ? 'bg-muted text-foreground' : ''}`} title={explorerOpen() ? 'Hide explorer' : 'Show explorer'} aria-controls="file-workspace-explorer" aria-expanded={explorerOpen()} onClick={() => setExplorerOpen((open) => !open)}><Files class="size-4" /></button>
+            <button class="project-modal-close" title="Close files" onClick={props.onClose}><X class="size-4" /></button>
+          </div>
+        </div>
+        <div class="file-workspace-file-bar">
+          <div class="min-w-0 flex-1">
+            <div class="truncate text-sm font-medium">{activePath() ?? props.project.name}</div>
+            <Show when={activeTab()}>
+              {(tab) => (
+                <div class={`truncate text-xs ${tab().saveError ? 'text-destructive' : 'text-muted-foreground'}`}>
+                  {tab().saveError || (tab().externalChange ? 'File changed on disk while you have unsaved changes.' : tab().truncated ? 'Large file preview is read-only because it was truncated.' : fileWorkspaceTabDirty(tab()) ? 'Unsaved changes' : 'Saved')}
+                </div>
+              )}
+            </Show>
+          </div>
+          <Show when={activePath()}>
+            {(path) => (
+              <div class="flex shrink-0 items-center gap-1.5">
+                <button class="ghost" title="Copy relative path" onClick={() => void copyText(path())}><Copy class="size-4" /></button>
+                <Show when={isTextPath(path())}>
+                  <button class="button h-8 px-3 text-xs" disabled={!activeTab() || !fileWorkspaceTabDirty(activeTab()!) || activeTab()?.truncated || Boolean(savingPath())} onClick={() => void saveFile(path())}>{savingPath() === path() ? 'Saving...' : 'Save'}</button>
+                </Show>
+              </div>
+            )}
           </Show>
-        </Show>
-      </div>
+        </div>
+        <div class="file-workspace-content" role="tabpanel" aria-label={activePath() ? `File ${activePath()}` : 'File preview'}>
+          <Show when={activePath()} keyed fallback={<div class="file-workspace-empty"><Files class="size-8" /><div>Select a file from the explorer.</div><Show when={!explorerOpen()}><button class="button-secondary" onClick={() => setExplorerOpen(true)}>Show explorer</button></Show></div>}>
+            {(path) => (
+              <Show when={activeTab()}>
+                {(tab) => (
+                  <Show
+                    when={isTextPath(path)}
+                    fallback={
+                      <>
+                        <Show when={isImagePath(path)}><div class="asset-preview-media"><img class="asset-preview-image" src={assetUrl(props.project.id, path)} alt={path} /></div></Show>
+                        <Show when={isVideoPath(path)}><div class="asset-preview-media"><video class="asset-preview-video" src={assetUrl(props.project.id, path)} controls /></div></Show>
+                        <Show when={isPdfPath(path)}><iframe class="h-full w-full bg-background" src={assetUrl(props.project.id, path)} title={path} /></Show>
+                        <Show when={!isImagePath(path) && !isVideoPath(path) && !isPdfPath(path)}><div class="file-workspace-empty">Preview is not available for this file type.</div></Show>
+                      </>
+                    }
+                  >
+                    <Show when={tab().loaded} fallback={
+                      <Show when={activeFile.error} fallback={<div class="file-workspace-empty">Loading file...</div>}>
+                        <div class="file-workspace-empty text-destructive">
+                          <div>{errorMessage(activeFile.error, 'Could not load file')}</div>
+                          <button class="button-secondary" onClick={() => void activeFile.refetch()}>Retry</button>
+                        </div>
+                      </Show>
+                    }>
+                      <div class="file-preview-code-wrap">
+                        <Show when={tab().truncated}><div class="file-preview-notice">Preview truncated to keep the app responsive.</div></Show>
+                        <CodePreview
+                          path={path}
+                          content={tab().draftContent ?? ''}
+                          readOnly={Boolean(tab().truncated)}
+                          viewState={tab().editorViewState}
+                          model={editorModels.get(path)}
+                          themeMode={props.themeMode}
+                          syntaxTheme={settings.data?.effective.syntaxHighlightTheme}
+                          syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight}
+                          syntaxThemeDark={settings.data?.effective.syntaxHighlightThemeDark}
+                          onContent={(content) => updateTab(path, (current) => ({ ...current, draftContent: content, saveError: '' }))}
+                          onSave={() => void saveFile(path)}
+                          onViewState={(viewState) => saveEditorViewState(path, viewState)}
+                          onModel={(model) => editorModels.set(path, model)}
+                        />
+                      </div>
+                    </Show>
+                  </Show>
+                )}
+              </Show>
+            )}
+          </Show>
+        </div>
+      </main>
+      <Show when={explorerOpen()}>
+        <button class="file-workspace-explorer-backdrop" aria-label="Hide explorer" onClick={() => setExplorerOpen(false)} />
+        <div
+          class="review-resize-handle file-workspace-resize-handle"
+          role="separator"
+          aria-label="Resize file explorer"
+          aria-orientation="vertical"
+          aria-valuemin={FILE_WORKSPACE_EXPLORER_MIN_WIDTH}
+          aria-valuemax={explorer.maxSize()}
+          aria-valuenow={explorer.size()}
+          tabIndex={0}
+          data-dragging={explorer.resizing() ? 'true' : 'false'}
+          onDblClick={() => explorer.setClampedSize(FILE_WORKSPACE_EXPLORER_DEFAULT_WIDTH)}
+          onKeyDown={explorer.resizeWithKeyboard}
+          onPointerDown={explorer.startResize}
+        />
+        <aside id="file-workspace-explorer" class="file-workspace-explorer grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card">
+          <div class="tool-panel-header">
+            <div class="min-w-0 flex-1">
+              <div class="font-semibold">Explorer</div>
+              <div class="truncate text-xs text-muted-foreground">{selectedDirectory() || props.project.name}</div>
+            </div>
+            <div class="flex shrink-0 items-center gap-1">
+              <button class="ghost" title="Collapse folders" onClick={() => { setExpandedDirectories({ '': true }); setSelectedDirectory(''); }}><Home class="size-4" /></button>
+              <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => setFileSearchOpen(true)}><Search class="size-4" /></button>
+              <button class="ghost" title={`Create file in ${selectedDirectory() || 'project root'}`} onClick={() => setCreateFileDir(selectedDirectory())}><FilePlus class="size-4" /></button>
+              <button class="ghost" title="Hide explorer" onClick={() => setExplorerOpen(false)}><X class="size-4" /></button>
+            </div>
+          </div>
+          <div class="file-workspace-tree" role="navigation" aria-label={`${props.project.name} files`}>
+            <FileTreeDirectory
+              project={props.project}
+              path=""
+              depth={0}
+              activePath={activePath()}
+              selectedDirectory={selectedDirectory()}
+              expandedDirectories={expandedDirectories()}
+              onToggleDirectory={toggleDirectory}
+              onOpenFile={openFile}
+              onEntryMenu={openEntryMenu}
+            />
+          </div>
+        </aside>
+      </Show>
       <Show when={entryMenu()}>
         {(menu) => (
           <FileEntryMenu
@@ -8724,20 +9178,14 @@ function FileExplorer(props: { project: Project; themeMode: ResolvedThemeMode; s
           />
         )}
       </Show>
-      <Show when={fileSearchOpen()}>
-        <FileSearchModal project={props.project} onOpen={(path) => { setCurrentPath(parentPath(path)); openFile(path); }} onClose={() => setFileSearchOpen(false)} />
-      </Show>
-      <Show when={createFileDir() !== undefined}>
-        <FileCreateDialog directory={createFileDir() ?? ''} onCancel={() => setCreateFileDir(undefined)} onConfirm={createFile} />
-      </Show>
-      <Show when={renameTarget()}>
-        {(target) => <FileRenameDialog entry={target()} onCancel={() => setRenameTarget(undefined)} onConfirm={(name) => renameEntry(target(), name)} />}
-      </Show>
+      <Show when={fileSearchOpen()}><FileSearchModal project={props.project} onOpen={openFile} onClose={() => setFileSearchOpen(false)} /></Show>
+      <Show when={createFileDir() !== undefined}><FileCreateDialog directory={createFileDir() ?? ''} onCancel={() => setCreateFileDir(undefined)} onConfirm={createFile} /></Show>
+      <Show when={renameTarget()}>{(target) => <FileRenameDialog entry={target()} onCancel={() => setRenameTarget(undefined)} onConfirm={(name) => renameEntry(target(), name)} />}</Show>
       <Show when={deleteTarget()}>
         {(target) => (
           <ConfirmDialog
             title={`Permanently delete ${target().type === 'directory' ? 'folder' : 'file'}?`}
-            description={`This will permanently delete "${target().path}". This cannot be undone.`}
+            description={`${tabs().some((tab) => pathIsAtOrBelow(tab.path, target().path) && fileWorkspaceTabDirty(tab)) ? 'This will also discard unsaved edits in open tabs. ' : ''}This will permanently delete "${target().path}". This cannot be undone.`}
             confirmLabel="Permanently delete"
             busyLabel="Deleting..."
             variant="danger"
@@ -8748,11 +9196,104 @@ function FileExplorer(props: { project: Project; themeMode: ResolvedThemeMode; s
           />
         )}
       </Show>
-      <Show when={previewPath()}>
-        {(path) => <AssetPreviewModal project={props.project} path={path()} themeMode={props.themeMode} onClose={() => setPreviewPath(undefined)} />}
+      <Show when={closeTabPath()}>
+        {(path) => <UnsavedFileDialog saving={savingPath() === path()} error={tabs().find((tab) => tab.path === path())?.saveError ?? ''} onSave={() => void saveAndCloseTab(path())} onDiscard={() => { setCloseTabPath(undefined); removeTabs((candidate) => candidate === path()); }} onCancel={() => setCloseTabPath(undefined)} />}
       </Show>
-    </aside>
+      <Show when={confirmWorkspaceClose()}>
+        <UnsavedFileDialog
+          saving={Boolean(savingPath())}
+          error={dirtyTabs().find((tab) => tab.saveError)?.saveError ?? ''}
+          description={`Save changes to ${dirtyTabs().length} open ${dirtyTabs().length === 1 ? 'file' : 'files'} before closing?`}
+          onSave={() => void saveAllAndClose()}
+          onDiscard={discardAllAndClose}
+          onCancel={() => {
+            const onCancel = pendingCloseCancel();
+            setConfirmWorkspaceClose(false);
+            setPendingCloseAction(undefined);
+            setPendingCloseCancel(undefined);
+            onCancel?.();
+          }}
+        />
+      </Show>
+    </section>
   );
+}
+
+function FileTreeDirectory(props: {
+  project: Project;
+  path: string;
+  depth: number;
+  activePath?: string;
+  selectedDirectory: string;
+  expandedDirectories: Record<string, boolean>;
+  onToggleDirectory: (path: string) => void;
+  onOpenFile: (path: string) => void;
+  onEntryMenu: (entry: ProjectFileEntry, path: string, event: MouseEvent) => void;
+}) {
+  const files = createQuery(() => ({
+    queryKey: ['files', props.project.id, props.path],
+    queryFn: ({ signal }) => api<ProjectFilesResponse>(`/api/projects/${props.project.id}/files?path=${encodeURIComponent(props.path)}`, { signal }),
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+  }));
+
+  return (
+    <div>
+      <Show when={files.isLoading}><div class="file-tree-state" style={{ 'padding-left': `${0.75 + props.depth}rem` }}>Loading...</div></Show>
+      <Show when={files.error}>
+        <div class="file-tree-state file-explorer-state-error" style={{ 'padding-left': `${0.75 + props.depth}rem` }}>
+          <span>{errorMessage(files.error, 'Could not list folder')}</span>
+          <button class="review-thread-link" onClick={() => void files.refetch()}>Retry</button>
+        </div>
+      </Show>
+      <Show when={!files.isLoading && !files.error}>
+        <For each={files.data?.entries ?? []} fallback={<div class="file-tree-state" style={{ 'padding-left': `${0.75 + props.depth}rem` }}>Empty folder</div>}>
+          {(entry) => {
+            const path = () => joinRelativePath(props.path, entry.name);
+            const directoryOpen = () => entry.type === 'directory' && Boolean(props.expandedDirectories[path()]);
+            const active = () => entry.type === 'file' ? props.activePath === path() : props.selectedDirectory === path();
+            return (
+              <>
+                <div
+                  ref={(element) => { if (entry.type === 'file' && props.activePath === path()) queueMicrotask(() => element.scrollIntoView({ block: 'nearest', inline: 'nearest' })); }}
+                  class={`file-tree-row group ${active() ? 'file-tree-row-active' : ''}`}
+                  style={{ 'padding-left': `${0.5 + props.depth}rem` }}
+                >
+                  <button class="file-tree-row-main" aria-expanded={entry.type === 'directory' ? directoryOpen() : undefined} aria-current={active() ? 'page' : undefined} onClick={() => entry.type === 'directory' ? props.onToggleDirectory(path()) : props.onOpenFile(path())}>
+                    <span class="grid size-4 shrink-0 place-items-center">
+                      <Show when={entry.type === 'directory'} fallback={<span class="size-3.5" />}>
+                        {directoryOpen() ? <ChevronDown class="size-3.5" /> : <ChevronRight class="size-3.5" />}
+                      </Show>
+                    </span>
+                    <span class="grid size-4 shrink-0 place-items-center">{entry.type === 'directory' ? <DirectoryTypeIcon name={entry.name} class="size-4" /> : <FileTypeIcon name={entry.name} class="size-4" />}</span>
+                    <span class="truncate">{entry.name}</span>
+                  </button>
+                  <button class="file-row-menu-button" title={`${entry.type === 'directory' ? 'Folder' : 'File'} options`} onClick={(event) => props.onEntryMenu(entry, path(), event)}><Ellipsis class="size-4" /></button>
+                </div>
+                <Show when={directoryOpen()}>
+                  <FileTreeDirectory
+                    project={props.project}
+                    path={path()}
+                    depth={props.depth + 1}
+                    activePath={props.activePath}
+                    selectedDirectory={props.selectedDirectory}
+                    expandedDirectories={props.expandedDirectories}
+                    onToggleDirectory={props.onToggleDirectory}
+                    onOpenFile={props.onOpenFile}
+                    onEntryMenu={props.onEntryMenu}
+                  />
+                </Show>
+              </>
+            );
+          }}
+        </For>
+      </Show>
+    </div>
+  );
+}
+
+function fileWorkspaceTabDirty(tab: FileWorkspaceTab) {
+  return tab.loaded && tab.savedContent !== undefined && tab.draftContent !== undefined && tab.draftContent !== tab.savedContent;
 }
 
 function FileEntryMenu(props: {
