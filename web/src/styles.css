@@ -1369,6 +1369,15 @@ body {
     @apply flex items-start justify-between gap-3 border-b border-border px-4 py-3;
   }
 
+  .file-workspace-explorer > .tool-panel-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+  }
+
+  .file-workspace-explorer > .tool-panel-header > :first-child {
+    overflow: hidden;
+  }
+
   .file-row {
     @apply flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground;
   }
