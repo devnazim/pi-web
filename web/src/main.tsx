@@ -104,7 +104,7 @@ import {
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
 import { buildReviewFileTree, type ReviewFileTreeNode } from './reviewFileTree';
-import { activePathAfterRemoval, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot } from './fileWorkspace';
+import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
@@ -180,6 +180,16 @@ type ProjectFileEntry = { name: string; type: 'directory' | 'file' };
 type ProjectFilesResponse = { path: string; entries: ProjectFileEntry[] };
 type ProjectFilePreview = { path: string; content: string; truncated?: boolean; mtimeMs?: number; size?: number; etag?: string; contentHash?: string };
 type ProjectFileSearchEntry = { path: string; name: string; directory: string };
+type FileSearchMode = 'files' | 'text';
+type TextSearchRange = { startColumn: number; endColumn: number };
+type TextSearchLine = { line: number; preview: string; previewStartColumn: number; beforeTruncated: boolean; afterTruncated: boolean; ranges: TextSearchRange[]; targetRange?: TextSearchRange };
+type TextSearchFileResult = { path: string; matchCount: number; lines: TextSearchLine[] };
+type TextSearchNavigationOptions = { query: string; caseSensitive: boolean; wholeWord: boolean };
+type TextSearchEvent =
+  | ({ type: 'file' } & TextSearchFileResult)
+  | { type: 'done'; fileCount: number; matchCount: number; limitHit: boolean; timedOut: boolean }
+  | { type: 'error'; message: string };
+type FileEditorNavigation = { path: string; line: number; startColumn: number; endColumn: number; revision: number };
 type FileEditorViewState = import('monaco-editor').editor.ICodeEditorViewState;
 type FileEditorModel = import('monaco-editor').editor.ITextModel;
 type FileWorkspaceTab = Omit<ProjectFilePreview, 'content'> & {
@@ -196,6 +206,9 @@ type FileWorkspaceState = {
   expandedDirectories: Record<string, boolean>;
   selectedDirectory: string;
   explorerOpen: boolean;
+  explorerView: 'files' | 'search';
+  searchMode: FileSearchMode;
+  searchTextPaths: string[];
   explorerWidth: number;
 };
 type FileWorkspaceController = { requestClose: (afterClose: () => void, onCancel?: () => void) => void };
@@ -498,7 +511,7 @@ const PROJECT_ORDER_KEY = 'pi-web-project-order';
 const SESSION_PAGE_SIZE = 30;
 const WORKSPACE_SHORTCUT_KEYS = '123456789'.split('');
 const CHAT_SEARCH_INPUT_SELECTOR = '[data-chat-search-input="true"]';
-const SHORTCUT_BLOCKING_DIALOG_SELECTOR = '.project-modal-backdrop, .confirm-modal-backdrop, .file-search-backdrop, .asset-preview-backdrop';
+const SHORTCUT_BLOCKING_DIALOG_SELECTOR = '.project-modal-backdrop, .confirm-modal-backdrop, .asset-preview-backdrop';
 const KEYBINDINGS_STORAGE_KEY = 'pi-web-keybindings';
 const FAVICON_HREF = appUrl('/favicon.svg');
 const FAVICON_SIZE = 512;
@@ -664,6 +677,9 @@ function createFileWorkspaceState(): FileWorkspaceState {
     expandedDirectories: { '': true },
     selectedDirectory: '',
     explorerOpen: true,
+    explorerView: 'files',
+    searchMode: 'files',
+    searchTextPaths: [],
     explorerWidth: FILE_WORKSPACE_EXPLORER_DEFAULT_WIDTH,
   };
 }
@@ -7956,12 +7972,24 @@ function UnsavedFileDialog(props: { saving: boolean; error: string; description?
   );
 }
 
-function CodePreview(props: { path: string; content: string; readOnly?: boolean; viewState?: FileEditorViewState; model?: FileEditorModel; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme; onContent: (content: string) => void; onSave: () => void; onViewState?: (viewState: FileEditorViewState) => void; onModel?: (model: FileEditorModel) => void }) {
+function CodePreview(props: { path: string; content: string; readOnly?: boolean; viewState?: FileEditorViewState; model?: FileEditorModel; navigation?: FileEditorNavigation; themeMode: ResolvedThemeMode; syntaxTheme?: SyntaxHighlightTheme; syntaxThemeLight?: SyntaxHighlightTheme; syntaxThemeDark?: SyntaxHighlightTheme; onContent: (content: string) => void; onSave: () => void; onViewState?: (viewState: FileEditorViewState) => void; onModel?: (model: FileEditorModel) => void; onNavigationApplied?: (revision: number) => void }) {
   let containerRef: HTMLDivElement | undefined;
   let monacoApi: MonacoApi | undefined;
   let editor: import('monaco-editor').editor.IStandaloneCodeEditor | undefined;
   let model: import('monaco-editor').editor.ITextModel | undefined;
   let latestContent = props.content;
+  let appliedNavigationRevision = 0;
+
+  function applyNavigation() {
+    const navigation = props.navigation;
+    if (!editor || !monacoApi || !navigation || navigation.path !== props.path || navigation.revision === appliedNavigationRevision) return;
+    appliedNavigationRevision = navigation.revision;
+    const selection = new monacoApi.Range(navigation.line, navigation.startColumn, navigation.line, navigation.endColumn);
+    editor.setSelection(selection);
+    editor.revealRangeInCenter(selection, monacoApi.editor.ScrollType.Smooth);
+    editor.focus();
+    props.onNavigationApplied?.(navigation.revision);
+  }
 
   onMount(() => {
     let disposed = false;
@@ -8003,6 +8031,7 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
         scrollbar: { useShadows: false, horizontal: 'auto', vertical: 'auto' },
       });
       if (props.viewState) editor.restoreViewState(props.viewState);
+      applyNavigation();
       editor.onDidChangeModelContent(() => props.onContent(model?.getValue() ?? ''));
       editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, props.onSave);
     });
@@ -8020,6 +8049,11 @@ function CodePreview(props: { path: string; content: string; readOnly?: boolean;
     if (props.content === latestContent) return;
     latestContent = props.content;
     if (model?.getValue() !== props.content) model?.setValue(props.content);
+  });
+
+  createEffect(() => {
+    props.navigation;
+    applyNavigation();
   });
 
   createEffect(() => {
@@ -8665,6 +8699,8 @@ async function copyText(text: string) {
 function FileWorkspace(props: { project: Project; state: FileWorkspaceState; themeMode: ResolvedThemeMode; searchRequest: number; onController: (controller?: FileWorkspaceController) => void; onClose: () => void }) {
   let workspaceRef: HTMLElement | undefined;
   let viewStatePathRemap: { previousRoot: string; nextRoot: string } | undefined;
+  let editorNavigationRevision = 0;
+  let fileNavigationRequest = 0;
   const tabElements = new Map<string, HTMLDivElement>();
   const editorModels = new Map<string, FileEditorModel>();
   const initialActivePath = props.state.tabs.some((tab) => tab.path === props.state.activePath) ? props.state.activePath : props.state.tabs[0]?.path;
@@ -8673,6 +8709,11 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   const [expandedDirectories, setExpandedDirectories] = createSignal(props.state.expandedDirectories);
   const [selectedDirectory, setSelectedDirectory] = createSignal(props.state.selectedDirectory);
   const [explorerOpen, setExplorerOpen] = createSignal(props.state.explorerOpen);
+  const [explorerView, setExplorerView] = createSignal(props.state.explorerView ?? 'files');
+  const [searchMode, setSearchMode] = createSignal(props.state.searchMode ?? 'files');
+  const [searchFocusRequest, setSearchFocusRequest] = createSignal(0);
+  const [editorNavigation, setEditorNavigation] = createSignal<FileEditorNavigation>();
+  const [searchTextPaths, setSearchTextPaths] = createSignal(new Set(props.state.searchTextPaths ?? []));
   const [entryMenu, setEntryMenu] = createSignal<FileEntryMenuState>();
   const [renameTarget, setRenameTarget] = createSignal<FileEntryMenuState>();
   const [deleteTarget, setDeleteTarget] = createSignal<FileEntryMenuState>();
@@ -8681,7 +8722,6 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   const [confirmWorkspaceClose, setConfirmWorkspaceClose] = createSignal(false);
   const [pendingCloseAction, setPendingCloseAction] = createSignal<() => void>();
   const [pendingCloseCancel, setPendingCloseCancel] = createSignal<() => void>();
-  const [fileSearchOpen, setFileSearchOpen] = createSignal(false);
   const [savingPath, setSavingPath] = createSignal<string>();
   const [deleteBusy, setDeleteBusy] = createSignal(false);
   const [deleteError, setDeleteError] = createSignal('');
@@ -8708,7 +8748,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
     return {
       queryKey: ['file-preview', props.project.id, path],
       queryFn: ({ signal }: { signal: AbortSignal }) => api<ProjectFilePreview>(`/api/projects/${props.project.id}/file?path=${encodeURIComponent(path)}`, { signal }),
-      enabled: Boolean(path && isTextPath(path)),
+      enabled: Boolean(path && workspaceTextPath(path)),
       staleTime: 0,
       refetchOnWindowFocus: true,
     };
@@ -8719,11 +8759,15 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   createEffect(() => { props.state.expandedDirectories = expandedDirectories(); });
   createEffect(() => { props.state.selectedDirectory = selectedDirectory(); });
   createEffect(() => { props.state.explorerOpen = explorerOpen(); });
+  createEffect(() => { props.state.explorerView = explorerView(); });
+  createEffect(() => { props.state.searchMode = searchMode(); });
+  createEffect(() => { props.state.searchTextPaths = [...searchTextPaths()]; });
   createEffect(() => { props.state.explorerWidth = explorer.size(); });
 
   onMount(() => {
     props.onController({ requestClose });
     onCleanup(() => {
+      fileNavigationRequest += 1;
       props.onController(undefined);
       for (const model of editorModels.values()) model.dispose();
       editorModels.clear();
@@ -8731,7 +8775,11 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   });
 
   createEffect(() => {
-    if (props.searchRequest) setFileSearchOpen(true);
+    if (!props.searchRequest) return;
+    setExplorerOpen(true);
+    setExplorerView('search');
+    setSearchMode('files');
+    setSearchFocusRequest((request) => request + 1);
   });
 
   createEffect(() => {
@@ -8804,6 +8852,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   }
 
   function activateOpenTab(path: string) {
+    fileNavigationRequest += 1;
     setActivePath(path);
     setSelectedDirectory(parentPath(path));
     expandFileAncestors(path);
@@ -8814,6 +8863,55 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
     activateOpenTab(path);
     rememberRecentFile(props.project.id, fileSearchEntryFromPath(path));
     if (window.matchMedia('(max-width: 900px)').matches) setExplorerOpen(false);
+  }
+
+  function workspaceTextPath(path: string) {
+    return isTextPath(path) || searchTextPaths().has(path);
+  }
+
+  function openFileSearch(mode = searchMode()) {
+    setExplorerOpen(true);
+    setExplorerView('search');
+    setSearchMode(mode);
+    setSearchFocusRequest((request) => request + 1);
+  }
+
+  async function openTextSearchMatch(path: string, line: TextSearchLine, range: TextSearchRange, options: TextSearchNavigationOptions) {
+    const navigationRequest = ++fileNavigationRequest;
+    setSearchTextPaths((current) => new Set(current).add(path));
+    const tab = tabs().find((candidate) => candidate.path === path);
+    if (!shouldRefreshFileSearchTarget(tab) && tab?.draftContent !== undefined) {
+      const draftRange = closestDraftTextSearchRange(tab.draftContent, options.query, line.line, range.startColumn, options);
+      setEditorNavigation(draftRange ? { path, ...draftRange, revision: ++editorNavigationRevision } : undefined);
+      openFile(path);
+      return;
+    }
+
+    const navigationRevision = ++editorNavigationRevision;
+    queryClient.removeQueries({ queryKey: ['file-preview', props.project.id, path], exact: true });
+    if (tab) updateTab(path, (current) => ({ ...current, savedContent: undefined, draftContent: undefined, loaded: false, externalChange: false, saveError: '' }));
+    try {
+      const preview = await api<ProjectFilePreview>(`/api/projects/${props.project.id}/file?path=${encodeURIComponent(path)}`);
+      if (navigationRequest !== fileNavigationRequest || navigationRevision !== editorNavigationRevision) return;
+      queryClient.setQueryData(['file-preview', props.project.id, path], preview);
+      const refreshedTab: FileWorkspaceTab = {
+        ...tab,
+        ...preview,
+        savedContent: preview.content,
+        draftContent: preview.content,
+        loaded: true,
+        externalChange: false,
+        saveError: '',
+      };
+      if (tab) updateTab(path, () => refreshedTab);
+      else setTabs((current) => [...current, refreshedTab]);
+      setEditorNavigation({ path, line: line.line, startColumn: range.startColumn, endColumn: range.endColumn, revision: navigationRevision });
+      openFile(path);
+    } catch {
+      if (navigationRequest !== fileNavigationRequest || navigationRevision !== editorNavigationRevision) return;
+      setEditorNavigation(undefined);
+      openFile(path);
+    }
   }
 
   function handleTabKeyDown(event: KeyboardEvent, path: string) {
@@ -8841,6 +8939,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   }
 
   function removeTabs(removed: (path: string) => boolean) {
+    fileNavigationRequest += 1;
     const currentTabs = tabs();
     const nextActivePath = activePathAfterRemoval(currentTabs.map((tab) => tab.path), activePath(), removed);
     disposeEditorModels(removed);
@@ -8963,10 +9062,12 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   }
 
   async function renameEntry(target: FileEntryMenuState, name: string) {
+    fileNavigationRequest += 1;
     if (savingPath() && pathIsAtOrBelow(savingPath()!, target.path)) throw new Error('Wait for the affected file to finish saving before renaming it');
     const nextPath = joinRelativePath(parentPath(target.path), name);
     const affectedDirtyTab = tabs().find((tab) => pathIsAtOrBelow(tab.path, target.path) && fileWorkspaceTabDirty(tab));
-    if (target.type === 'file' && affectedDirtyTab && isTextPath(target.path) !== isTextPath(nextPath)) throw new Error('Save or discard this file before changing its file type');
+    const nextPathIsText = isTextPath(nextPath) || searchTextPaths().has(target.path);
+    if (target.type === 'file' && affectedDirtyTab && workspaceTextPath(target.path) !== nextPathIsText) throw new Error('Save or discard this file before changing its file type');
     const renamed = await api<{ path: string; name: string; type: ProjectFileEntry['type'] }>(`/api/projects/${props.project.id}/file?path=${encodeURIComponent(target.path)}`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
@@ -8981,6 +9082,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
     if (nextActivePath) expandFileAncestors(nextActivePath);
     setSelectedDirectory((current) => remapPathRoot(current, target.path, renamed.path));
     setExpandedDirectories((current) => Object.fromEntries(Object.entries(current).map(([path, open]) => [remapPathRoot(path, target.path, renamed.path), open])));
+    setSearchTextPaths((current) => new Set([...current].map((path) => remapPathRoot(path, target.path, renamed.path))));
     localStorage.setItem(`${RECENT_FILES_KEY_PREFIX}${props.project.id}`, JSON.stringify(readRecentFiles(props.project.id).map((file) => fileSearchEntryFromPath(remapPathRoot(file.path, target.path, renamed.path)))));
     invalidateProjectFileQueries(props.project.id);
     queueMicrotask(() => { if (viewStatePathRemap === pathRemap) viewStatePathRemap = undefined; });
@@ -8999,6 +9101,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
   }
 
   async function deleteEntry(target: FileEntryMenuState) {
+    fileNavigationRequest += 1;
     if (savingPath() && pathIsAtOrBelow(savingPath()!, target.path)) {
       setDeleteError('Wait for the affected file to finish saving before deleting it.');
       return;
@@ -9010,6 +9113,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
       removeTabs((path) => pathIsAtOrBelow(path, target.path));
       setSelectedDirectory((current) => pathIsAtOrBelow(current, target.path) ? parentPath(target.path) : current);
       setExpandedDirectories((current) => Object.fromEntries(Object.entries(current).filter(([path]) => !pathIsAtOrBelow(path, target.path))));
+      setSearchTextPaths((current) => new Set([...current].filter((path) => !pathIsAtOrBelow(path, target.path))));
       localStorage.setItem(`${RECENT_FILES_KEY_PREFIX}${props.project.id}`, JSON.stringify(readRecentFiles(props.project.id).filter((file) => !pathIsAtOrBelow(file.path, target.path))));
       invalidateProjectFileQueries(props.project.id);
       setDeleteTarget(undefined);
@@ -9052,7 +9156,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
             </For>
           </div>
           <div class="file-workspace-tab-actions">
-            <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => setFileSearchOpen(true)}><Search class="size-4" /></button>
+            <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => openFileSearch()}><Search class="size-4" /></button>
             <button class={`ghost ${explorerOpen() ? 'bg-muted text-foreground' : ''}`} title={explorerOpen() ? 'Hide explorer' : 'Show explorer'} aria-controls="file-workspace-explorer" aria-expanded={explorerOpen()} onClick={() => setExplorerOpen((open) => !open)}><Files class="size-4" /></button>
             <button class="project-modal-close" title="Close files" onClick={props.onClose}><X class="size-4" /></button>
           </div>
@@ -9072,7 +9176,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
             {(path) => (
               <div class="flex shrink-0 items-center gap-1.5">
                 <button class="ghost" title="Copy relative path" onClick={() => void copyText(path())}><Copy class="size-4" /></button>
-                <Show when={isTextPath(path())}>
+                <Show when={workspaceTextPath(path())}>
                   <button class="button h-8 px-3 text-xs" disabled={!activeTab() || !fileWorkspaceTabDirty(activeTab()!) || activeTab()?.truncated || Boolean(savingPath())} onClick={() => void saveFile(path())}>{savingPath() === path() ? 'Saving...' : 'Save'}</button>
                 </Show>
               </div>
@@ -9085,7 +9189,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
               <Show when={activeTab()}>
                 {(tab) => (
                   <Show
-                    when={isTextPath(path)}
+                    when={workspaceTextPath(path)}
                     fallback={
                       <>
                         <Show when={isImagePath(path)}><div class="asset-preview-media"><img class="asset-preview-image" src={assetUrl(props.project.id, path)} alt={path} /></div></Show>
@@ -9111,6 +9215,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
                           readOnly={Boolean(tab().truncated)}
                           viewState={tab().editorViewState}
                           model={editorModels.get(path)}
+                          navigation={editorNavigation()?.path === path ? editorNavigation() : undefined}
                           themeMode={props.themeMode}
                           syntaxTheme={settings.data?.effective.syntaxHighlightTheme}
                           syntaxThemeLight={settings.data?.effective.syntaxHighlightThemeLight}
@@ -9119,6 +9224,7 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
                           onSave={() => void saveFile(path)}
                           onViewState={(viewState) => saveEditorViewState(path, viewState)}
                           onModel={(model) => editorModels.set(path, model)}
+                          onNavigationApplied={(revision) => setEditorNavigation((current) => current?.revision === revision ? undefined : current)}
                         />
                       </div>
                     </Show>
@@ -9145,34 +9251,49 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
           onKeyDown={explorer.resizeWithKeyboard}
           onPointerDown={explorer.startResize}
         />
-        <aside id="file-workspace-explorer" class="file-workspace-explorer grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card">
+      </Show>
+      <aside id="file-workspace-explorer" class={`file-workspace-explorer grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card ${explorerOpen() ? '' : 'hidden'}`}>
           <div class="tool-panel-header">
             <div class="min-w-0 flex-1">
-              <div class="font-semibold">Explorer</div>
-              <div class="truncate text-xs text-muted-foreground">{selectedDirectory() || props.project.name}</div>
+              <div class="font-semibold">{explorerView() === 'search' ? 'Search' : 'Explorer'}</div>
+              <div class="truncate text-xs text-muted-foreground">{explorerView() === 'search' ? (searchMode() === 'files' ? 'Files by name' : 'Text in files') : selectedDirectory() || props.project.name}</div>
             </div>
             <div class="flex shrink-0 items-center gap-1">
-              <button class="ghost" title="Collapse folders" onClick={() => { setExpandedDirectories({ '': true }); setSelectedDirectory(''); }}><Home class="size-4" /></button>
-              <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => setFileSearchOpen(true)}><Search class="size-4" /></button>
-              <button class="ghost" title={`Create file in ${selectedDirectory() || 'project root'}`} onClick={() => setCreateFileDir(selectedDirectory())}><FilePlus class="size-4" /></button>
+              <Show when={explorerView() === 'files'} fallback={
+                <button class="ghost" title="Show file explorer" onClick={() => setExplorerView('files')}><Files class="size-4" /></button>
+              }>
+                <button class="ghost" title="Collapse folders" onClick={() => { setExpandedDirectories({ '': true }); setSelectedDirectory(''); }}><Home class="size-4" /></button>
+                <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => openFileSearch()}><Search class="size-4" /></button>
+                <button class="ghost" title={`Create file in ${selectedDirectory() || 'project root'}`} onClick={() => setCreateFileDir(selectedDirectory())}><FilePlus class="size-4" /></button>
+              </Show>
               <button class="ghost" title="Hide explorer" onClick={() => setExplorerOpen(false)}><X class="size-4" /></button>
             </div>
           </div>
-          <div class="file-workspace-tree" role="navigation" aria-label={`${props.project.name} files`}>
-            <FileTreeDirectory
+          <Show when={explorerView() === 'files'} fallback={
+            <FileSearchPanel
               project={props.project}
-              path=""
-              depth={0}
-              activePath={activePath()}
-              selectedDirectory={selectedDirectory()}
-              expandedDirectories={expandedDirectories()}
-              onToggleDirectory={toggleDirectory}
+              mode={searchMode()}
+              focusRequest={searchFocusRequest()}
+              onMode={setSearchMode}
               onOpenFile={openFile}
-              onEntryMenu={openEntryMenu}
+              onOpenMatch={openTextSearchMatch}
             />
-          </div>
-        </aside>
-      </Show>
+          }>
+            <div class="file-workspace-tree" role="navigation" aria-label={`${props.project.name} files`}>
+              <FileTreeDirectory
+                project={props.project}
+                path=""
+                depth={0}
+                activePath={activePath()}
+                selectedDirectory={selectedDirectory()}
+                expandedDirectories={expandedDirectories()}
+                onToggleDirectory={toggleDirectory}
+                onOpenFile={openFile}
+                onEntryMenu={openEntryMenu}
+              />
+            </div>
+          </Show>
+      </aside>
       <Show when={entryMenu()}>
         {(menu) => (
           <FileEntryMenu
@@ -9185,7 +9306,6 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
           />
         )}
       </Show>
-      <Show when={fileSearchOpen()}><FileSearchModal project={props.project} onOpen={openFile} onClose={() => setFileSearchOpen(false)} /></Show>
       <Show when={createFileDir() !== undefined}><FileCreateDialog directory={createFileDir() ?? ''} onCancel={() => setCreateFileDir(undefined)} onConfirm={createFile} /></Show>
       <Show when={renameTarget()}>{(target) => <FileRenameDialog entry={target()} onCancel={() => setRenameTarget(undefined)} onConfirm={(name) => renameEntry(target(), name)} />}</Show>
       <Show when={deleteTarget()}>
@@ -9341,28 +9461,76 @@ function FileEntryMenu(props: {
   );
 }
 
-function FileSearchModal(props: { project: Project; onOpen: (path: string) => void; onClose: () => void }) {
+function FileSearchPanel(props: {
+  project: Project;
+  mode: FileSearchMode;
+  focusRequest: number;
+  onMode: (mode: FileSearchMode) => void;
+  onOpenFile: (path: string) => void;
+  onOpenMatch: (path: string, line: TextSearchLine, range: TextSearchRange, options: TextSearchNavigationOptions) => void | Promise<void>;
+}) {
   let inputRef: HTMLInputElement | undefined;
+  let textSearchSequence = 0;
+  let textSearchController: AbortController | undefined;
+  let textFlushTimer: number | undefined;
+  let queuedTextFiles: TextSearchFileResult[] = [];
   const [input, setInput] = createSignal('');
   const [query, setQuery] = createSignal('');
   const [activeIndex, setActiveIndex] = createSignal(0);
   const [recentFiles, setRecentFiles] = createSignal(readRecentFiles(props.project.id));
+  const [caseSensitive, setCaseSensitive] = createSignal(false);
+  const [wholeWord, setWholeWord] = createSignal(false);
+  const [contextLines, setContextLines] = createSignal(1);
+  const [textFiles, setTextFiles] = createSignal<TextSearchFileResult[]>([]);
+  const [textStatus, setTextStatus] = createSignal<'idle' | 'searching' | 'done' | 'stopped' | 'error'>('idle');
+  const [textError, setTextError] = createSignal('');
+  const [textCompletion, setTextCompletion] = createSignal<Extract<TextSearchEvent, { type: 'done' }>>();
+  const [collapsedTextFiles, setCollapsedTextFiles] = createSignal<Record<string, boolean>>({});
+  const [textRetryRequest, setTextRetryRequest] = createSignal(0);
+  const [stoppedTextRequest, setStoppedTextRequest] = createSignal<string>();
   const searchValue = createMemo(() => input().trim());
-  const showingRecent = createMemo(() => !searchValue() && recentFiles().length > 0);
+  const showingRecent = createMemo(() => props.mode === 'files' && !searchValue() && recentFiles().length > 0);
   const fileSearch = createQuery(() => ({
     queryKey: ['file-search', props.project.id, query()],
     queryFn: ({ signal }) => api<{ files: ProjectFileSearchEntry[] }>(`/api/projects/${props.project.id}/files/search?query=${encodeURIComponent(query())}`, { signal }),
-    enabled: !showingRecent(),
+    enabled: props.mode === 'files' && !showingRecent(),
     staleTime: 15_000,
   }));
-  const searching = createMemo(() => !showingRecent() && (fileSearch.isLoading || fileSearch.isFetching || query() !== searchValue()));
-  const results = createMemo(() => showingRecent() ? recentFiles() : fileSearch.data?.files ?? []);
+  const fileSearching = createMemo(() => props.mode === 'files' && !showingRecent() && (fileSearch.isLoading || fileSearch.isFetching || query() !== searchValue()));
+  const fileResults = createMemo(() => showingRecent() ? recentFiles() : fileSearch.data?.files ?? []);
+  const textRows = createMemo(() => textFiles().flatMap((file) => collapsedTextFiles()[file.path]
+    ? []
+    : file.lines.flatMap((line) => line.targetRange ? [{ file, line, range: line.targetRange }] : [])));
+  const textRowIndexes = createMemo(() => new Map(textRows().map((row, index) => [row.line, index])));
+  const textSearching = createMemo(() => props.mode === 'text' && Boolean(searchValue()) && textStatus() !== 'stopped' && (query() !== searchValue() || textStatus() === 'searching'));
+  const textRequestKey = createMemo(() => JSON.stringify([searchValue(), caseSensitive(), wholeWord(), contextLines()]));
+  const visibleTextMatchCount = createMemo(() => textFiles().reduce((total, file) => total + file.matchCount, 0));
+  const activeDescriptionId = `file-search-active-${props.project.id}`;
+  const activeResultDescription = createMemo(() => {
+    if (props.mode === 'files') {
+      const file = fileResults()[activeIndex()];
+      return file ? `${file.path}` : '';
+    }
+    const row = textRows()[activeIndex()];
+    return row ? `${row.file.path}, line ${row.line.line}: ${row.line.preview}` : '';
+  });
 
   onMount(() => inputRef?.focus());
 
   createEffect(() => {
     props.project.id;
     setRecentFiles(readRecentFiles(props.project.id));
+  });
+
+  createEffect(() => {
+    props.focusRequest;
+    queueMicrotask(() => inputRef?.focus());
+  });
+
+  createEffect(() => {
+    props.mode;
+    setActiveIndex(0);
+    queueMicrotask(() => inputRef?.focus());
   });
 
   createEffect(() => {
@@ -9377,53 +9545,239 @@ function FileSearchModal(props: { project: Project; onOpen: (path: string) => vo
   });
 
   createEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') props.onClose();
-    };
-    window.addEventListener('keydown', onKeyDown);
-    onCleanup(() => window.removeEventListener('keydown', onKeyDown));
+    const mode = props.mode;
+    const value = searchValue();
+    const debouncedQuery = query();
+    const sensitive = caseSensitive();
+    const words = wholeWord();
+    const context = contextLines();
+    const requestKey = textRequestKey();
+    textRetryRequest();
+    if (mode !== 'text' || !value) {
+      stopTextSearch();
+      setTextFiles([]);
+      setTextCompletion(undefined);
+      setTextError('');
+      setTextStatus('idle');
+      return;
+    }
+    if (stoppedTextRequest() === requestKey) {
+      stopTextSearch();
+      setTextStatus('stopped');
+      return;
+    }
+    if (value !== debouncedQuery) {
+      stopTextSearch();
+      setTextFiles([]);
+      setTextCompletion(undefined);
+      setTextError('');
+      setTextStatus('searching');
+      return;
+    }
+
+    const controller = new AbortController();
+    const sequence = ++textSearchSequence;
+    textSearchController = controller;
+    queuedTextFiles = [];
+    setStoppedTextRequest(undefined);
+    setTextFiles([]);
+    setTextCompletion(undefined);
+    setTextError('');
+    setTextStatus('searching');
+    void streamTextSearch(props.project.id, {
+      query: debouncedQuery,
+      caseSensitive: sensitive,
+      wholeWord: words,
+      contextLines: context,
+    }, controller.signal, (event) => {
+      if (sequence !== textSearchSequence || controller.signal.aborted) return;
+      if (event.type === 'file') {
+        queuedTextFiles.push(event);
+        if (textFlushTimer === undefined) textFlushTimer = window.setTimeout(() => flushTextSearchFiles(sequence), 40);
+        return;
+      }
+      flushTextSearchFiles(sequence);
+      if (event.type === 'done') {
+        setTextCompletion(event);
+        setTextStatus('done');
+      } else {
+        setTextError(event.message);
+        setTextStatus('error');
+      }
+    }).catch((error) => {
+      if (sequence !== textSearchSequence || controller.signal.aborted) return;
+      flushTextSearchFiles(sequence);
+      setTextError(errorMessage(error, 'Could not search file contents'));
+      setTextStatus('error');
+    });
+    onCleanup(() => {
+      controller.abort();
+      if (textSearchController === controller) {
+        textSearchController = undefined;
+        clearTextSearchQueue();
+      }
+    });
   });
+
+  onCleanup(() => stopTextSearch());
+
+  function flushTextSearchFiles(sequence: number) {
+    if (textFlushTimer !== undefined) {
+      window.clearTimeout(textFlushTimer);
+      textFlushTimer = undefined;
+    }
+    if (sequence !== textSearchSequence || !queuedTextFiles.length) {
+      queuedTextFiles = [];
+      return;
+    }
+    const files = queuedTextFiles;
+    queuedTextFiles = [];
+    setTextFiles((current) => [...current, ...files]);
+  }
+
+  function clearTextSearchQueue() {
+    if (textFlushTimer !== undefined) {
+      window.clearTimeout(textFlushTimer);
+      textFlushTimer = undefined;
+    }
+    queuedTextFiles = [];
+  }
+
+  function stopTextSearch() {
+    textSearchSequence += 1;
+    textSearchController?.abort();
+    textSearchController = undefined;
+    clearTextSearchQueue();
+  }
+
+  function stopVisibleTextSearch() {
+    flushTextSearchFiles(textSearchSequence);
+    setStoppedTextRequest(textRequestKey());
+    stopTextSearch();
+    setTextCompletion(undefined);
+    setTextStatus('stopped');
+  }
 
   function openFile(file: ProjectFileSearchEntry) {
     rememberRecentFile(props.project.id, file);
     setRecentFiles(readRecentFiles(props.project.id));
-    props.onOpen(file.path);
-    props.onClose();
+    props.onOpenFile(file.path);
+  }
+
+  function openTextRow(row: { file: TextSearchFileResult; line: TextSearchLine; range: TextSearchRange }) {
+    void props.onOpenMatch(row.file.path, row.line, row.range, { query: query(), caseSensitive: caseSensitive(), wholeWord: wholeWord() });
   }
 
   function handleInputKeyDown(event: KeyboardEvent) {
-    const files = results();
+    const count = props.mode === 'files' ? fileResults().length : textRows().length;
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      setActiveIndex((index) => Math.min(index + 1, Math.max(files.length - 1, 0)));
+      moveFileSearchSelection(Math.min(activeIndex() + 1, Math.max(count - 1, 0)));
       return;
     }
     if (event.key === 'ArrowUp') {
       event.preventDefault();
-      setActiveIndex((index) => Math.max(index - 1, 0));
+      moveFileSearchSelection(Math.max(activeIndex() - 1, 0));
       return;
     }
-    if (event.key === 'Enter' && files[activeIndex()]) {
+    if (event.key !== 'Enter') return;
+    if (props.mode === 'files' && fileResults()[activeIndex()]) {
       event.preventDefault();
-      openFile(files[activeIndex()]);
+      openFile(fileResults()[activeIndex()]);
+    } else if (props.mode === 'text' && textRows()[activeIndex()]) {
+      event.preventDefault();
+      openTextRow(textRows()[activeIndex()]);
     }
   }
 
+  function moveFileSearchSelection(index: number) {
+    setActiveIndex(index);
+    queueMicrotask(() => document.getElementById(fileSearchOptionId(props.project.id, props.mode, index))?.scrollIntoView({ block: 'nearest' }));
+  }
+
   return (
-    <div class="file-search-backdrop" onMouseDown={props.onClose}>
-      <div class="file-search-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <div class="file-search-input-wrap">
-          <Search class="size-4 text-muted-foreground" />
-          <input ref={inputRef} class="file-search-input" placeholder="Search files by name" value={input()} onInput={(event) => setInput(event.currentTarget.value)} onKeyDown={handleInputKeyDown} />
-          <Show when={input()}><button class="ghost h-8 w-8 px-0" title="Clear search" onClick={() => setInput('')}><X class="size-3.5" /></button></Show>
+    <div class="file-search-panel">
+      <div class="file-search-controls">
+        <div class="file-search-modes" role="group" aria-label="Search mode">
+          <button class={`file-search-mode ${props.mode === 'files' ? 'file-search-mode-active' : ''}`} type="button" aria-pressed={props.mode === 'files'} onClick={() => { setStoppedTextRequest(undefined); props.onMode('files'); }}>Files</button>
+          <button class={`file-search-mode ${props.mode === 'text' ? 'file-search-mode-active' : ''}`} type="button" aria-pressed={props.mode === 'text'} onClick={() => { setStoppedTextRequest(undefined); props.onMode('text'); }}>Text</button>
         </div>
-        <div class="file-search-results">
+        <div class="file-search-input-wrap">
+          <Search class="size-4 shrink-0 text-muted-foreground" />
+          <input ref={inputRef} class="file-search-input" aria-describedby={activeDescriptionId} aria-label={props.mode === 'files' ? 'Search files by name' : 'Search text in files'} placeholder={props.mode === 'files' ? 'Search files by name' : 'Search text in files'} value={input()} onInput={(event) => { setStoppedTextRequest(undefined); setInput(event.currentTarget.value); }} onKeyDown={handleInputKeyDown} />
+          <Show when={input()}><button class="ghost h-7 w-7 px-0" title="Clear search" onClick={() => setInput('')}><X class="size-3.5" /></button></Show>
+        </div>
+        <span id={activeDescriptionId} class="sr-only" aria-live="polite">{activeResultDescription()}</span>
+        <Show when={props.mode === 'text'}>
+          <div class="file-text-search-options">
+            <div class="flex items-center gap-1">
+              <button class={`file-text-search-option ${caseSensitive() ? 'file-text-search-option-active' : ''}`} type="button" aria-label="Match case" aria-pressed={caseSensitive()} title="Match case" onClick={() => { setStoppedTextRequest(undefined); setCaseSensitive((value) => !value); }}>Aa</button>
+              <button class={`file-text-search-option ${wholeWord() ? 'file-text-search-option-active' : ''}`} type="button" aria-label="Match whole word" aria-pressed={wholeWord()} title="Match whole word" onClick={() => { setStoppedTextRequest(undefined); setWholeWord((value) => !value); }}>ab</button>
+            </div>
+            <label class="file-text-search-context">Context
+              <select value={contextLines()} onChange={(event) => { setStoppedTextRequest(undefined); setContextLines(Number(event.currentTarget.value)); }} aria-label="Context lines">
+                <For each={[0, 1, 2, 3]}>{(count) => <option value={count}>{count}</option>}</For>
+              </select>
+            </label>
+          </div>
+        </Show>
+      </div>
+      <div class="file-search-results">
+        <Show when={props.mode === 'files'} fallback={
+          <Show when={searchValue()} fallback={<div class="file-search-empty">Enter text to search across files.</div>}>
+            <div class="file-text-search-summary" role="status" aria-live="polite">
+              <span>{textSearching() ? `Searching… ${visibleTextMatchCount()} matches` : textCompletion() ? `${textCompletion()!.matchCount} matches in ${textCompletion()!.fileCount} files` : textStatus() === 'stopped' ? `Stopped — ${visibleTextMatchCount()} partial matches` : textStatus() === 'error' ? 'Search failed' : `${visibleTextMatchCount()} matches`}</span>
+              <Show when={textSearching()}><button class="review-thread-link" onClick={stopVisibleTextSearch}>Stop</button></Show>
+            </div>
+            <Show when={textError()}>
+              <div class="file-search-empty file-explorer-state-error"><div>{textError()}</div><button class="review-thread-link mt-2" onClick={() => { setStoppedTextRequest(undefined); setTextRetryRequest((request) => request + 1); }}>Retry</button></div>
+            </Show>
+            <Show when={textFiles().length > 0} fallback={
+              <Show when={!textSearching() && textStatus() !== 'error'}><div class="file-search-empty">No matching text</div></Show>
+            }>
+              <For each={textFiles()}>
+                {(file) => (
+                  <section class="file-text-search-file" role="group" aria-label={`${file.path}, ${file.matchCount} matches`}>
+                    <button class="file-text-search-file-header" aria-expanded={!collapsedTextFiles()[file.path]} title={file.path} onClick={() => setCollapsedTextFiles((current) => ({ ...current, [file.path]: !current[file.path] }))}>
+                      {collapsedTextFiles()[file.path] ? <ChevronRight class="size-3.5 shrink-0" /> : <ChevronDown class="size-3.5 shrink-0" />}
+                      <FileTypeIcon name={file.path} class="size-4 shrink-0" />
+                      <span class="min-w-0 flex-1 truncate text-left">{file.path}</span>
+                      <span class="file-text-search-count">{file.matchCount}</span>
+                    </button>
+                    <Show when={!collapsedTextFiles()[file.path]}>
+                      <div class="file-text-search-lines">
+                        <For each={file.lines}>
+                          {(line) => {
+                            const index = () => textRowIndexes().get(line);
+                            const matching = () => Boolean(line.targetRange);
+                            return (
+                              <Show when={matching()} fallback={
+                                <div class="file-text-search-line file-text-search-context-line"><span class="file-text-search-line-number">{line.line}</span><code>{highlightTextSearchLine(line)}</code></div>
+                              }>
+                                <button id={fileSearchOptionId(props.project.id, 'text', index() ?? 0)} class={`file-text-search-line file-text-search-match-line ${index() === activeIndex() ? 'file-search-result-active' : ''}`} onMouseEnter={() => index() !== undefined && setActiveIndex(index()!)} onClick={() => { if (line.targetRange) void props.onOpenMatch(file.path, line, line.targetRange, { query: query(), caseSensitive: caseSensitive(), wholeWord: wholeWord() }); }}>
+                                  <span class="file-text-search-line-number">{line.line}</span><code>{highlightTextSearchLine(line)}</code>
+                                </button>
+                              </Show>
+                            );
+                          }}
+                        </For>
+                      </div>
+                    </Show>
+                  </section>
+                )}
+              </For>
+            </Show>
+            <Show when={textCompletion()?.limitHit}>
+              <div class="file-text-search-limit">{textCompletion()?.timedOut ? 'Search stopped after reaching the time limit.' : 'More matches exist. Results were limited.'}</div>
+            </Show>
+          </Show>
+        }>
           <div class="file-search-section-label">{showingRecent() ? 'Recent files' : searchValue() ? 'Matching files' : 'Files'}</div>
-          <Show when={!searching()} fallback={<div class="file-search-empty">Loading files...</div>}>
-            <Show when={results().length > 0} fallback={<div class="file-search-empty">No matching files</div>}>
-              <For each={results()}>
+          <Show when={!fileSearching()} fallback={<div class="file-search-empty">Loading files...</div>}>
+            <Show when={fileResults().length > 0} fallback={<div class="file-search-empty">No matching files</div>}>
+              <For each={fileResults()}>
                 {(file, index) => (
-                  <button class={`file-search-result ${activeIndex() === index() ? 'file-search-result-active' : ''}`} onMouseEnter={() => setActiveIndex(index())} onClick={() => openFile(file)}>
+                  <button id={fileSearchOptionId(props.project.id, 'files', index())} class={`file-search-result ${activeIndex() === index() ? 'file-search-result-active' : ''}`} onMouseEnter={() => setActiveIndex(index())} onClick={() => openFile(file)}>
                     <span class="grid w-5 shrink-0 place-items-center"><FileTypeIcon name={file.name} class="size-4" /></span>
                     <span class="min-w-0 flex-1 text-left">
                       <span class="block truncate text-sm">{highlightFileSearchText(file.name, input())}</span>
@@ -9434,10 +9788,52 @@ function FileSearchModal(props: { project: Project; onOpen: (path: string) => vo
               </For>
             </Show>
           </Show>
-        </div>
+        </Show>
       </div>
     </div>
   );
+}
+
+function fileSearchOptionId(projectId: string, mode: FileSearchMode, index: number) {
+  return `file-search-option-${projectId}-${mode}-${index}`;
+}
+
+async function streamTextSearch(projectId: string, options: { query: string; caseSensitive: boolean; wholeWord: boolean; contextLines: number }, signal: AbortSignal, onEvent: (event: TextSearchEvent) => void) {
+  const response = await fetch(appUrl(`/api/projects/${projectId}/files/text-search`), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
+    body: JSON.stringify(options),
+    signal,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { error?: unknown };
+    throw new Error(typeof body.error === 'string' ? body.error : response.statusText || 'Could not search file contents');
+  }
+  if (!response.body) throw new Error('Streaming search is not supported by this browser');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let pending = '';
+  let terminalEventReceived = false;
+  const emitEvent = (line: string) => {
+    const event = JSON.parse(line) as TextSearchEvent;
+    terminalEventReceived ||= event.type === 'done' || event.type === 'error';
+    onEvent(event);
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    pending += decoder.decode(value, { stream: !done });
+    let newline = pending.indexOf('\n');
+    while (newline !== -1) {
+      const line = pending.slice(0, newline).trim();
+      pending = pending.slice(newline + 1);
+      if (line) emitEvent(line);
+      newline = pending.indexOf('\n');
+    }
+    if (done) break;
+  }
+  const finalLine = pending.trim();
+  if (finalLine) emitEvent(finalLine);
+  if (!terminalEventReceived && !signal.aborted) throw new Error('Text search ended before completion');
 }
 
 function FileCreateDialog(props: { directory: string; onCancel: () => void; onConfirm: (name: string, directory: string) => void | Promise<void> }) {
@@ -14072,6 +14468,33 @@ function highlightFileSearchText(text: string, query: string): JSX.Element[] {
     parts.push(<span class="file-search-match">{text.slice(matchIndex, matchIndex + matchToken.length)}</span>);
     cursor = matchIndex + matchToken.length;
   }
+  return parts;
+}
+
+function highlightTextSearchLine(line: TextSearchLine): JSX.Element[] {
+  const parts: JSX.Element[] = [];
+  if (line.beforeTruncated) parts.push('…');
+  const ranges = line.ranges
+    .map((range) => ({
+      start: Math.max(0, range.startColumn - line.previewStartColumn),
+      end: Math.min(line.preview.length, range.endColumn - line.previewStartColumn),
+    }))
+    .filter((range) => range.end > range.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+    .reduce<Array<{ start: number; end: number }>>((merged, range) => {
+      const previous = merged.at(-1);
+      if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end);
+      else merged.push({ ...range });
+      return merged;
+    }, []);
+  let cursor = 0;
+  for (const range of ranges) {
+    if (range.start > cursor) parts.push(line.preview.slice(cursor, range.start));
+    parts.push(<span class="file-search-match">{line.preview.slice(range.start, range.end)}</span>);
+    cursor = range.end;
+  }
+  if (cursor < line.preview.length) parts.push(line.preview.slice(cursor));
+  if (line.afterTruncated) parts.push('…');
   return parts;
 }
 

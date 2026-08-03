@@ -468,7 +468,6 @@ body {
   }
 
   .project-modal-backdrop,
-  .file-search-backdrop,
   .asset-preview-backdrop {
     @apply fixed inset-0 z-50 bg-black/80;
   }
@@ -483,7 +482,6 @@ body {
     @apply grid place-items-center p-6;
   }
 
-  .file-search-backdrop,
   .open-project-modal-backdrop {
     @apply flex items-start justify-center p-4 pt-[10vh];
   }
@@ -492,7 +490,6 @@ body {
   .project-edit-modal,
   .settings-modal,
   .confirm-modal,
-  .file-search-modal,
   .asset-preview-modal {
     @apply bg-popover text-sm text-popover-foreground ring-1 ring-foreground/5;
   }
@@ -526,11 +523,6 @@ body {
     overflow-wrap: anywhere;
   }
 
-  .file-search-modal {
-    @apply grid w-full max-w-2xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-4xl border border-border p-1 shadow-2xl;
-    height: min(560px, calc(100vh - 12vh - 2rem));
-  }
-
   .file-search-input-wrap {
     @apply flex items-center gap-2 border-b border-border px-3 py-2;
   }
@@ -561,6 +553,98 @@ body {
 
   .file-search-match {
     @apply rounded-md bg-primary/15 px-0.5 font-semibold text-foreground;
+  }
+
+  .file-search-panel {
+    @apply grid min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden;
+  }
+
+  .file-search-controls {
+    @apply grid gap-2 border-b border-border p-2.5;
+  }
+
+  .file-search-modes {
+    @apply grid grid-cols-2 gap-1 rounded-xl bg-muted/60 p-1;
+  }
+
+  .file-search-mode {
+    @apply rounded-lg px-2 py-1.5 text-xs font-medium text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50;
+  }
+
+  .file-search-mode-active {
+    @apply bg-background text-foreground shadow-sm;
+  }
+
+  .file-search-panel .file-search-input-wrap {
+    @apply rounded-xl border border-border px-2 py-0.5;
+  }
+
+  .file-search-panel .file-search-input {
+    @apply h-8 px-0;
+  }
+
+  .file-text-search-options {
+    @apply flex items-center justify-between gap-2;
+  }
+
+  .file-text-search-option {
+    @apply grid h-7 min-w-8 place-items-center rounded-lg border border-transparent px-1.5 font-mono text-[11px] text-muted-foreground outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50;
+  }
+
+  .file-text-search-option-active {
+    @apply border-primary/30 bg-primary/10 text-primary;
+  }
+
+  .file-text-search-context {
+    @apply flex items-center gap-1.5 text-[11px] text-muted-foreground;
+  }
+
+  .file-text-search-context select {
+    @apply h-7 rounded-lg border border-border bg-background px-1.5 text-xs text-foreground outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50;
+  }
+
+  .file-text-search-summary {
+    @apply flex min-h-9 items-center justify-between gap-2 border-b border-border px-3 py-2 text-[11px] text-muted-foreground;
+  }
+
+  .file-text-search-file {
+    @apply border-b border-border/70 py-1;
+  }
+
+  .file-text-search-file-header {
+    @apply flex w-full min-w-0 items-center gap-1.5 px-2 py-1.5 text-xs font-medium text-foreground outline-none transition-colors hover:bg-accent focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50;
+  }
+
+  .file-text-search-count {
+    @apply min-w-5 rounded-full bg-muted px-1.5 py-0.5 text-center text-[10px] font-medium text-muted-foreground;
+  }
+
+  .file-text-search-lines {
+    @apply min-w-0 pb-1;
+  }
+
+  .file-text-search-line {
+    @apply grid min-h-6 w-full min-w-0 grid-cols-[2.75rem_minmax(0,1fr)] items-center px-1 text-left font-mono text-[11px] leading-5 text-muted-foreground;
+  }
+
+  .file-text-search-line code {
+    @apply block min-w-0 overflow-hidden whitespace-pre text-ellipsis;
+  }
+
+  .file-text-search-match-line {
+    @apply outline-none transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50;
+  }
+
+  .file-text-search-context-line {
+    @apply opacity-70;
+  }
+
+  .file-text-search-line-number {
+    @apply pr-2 text-right text-[10px] tabular-nums text-muted-foreground/70;
+  }
+
+  .file-text-search-limit {
+    @apply m-2 rounded-xl bg-yellow-500/10 px-3 py-2 text-xs leading-5 text-yellow-800 ring-1 ring-yellow-500/20 dark:text-yellow-200;
   }
 
   .dialog-body {

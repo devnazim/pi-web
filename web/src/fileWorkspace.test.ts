@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { activePathAfterRemoval, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot } from './fileWorkspace';
+import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
 
 test('fileAncestorDirectories includes the root and each containing directory', () => {
   assert.deepEqual(fileAncestorDirectories('src/components/App.tsx'), ['', 'src', 'src/components']);
@@ -26,4 +26,22 @@ test('activePathAfterRemoval prefers the next tab and otherwise the previous tab
 test('activePathAfterRemoval handles removing a directory worth of tabs', () => {
   const paths = ['src/a.ts', 'src/b.ts', 'README.md'];
   assert.equal(activePathAfterRemoval(paths, 'src/a.ts', (path) => pathIsAtOrBelow(path, 'src')), 'README.md');
+});
+
+test('search navigation refreshes clean or missing tabs but preserves dirty drafts', () => {
+  assert.equal(shouldRefreshFileSearchTarget(undefined), true);
+  assert.equal(shouldRefreshFileSearchTarget({ loaded: false }), true);
+  assert.equal(shouldRefreshFileSearchTarget({ loaded: true, savedContent: 'same', draftContent: 'same' }), true);
+  assert.equal(shouldRefreshFileSearchTarget({ loaded: true, savedContent: 'saved', draftContent: 'edited' }), false);
+});
+
+test('closestDraftTextSearchRange relocates an on-disk match in an edited draft', () => {
+  const content = ['inserted', 'before NEEDLEized', 'other NEEDLE'].join('\n');
+  assert.deepEqual(closestDraftTextSearchRange(content, 'needle', 1, 8, { caseSensitive: false, wholeWord: false }), { line: 2, startColumn: 8, endColumn: 14 });
+  assert.deepEqual(closestDraftTextSearchRange(content, 'needle', 2, 8, { caseSensitive: false, wholeWord: true }), { line: 3, startColumn: 7, endColumn: 13 });
+  assert.equal(closestDraftTextSearchRange(content, 'needle', 1, 1, { caseSensitive: true, wholeWord: false }), undefined);
+  assert.equal(closestDraftTextSearchRange(content, 'missing', 1, 1, { caseSensitive: false, wholeWord: false }), undefined);
+
+  const dense = 'x'.repeat(15_000);
+  assert.deepEqual(closestDraftTextSearchRange(dense, 'x', 1, 9_001, { caseSensitive: true, wholeWord: false }), { line: 1, startColumn: 9_001, endColumn: 9_002 });
 });

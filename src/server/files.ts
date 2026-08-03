@@ -10,6 +10,7 @@ import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import type { ProjectRegistry } from './projects.js';
 import { resolveSessionFile } from './sessions.js';
+import { registerTextSearchRoute } from './textSearch.js';
 import { projectUploadRoot, sessionUploadRoot } from './uploads.js';
 import { resolveWithin } from './util.js';
 
@@ -77,6 +78,7 @@ export async function registerFileRoutes(app: FastifyInstance, registry: Project
   await app.register(multipart, {
     limits: { fileSize: 256 * 1024 * 1024, files: 20 },
   });
+  await registerTextSearchRoute(app, registry);
 
   app.post<{ Params: { projectId: string } }>('/api/projects/:projectId/files/invalidate', async (request, reply) => {
     try {
