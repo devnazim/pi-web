@@ -103,6 +103,7 @@ import {
 } from './liveActivity';
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
+import { buildReviewFileTree, type ReviewFileTreeNode } from './reviewFileTree';
 import { activePathAfterRemoval, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot } from './fileWorkspace';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
@@ -161,6 +162,7 @@ type ReviewWorkspaceState = {
   sourceControlWidth: number;
   stagedOpen: boolean;
   unstagedOpen: boolean;
+  changedTreeExpanded: Record<string, boolean>;
   fileListScrollTop: number;
   fileListScrollLeft: number;
   previewPath?: string;
@@ -672,6 +674,7 @@ function createReviewWorkspaceState(): ReviewWorkspaceState {
     sourceControlWidth: REVIEW_SOURCE_CONTROL_DEFAULT_WIDTH,
     stagedOpen: true,
     unstagedOpen: true,
+    changedTreeExpanded: {},
     fileListScrollTop: 0,
     fileListScrollLeft: 0,
     commitDialogOpen: false,
@@ -687,6 +690,10 @@ function createReviewWorkspaceState(): ReviewWorkspaceState {
 
 function reviewFileSelectionKey(selection?: GitFileSelection) {
   return selection ? `${selection.staged ? 'staged' : 'unstaged'}:${selection.path}` : '';
+}
+
+function reviewChangedTreeDirectoryKey(staged: boolean, path: string) {
+  return `${staged ? 'staged' : 'unstaged'}:${path}`;
 }
 
 function reviewEditorStateKey(path: string, staged: boolean, kind: ReviewEditorKind) {
@@ -9603,6 +9610,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   const [previewPath, setPreviewPath] = createSignal<string | undefined>(props.state.previewPath);
   const [stagedOpen, setStagedOpen] = createSignal(props.state.stagedOpen);
   const [unstagedOpen, setUnstagedOpen] = createSignal(props.state.unstagedOpen);
+  const [changedTreeExpanded, setChangedTreeExpanded] = createSignal(props.state.changedTreeExpanded ?? {});
   let gitFileLongPressTimer: number | undefined;
   const [commitDialogOpen, setCommitDialogOpen] = createSignal(props.state.commitDialogOpen);
   const [commitMessage, setCommitMessage] = createSignal(props.state.commitMessage);
@@ -9653,6 +9661,8 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   });
   const stagedFiles = createMemo(() => (status.data?.status.files ?? []).filter((file) => file.staged));
   const unstagedFiles = createMemo(() => (status.data?.status.files ?? []).filter((file) => file.unstaged));
+  const stagedFileTree = createMemo(() => buildReviewFileTree(stagedFiles()));
+  const unstagedFileTree = createMemo(() => buildReviewFileTree(unstagedFiles()));
   const canCommit = createMemo(() => stagedFiles().length > 0 && !commitBusy());
   const selectableFiles = createMemo<GitFileSelection[]>(() => [
     ...stagedFiles().map((file) => ({ path: file.path, staged: true })),
@@ -9733,6 +9743,7 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
   createEffect(() => { props.state.reviewReplyDrafts = replyDrafts(); });
   createEffect(() => { props.state.reviewEditDrafts = editDrafts(); });
   createEffect(() => { props.state.reviewCollapsedThreads = collapsedThreads(); });
+  createEffect(() => { props.state.changedTreeExpanded = changedTreeExpanded(); });
   createEffect(() => { props.state.reviewNotesFilter = notesFilter(); });
   createEffect(() => { props.state.reviewOtherConversationsOpen = otherConversationsOpen(); });
   createEffect(() => {
@@ -9740,6 +9751,21 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
     selected()?.path;
     selected()?.staged;
     setReviewNoteError('');
+  });
+
+  createEffect(() => {
+    const selection = selected();
+    if (!selection) return;
+    setChangedTreeExpanded((current) => {
+      let next = current;
+      for (const directory of fileAncestorDirectories(selection.path).slice(1)) {
+        const key = reviewChangedTreeDirectoryKey(selection.staged, directory);
+        if (next[key] === true) continue;
+        if (next === current) next = { ...current };
+        next[key] = true;
+      }
+      return next;
+    });
   });
 
   function refreshSelectedDiff(options?: { force?: boolean }) {
@@ -10223,6 +10249,81 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
     selectFile(file, staged);
   }
 
+  function ChangedFileTree(treeProps: { nodes: ReviewFileTreeNode<GitFile>[]; staged: boolean; depth?: number; label?: string }) {
+    const depth = treeProps.depth ?? 0;
+    return (
+      <ul class="review-change-tree-list" role="list" aria-label={treeProps.label}>
+        <For each={treeProps.nodes}>
+          {(node) => {
+            if (node.type === 'directory') {
+              const key = reviewChangedTreeDirectoryKey(treeProps.staged, node.path);
+              const open = () => changedTreeExpanded()[key] !== false;
+              return (
+                <li>
+                  <button
+                    type="button"
+                    class="review-change-tree-directory"
+                    style={{ 'padding-left': `${10 + depth * 16}px` }}
+                    title={node.path}
+                    aria-expanded={open()}
+                    onClick={() => setChangedTreeExpanded((current) => ({ ...current, [key]: !open() }))}
+                  >
+                    <ChevronRight class={`size-3.5 shrink-0 transition-transform ${open() ? 'rotate-90' : ''}`} />
+                    <DirectoryTypeIcon name={node.name} class="size-4 shrink-0" />
+                    <span class="min-w-0 flex-1 truncate text-left">{node.name}</span>
+                  </button>
+                  <Show when={open()}>
+                    <ChangedFileTree nodes={node.children} staged={treeProps.staged} depth={depth + 1} />
+                  </Show>
+                </li>
+              );
+            }
+
+            const file = node.file;
+            const stats = changeStats(file, treeProps.staged);
+            const oldName = file.oldPath?.split('/').at(-1);
+            const displayName = treeProps.staged && oldName ? `${oldName} → ${node.name}` : node.name;
+            const active = () => selected()?.path === file.path && selected()?.staged === treeProps.staged;
+            return (
+              <li class={`review-change-tree-file-wrap group ${actionMenu()?.file.path === file.path && actionMenu()?.staged === treeProps.staged ? 'git-file-light-menu' : ''}`}>
+                <button
+                  type="button"
+                  class={`git-file-light review-change-tree-file ${active() ? 'git-file-light-active' : ''}`}
+                  style={{ 'padding-left': `${14 + depth * 16}px` }}
+                  aria-current={active() ? 'true' : undefined}
+                  title={gitFileDisplayPath(file, treeProps.staged)}
+                  onClick={() => selectFile(file, treeProps.staged)}
+                  onContextMenu={(event) => openGitFileMenu(file, treeProps.staged, event)}
+                  onPointerDown={(event) => startGitFileLongPress(file, treeProps.staged, event)}
+                  onPointerMove={clearGitFileLongPress}
+                  onPointerUp={clearGitFileLongPress}
+                  onPointerCancel={clearGitFileLongPress}
+                  onPointerLeave={clearGitFileLongPress}
+                >
+                  <span class="git-file-status">{file.status}</span>
+                  <FileTypeIcon name={file.path} class="size-4 shrink-0" />
+                  <span class="min-w-0 flex-1 truncate text-left">{displayName}</span>
+                  <span class="shrink-0 text-success">{stats.additions ? `+${stats.additions}` : ''}</span>
+                  <span class="shrink-0 text-destructive">{stats.deletions ? `-${stats.deletions}` : ''}</span>
+                </button>
+                <div class="git-file-actions">
+                  <Show when={treeProps.staged} fallback={
+                    <>
+                      <button class="git-file-action" disabled={busyAction() === `stage:${file.path}`} onClick={() => void gitAction('stage', file.path)}>Stage</button>
+                      <button class="git-file-action git-file-action-danger" disabled={busyAction() === `discard:${file.path}`} onClick={() => setDiscardTarget(file)}>Discard</button>
+                    </>
+                  }>
+                    <button class="git-file-action" disabled={busyAction() === `unstage:${file.path}`} onClick={() => void gitAction('unstage', file.path)}>Unstage</button>
+                  </Show>
+                </div>
+              </li>
+            );
+          }}
+        </For>
+      </ul>
+    );
+  }
+
   return (
     <section ref={reviewSplitRef} class={`review-workspace grid min-h-0 overflow-hidden bg-background ${sourceControlOpen() ? '' : 'review-source-hidden'}`} style={{ 'grid-template-columns': sourceControlOpen() ? `${sourceControlPanel.size()}px auto minmax(0,1fr)` : 'minmax(0,1fr)' }}>
       <Show when={sourceControlOpen()}>
@@ -10249,60 +10350,17 @@ function ReviewWorkspace(props: { project: Project; sessionId?: string; state: R
         </div>
         <div ref={fileListRef} class="review-file-list min-h-0 overflow-auto p-3" onScroll={(event) => saveFileListScroll(event.currentTarget)}>
           <PanelSection title={`Staged Changes ${stagedFiles().length}`} open={stagedOpen()} onOpenChange={setReviewStagedOpen}>
-            <div class="space-y-1">
-              <For each={stagedFiles()} fallback={<div class="review-empty-section">No staged changes.</div>}>
-                {(file) => (
-                  <div
-                    class={`git-file-light group ${selected()?.path === file.path && selected()?.staged ? 'git-file-light-active' : ''} ${actionMenu()?.file.path === file.path && actionMenu()?.staged ? 'git-file-light-menu' : ''}`}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => selectFile(file, true)}
-                    onContextMenu={(event) => openGitFileMenu(file, true, event)}
-                    onPointerDown={(event) => startGitFileLongPress(file, true, event)}
-                    onPointerMove={clearGitFileLongPress}
-                    onPointerUp={clearGitFileLongPress}
-                    onPointerCancel={clearGitFileLongPress}
-                    onPointerLeave={clearGitFileLongPress}
-                  >
-                    <span class="git-file-status">{file.status}</span>
-                    <span class="min-w-0 flex-1 break-all text-left" title={gitFileDisplayPath(file, true)}>{gitFileDisplayPath(file, true)}</span>
-                    <span class="text-success">{changeStats(file, true).additions ? `+${changeStats(file, true).additions}` : ''}</span>
-                    <span class="text-destructive">{changeStats(file, true).deletions ? `-${changeStats(file, true).deletions}` : ''}</span>
-                    <div class="git-file-actions">
-                      <button class="git-file-action" disabled={busyAction() === `unstage:${file.path}`} onClick={(event) => { event.stopPropagation(); void gitAction('unstage', file.path); }}>Unstage</button>
-                    </div>
-                  </div>
-                )}
-              </For>
+            <div class="review-change-tree">
+              <Show when={stagedFileTree().length} fallback={<div class="review-empty-section">No staged changes.</div>}>
+                <ChangedFileTree nodes={stagedFileTree()} staged label="Staged changed files" />
+              </Show>
             </div>
           </PanelSection>
           <PanelSection title={`Changes ${unstagedFiles().length}`} open={unstagedOpen()} onOpenChange={setReviewUnstagedOpen}>
-            <div class="space-y-1">
-              <For each={unstagedFiles()} fallback={<div class="review-empty-section">No working tree changes.</div>}>
-                {(file) => (
-                  <div
-                    class={`git-file-light group ${selected()?.path === file.path && selected()?.staged === false ? 'git-file-light-active' : ''} ${actionMenu()?.file.path === file.path && actionMenu()?.staged === false ? 'git-file-light-menu' : ''}`}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => selectFile(file, false)}
-                    onContextMenu={(event) => openGitFileMenu(file, false, event)}
-                    onPointerDown={(event) => startGitFileLongPress(file, false, event)}
-                    onPointerMove={clearGitFileLongPress}
-                    onPointerUp={clearGitFileLongPress}
-                    onPointerCancel={clearGitFileLongPress}
-                    onPointerLeave={clearGitFileLongPress}
-                  >
-                    <span class="git-file-status">{file.status}</span>
-                    <span class="min-w-0 flex-1 break-all text-left" title={gitFileDisplayPath(file, false)}>{gitFileDisplayPath(file, false)}</span>
-                    <span class="text-success">{changeStats(file, false).additions ? `+${changeStats(file, false).additions}` : ''}</span>
-                    <span class="text-destructive">{changeStats(file, false).deletions ? `-${changeStats(file, false).deletions}` : ''}</span>
-                    <div class="git-file-actions">
-                      <button class="git-file-action" disabled={busyAction() === `stage:${file.path}`} onClick={(event) => { event.stopPropagation(); void gitAction('stage', file.path); }}>Stage</button>
-                      <button class="git-file-action git-file-action-danger" disabled={busyAction() === `discard:${file.path}`} onClick={(event) => { event.stopPropagation(); setDiscardTarget(file); }}>Discard</button>
-                    </div>
-                  </div>
-                )}
-              </For>
+            <div class="review-change-tree">
+              <Show when={unstagedFileTree().length} fallback={<div class="review-empty-section">No working tree changes.</div>}>
+                <ChangedFileTree nodes={unstagedFileTree()} staged={false} label="Working tree changed files" />
+              </Show>
             </div>
           </PanelSection>
         </div>

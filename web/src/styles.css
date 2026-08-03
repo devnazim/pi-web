@@ -1999,7 +1999,7 @@ body {
 
   .git-file,
   .git-file-light {
-    @apply relative flex w-full select-none items-center gap-2 rounded-xl px-3 py-2 text-xs transition-[background-color,color,padding] hover:bg-accent hover:text-accent-foreground;
+    @apply relative flex w-full select-none items-center gap-2 rounded-xl px-3 py-2 text-xs transition-colors hover:bg-accent hover:text-accent-foreground;
     -webkit-touch-callout: none;
     touch-action: manipulation;
   }
@@ -2027,16 +2027,22 @@ body {
     @apply mb-2;
   }
 
-  @media (max-width: 900px) {
-    div.review-file-list {
-      overflow: visible;
-    }
+  .review-change-tree,
+  .review-change-tree-list {
+    @apply m-0 list-none space-y-0.5 p-0;
   }
 
-  @media (max-width: 900px) and (orientation: landscape) {
-    div.review-file-list {
-      overflow: auto;
-    }
+  .review-change-tree-directory {
+    @apply flex w-full select-none items-center gap-2 rounded-xl py-2 pr-3 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring;
+  }
+
+  .review-change-tree-file,
+  .review-change-tree-file-wrap {
+    min-width: 0;
+  }
+
+  .review-change-tree-file-wrap {
+    @apply relative;
   }
 
   .git-file-status {
@@ -2055,14 +2061,8 @@ body {
     @apply hover:bg-destructive/10 hover:text-destructive;
   }
 
-  .git-file-light:hover,
-  .git-file-light:focus-within,
-  .git-file-light-menu {
-    @apply pr-32;
-  }
-
-  .git-file-light:hover .git-file-actions,
-  .git-file-light:focus-within .git-file-actions,
+  .review-change-tree-file-wrap:hover .git-file-actions,
+  .review-change-tree-file-wrap:focus-within .git-file-actions,
   .git-file-light-menu .git-file-actions {
     @apply pointer-events-auto flex;
   }
@@ -2072,16 +2072,13 @@ body {
   }
 
   @media (hover: none) {
-    .git-file-light:hover,
-    .git-file-light:focus-within,
-    .git-file-light-menu {
-      padding-right: 0.75rem;
-    }
-
-    .git-file-light:hover .git-file-actions,
-    .git-file-light:focus-within .git-file-actions,
+    .review-change-tree-file-wrap:hover .git-file-actions,
     .git-file-light-menu .git-file-actions {
       display: none;
+    }
+
+    .review-change-tree-file-wrap:focus-within .git-file-actions {
+      display: flex;
     }
   }
 
