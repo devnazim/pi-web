@@ -1,3 +1,96 @@
+const TEXT_FILE_VARIANT_SUFFIXES = new Set([
+  'alpine',
+  'ci',
+  'debian',
+  'debug',
+  'default',
+  'defaults',
+  'dev',
+  'development',
+  'docker',
+  'example',
+  'local',
+  'prod',
+  'production',
+  'release',
+  'sample',
+  'stage',
+  'staging',
+  'template',
+  'test',
+  'testing',
+  'ubuntu',
+]);
+
+const WELL_KNOWN_TEXT_FILE_NAMES = new Set([
+  '.babelrc',
+  '.bashrc',
+  '.browserslistrc',
+  '.curlrc',
+  '.dockerignore',
+  '.editorconfig',
+  '.eslintignore',
+  '.eslintrc',
+  '.gitattributes',
+  '.gitignore',
+  '.gitkeep',
+  '.gitmodules',
+  '.helmignore',
+  '.ignore',
+  '.gvimrc',
+  '.inputrc',
+  '.node-version',
+  '.npmignore',
+  '.npmrc',
+  '.nvmrc',
+  '.pnpmrc',
+  '.prettierignore',
+  '.prettierrc',
+  '.profile',
+  '.python-version',
+  '.rgignore',
+  '.ruby-version',
+  '.stylelintignore',
+  '.stylelintrc',
+  '.swcrc',
+  '.tmux.conf',
+  '.tool-versions',
+  '.vimrc',
+  '.wgetrc',
+  '.yarnrc',
+  '.zprofile',
+  '.zshrc',
+  'brewfile',
+  'cmakelists.txt',
+  'gemfile',
+  'gnumakefile',
+  'jenkinsfile',
+  'justfile',
+  'makefile',
+  'procfile',
+  'rakefile',
+  'taskfile',
+  'tiltfile',
+  'vagrantfile',
+]);
+
+export function isTextPath(filePath: string) {
+  const fileName = filePath.replace(/\\/g, '/').split('/').at(-1)?.toLowerCase() ?? '';
+  return /\.(txt|md|mdx|json|jsonc|ts|tsx|js|jsx|css|scss|html|xml|yaml|yml|toml|ini|env|sh|bash|zsh|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp|sql|log)$/i.test(fileName)
+    || textFileNameVariant(fileName, '.env')
+    || textFileNameVariant(fileName, 'dockerfile')
+    || textFileNameVariant(fileName, '.dockerfile')
+    || textFileNameVariant(fileName, 'containerfile')
+    || textFileNameVariant(fileName, '.containerfile')
+    || WELL_KNOWN_TEXT_FILE_NAMES.has(fileName);
+}
+
+function textFileNameVariant(fileName: string, baseName: string) {
+  if (fileName === baseName) return true;
+  if (!fileName.startsWith(`${baseName}.`)) return false;
+  return fileName.slice(baseName.length + 1).split('.').every((suffix) => TEXT_FILE_VARIANT_SUFFIXES.has(suffix));
+}
+
 export function pathIsAtOrBelow(path: string, root: string) {
   return path === root || path.startsWith(`${root}/`);
 }

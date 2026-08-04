@@ -5,6 +5,9 @@ import { Readable } from 'node:stream';
 import type { ProjectRegistry } from './projects.js';
 
 const MAX_TEXT_SEARCH_QUERY_LENGTH = 500;
+const MAX_TEXT_SEARCH_GLOB_PATTERNS = 100;
+const MAX_TEXT_SEARCH_GLOB_PATTERN_LENGTH = 500;
+const MAX_TEXT_SEARCH_GLOB_EXPANSIONS = 1_000;
 const MAX_TEXT_SEARCH_RESULTS = 1_000;
 const MAX_TEXT_SEARCH_RESULTS_PER_FILE = 100;
 const MAX_TEXT_SEARCH_CONTEXT_LINES = 3;
@@ -20,6 +23,8 @@ type TextSearchBody = {
   caseSensitive?: unknown;
   wholeWord?: unknown;
   contextLines?: unknown;
+  includePatterns?: unknown;
+  excludePatterns?: unknown;
 };
 
 type TextSearchOptions = {
@@ -27,6 +32,8 @@ type TextSearchOptions = {
   caseSensitive: boolean;
   wholeWord: boolean;
   contextLines: number;
+  includePatterns: string[];
+  excludePatterns: string[];
 };
 
 type TextSearchRange = { startColumn: number; endColumn: number };
@@ -70,6 +77,7 @@ export async function registerTextSearchRoute(app: FastifyInstance, registry: Pr
       try {
         const project = registry.get(request.params.projectId);
         const options = textSearchOptions(request.body);
+        const globArgs = textSearchGlobArgs(options);
         const controller = new AbortController();
         activeSearches.add(controller);
         const abort = () => controller.abort();
@@ -79,7 +87,7 @@ export async function registerTextSearchRoute(app: FastifyInstance, registry: Pr
           controller.abort();
         };
         reply.raw.once('close', abort);
-        const stream = Readable.from(ndjsonTextSearch(project.path, options, controller.signal));
+        const stream = Readable.from(ndjsonTextSearch(project.path, options, globArgs, controller.signal));
         stream.once('close', cleanup);
         return reply
           .type('application/x-ndjson; charset=utf-8')
@@ -110,14 +118,149 @@ function textSearchOptions(body: TextSearchBody | undefined): TextSearchOptions 
     caseSensitive: body.caseSensitive === true,
     wholeWord: body.wholeWord === true,
     contextLines: Number(contextLines),
+    includePatterns: textSearchGlobPatterns(body.includePatterns, 'include'),
+    excludePatterns: textSearchGlobPatterns(body.excludePatterns, 'exclude'),
   };
 }
 
-async function* ndjsonTextSearch(projectPath: string, options: TextSearchOptions, signal: AbortSignal) {
-  for await (const event of projectTextSearch(projectPath, options, signal)) yield `${JSON.stringify(event)}\n`;
+function textSearchGlobPatterns(value: unknown, kind: 'include' | 'exclude') {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`Invalid files-to-${kind} patterns`);
+  if (value.length > MAX_TEXT_SEARCH_GLOB_PATTERNS) throw new Error(`Files-to-${kind} patterns cannot exceed ${MAX_TEXT_SEARCH_GLOB_PATTERNS} entries`);
+  return [...new Set(value.map((pattern) => {
+    if (typeof pattern !== 'string') throw new Error(`Invalid files-to-${kind} pattern`);
+    const normalized = pattern.trim().replace(/\\/g, '/').replace(/\/+$/g, '');
+    if (!normalized || normalized.length > MAX_TEXT_SEARCH_GLOB_PATTERN_LENGTH || /[\0\r\n]/.test(normalized)) throw new Error(`Invalid files-to-${kind} pattern`);
+    if (normalized.startsWith('!')) throw new Error(`Files-to-${kind} patterns cannot start with !`);
+    if (/^(?:\.\.?$|\.\.?\/|\/|[a-zA-Z]:(?:$|\/))/.test(normalized)) throw new Error('Search paths are not supported; use a workspace-relative glob without ./');
+    return normalized;
+  }))];
 }
 
-async function* projectTextSearch(projectPath: string, options: TextSearchOptions, signal: AbortSignal): AsyncGenerator<TextSearchEvent> {
+function textSearchGlobArgs(options: Pick<TextSearchOptions, 'includePatterns' | 'excludePatterns'>) {
+  const includes = new Set<string>();
+  for (const pattern of options.includePatterns) {
+    for (const glob of [...textSearchIncludeTraversalGlobs(pattern), ...expandTextSearchGlob(pattern)]) {
+      includes.add(glob);
+      if (includes.size > MAX_TEXT_SEARCH_GLOB_EXPANSIONS) throw new Error(`Search glob expansion cannot exceed ${MAX_TEXT_SEARCH_GLOB_EXPANSIONS} entries`);
+    }
+  }
+  return [
+    ...[...includes].flatMap((glob) => ['--glob', glob]),
+    ...options.excludePatterns.flatMap(expandTextSearchGlob).flatMap((glob) => ['--glob', `!${glob}`]),
+    ...TEXT_SEARCH_SKIPPED_GLOBS.flatMap((glob) => ['--glob', glob]),
+  ];
+}
+
+function textSearchIncludeTraversalGlobs(pattern: string) {
+  const normalized = pattern.startsWith('.') ? `*${pattern}` : pattern;
+  const prefixes = new Set<string>();
+  for (const expanded of expandTextSearchBraceAlternatives(normalized)) {
+    const components = splitTextSearchGlob(expanded, '/');
+    for (let index = 0; index < components.length - 1; index += 1) {
+      const prefix = collapseRecursiveGlob(`**/${components.slice(0, index + 1).join('/')}/`);
+      if (prefix === '**/') continue;
+      prefixes.add(prefix);
+      if (prefixes.size > MAX_TEXT_SEARCH_GLOB_EXPANSIONS) throw new Error(`Search glob expansion cannot exceed ${MAX_TEXT_SEARCH_GLOB_EXPANSIONS} entries`);
+    }
+  }
+  return [...prefixes];
+}
+
+function expandTextSearchBraceAlternatives(glob: string, expanded: string[] = []) {
+  const brace = expandableTextSearchBrace(glob);
+  if (!brace) {
+    expanded.push(glob);
+    if (expanded.length > MAX_TEXT_SEARCH_GLOB_EXPANSIONS) throw new Error(`Search glob expansion cannot exceed ${MAX_TEXT_SEARCH_GLOB_EXPANSIONS} entries`);
+    return expanded;
+  }
+  for (const alternative of brace.alternatives) {
+    expandTextSearchBraceAlternatives(`${glob.slice(0, brace.start)}${alternative}${glob.slice(brace.end + 1)}`, expanded);
+  }
+  return expanded;
+}
+
+function expandableTextSearchBrace(glob: string) {
+  const starts: number[] = [];
+  let inBrackets = false;
+  let bracketCharacters = 0;
+  let bracketNegated = false;
+  for (let index = 0; index < glob.length; index += 1) {
+    const character = glob[index];
+    if (inBrackets) {
+      if (bracketCharacters === 0 && (character === '!' || character === '^')) {
+        bracketNegated = true;
+        bracketCharacters += 1;
+      } else if (character === ']' && bracketCharacters > (bracketNegated ? 1 : 0)) inBrackets = false;
+      else bracketCharacters += 1;
+      continue;
+    }
+    if (character === '[') {
+      inBrackets = true;
+      bracketCharacters = 0;
+      bracketNegated = false;
+      continue;
+    }
+    if (character === '{') {
+      starts.push(index);
+      continue;
+    }
+    if (character !== '}' || !starts.length) continue;
+    const start = starts.pop()!;
+    const alternatives = splitTextSearchGlob(glob.slice(start + 1, index), ',');
+    if (alternatives.length > 1) return { start, end: index, alternatives };
+  }
+  return undefined;
+}
+
+function expandTextSearchGlob(pattern: string) {
+  const normalized = pattern.startsWith('.') ? `*${pattern}` : pattern;
+  return [...new Set([
+    collapseRecursiveGlob(`**/${normalized}/**`),
+    collapseRecursiveGlob(`**/${normalized}`),
+  ])];
+}
+
+function splitTextSearchGlob(glob: string, separator: string) {
+  const components: string[] = [];
+  let current = '';
+  let braceDepth = 0;
+  let inBrackets = false;
+  let bracketCharacters = 0;
+  let bracketNegated = false;
+  for (const character of glob) {
+    if (character === separator && braceDepth === 0 && !inBrackets) {
+      components.push(current);
+      current = '';
+      continue;
+    }
+    if (inBrackets) {
+      if (bracketCharacters === 0 && (character === '!' || character === '^')) {
+        bracketNegated = true;
+        bracketCharacters += 1;
+      } else if (character === ']' && bracketCharacters > (bracketNegated ? 1 : 0)) inBrackets = false;
+      else bracketCharacters += 1;
+    } else if (character === '[') {
+      inBrackets = true;
+      bracketCharacters = 0;
+      bracketNegated = false;
+    } else if (character === '{') braceDepth += 1;
+    else if (character === '}' && braceDepth > 0) braceDepth -= 1;
+    current += character;
+  }
+  components.push(current);
+  return components;
+}
+
+function collapseRecursiveGlob(glob: string) {
+  return glob.split('/').filter((segment, index, segments) => segment !== '**' || segments[index - 1] !== '**').join('/');
+}
+
+async function* ndjsonTextSearch(projectPath: string, options: TextSearchOptions, globArgs: string[], signal: AbortSignal) {
+  for await (const event of projectTextSearch(projectPath, options, globArgs, signal)) yield `${JSON.stringify(event)}\n`;
+}
+
+async function* projectTextSearch(projectPath: string, options: TextSearchOptions, globArgs: string[], signal: AbortSignal): AsyncGenerator<TextSearchEvent> {
   const args = [
     '--json',
     '--no-config',
@@ -131,7 +274,7 @@ async function* projectTextSearch(projectPath: string, options: TextSearchOption
     `--max-count=${MAX_TEXT_SEARCH_RESULTS_PER_FILE + 1}`,
     `--max-filesize=${MAX_TEXT_SEARCH_FILE_BYTES}`,
     '--hidden',
-    ...TEXT_SEARCH_SKIPPED_GLOBS.flatMap((glob) => ['--glob', glob]),
+    ...globArgs,
     '--',
     options.query,
     '.',

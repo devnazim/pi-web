@@ -100,6 +100,160 @@ test('text search applies case sensitivity and optional whole-word matching', as
   assert.equal(partialEvents.find((event) => event.type === 'done' && event)?.matchCount, 4);
 });
 
+test('text search applies VS Code-style include and exclude globs without exposing protected roots', async (t) => {
+  const projectPath = await mkdtemp(path.join(tmpdir(), 'pi-web-text-search-globs-'));
+  await Promise.all([
+    mkdir(path.join(projectPath, 'src')),
+    mkdir(path.join(projectPath, 'nested', 'src'), { recursive: true }),
+    mkdir(path.join(projectPath, 'tests')),
+    mkdir(path.join(projectPath, '.git')),
+    mkdir(path.join(projectPath, '.pi-web')),
+  ]);
+  await Promise.all([
+    writeFile(path.join(projectPath, '.gitignore'), '.dockerfile\n'),
+    writeFile(path.join(projectPath, '.dockerfile'), 'glob-needle'),
+    writeFile(path.join(projectPath, 'src', 'app.ts'), 'glob-needle'),
+    writeFile(path.join(projectPath, 'src', 'app.tsx'), 'glob-needle'),
+    writeFile(path.join(projectPath, 'src', 'app.test.ts'), 'glob-needle'),
+    writeFile(path.join(projectPath, 'src', 'app.js'), 'glob-needle'),
+    writeFile(path.join(projectPath, 'nested', 'src', 'nested.ts'), 'glob-needle'),
+    writeFile(path.join(projectPath, 'tests', 'spec.ts'), 'glob-needle'),
+    writeFile(path.join(projectPath, '.git', 'secret.ts'), 'glob-needle'),
+    writeFile(path.join(projectPath, '.pi-web', 'secret.ts'), 'glob-needle'),
+  ]);
+  const app = Fastify({ logger: false });
+  const registry = new ProjectRegistry(projectPath);
+  await registerFileRoutes(app, registry);
+  await app.ready();
+  t.after(async () => {
+    await app.close();
+    await rm(projectPath, { recursive: true, force: true });
+  });
+  const project = registry.list()[0];
+
+  const response = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: {
+      query: 'glob-needle',
+      contextLines: 0,
+      includePatterns: ['*.{ts,tsx}', '.dockerfile', '**/.git/**', '**/.pi-web/**'],
+      excludePatterns: ['*.test.ts', 'tests'],
+    },
+  });
+  assert.deepEqual(parseTextSearchEvents(response.body).filter((event) => event.type === 'file').map((event) => event.path).sort(), [
+    '.dockerfile',
+    'nested/src/nested.ts',
+    'src/app.ts',
+    'src/app.tsx',
+  ]);
+});
+
+test('text search expands simple directory globs at any depth', async (t) => {
+  const projectPath = await mkdtemp(path.join(tmpdir(), 'pi-web-text-search-global-glob-'));
+  await Promise.all([
+    mkdir(path.join(projectPath, 'src')),
+    mkdir(path.join(projectPath, 'nested', 'src'), { recursive: true }),
+    mkdir(path.join(projectPath, 'web', 'target'), { recursive: true }),
+    mkdir(path.join(projectPath, 'weird', 'nottarget'), { recursive: true }),
+    mkdir(path.join(projectPath, 'dist', 'server'), { recursive: true }),
+    mkdir(path.join(projectPath, 'other')),
+    mkdir(path.join(projectPath, 'scripts')),
+    ...[']', '{', ',', '}'].map((directory) => mkdir(path.join(projectPath, 'ignored-classes', directory), { recursive: true })),
+  ]);
+  await Promise.all([
+    writeFile(path.join(projectPath, '.gitignore'), 'dist/\nignored-classes/\n'),
+    writeFile(path.join(projectPath, 'src', 'root.txt'), 'directory-needle'),
+    writeFile(path.join(projectPath, 'nested', 'src', 'nested.txt'), 'directory-needle'),
+    writeFile(path.join(projectPath, 'outside.txt'), 'directory-needle'),
+    writeFile(path.join(projectPath, 'web', 'target', 'web.txt'), 'embedded-glob-needle'),
+    writeFile(path.join(projectPath, 'weird', 'nottarget', 'weird.txt'), 'embedded-glob-needle'),
+    writeFile(path.join(projectPath, 'dist', 'generated.txt'), 'ignored-directory-needle'),
+    writeFile(path.join(projectPath, 'dist', 'server', 'app.js'), 'file-specific-needle'),
+    writeFile(path.join(projectPath, 'dist', 'server', 'app.txt'), 'file-specific-needle'),
+    writeFile(path.join(projectPath, 'other', 'dist'), 'file-specific-needle'),
+    writeFile(path.join(projectPath, 'scripts', 'build.js'), 'brace-directory-needle'),
+    writeFile(path.join(projectPath, 'dist', 'server', 'brace.js'), 'brace-directory-needle'),
+    ...[']', '{', ',', '}'].map((directory) => writeFile(path.join(projectPath, 'ignored-classes', directory, 'file.txt'), 'bracket-directory-needle')),
+  ]);
+  const app = Fastify({ logger: false });
+  const registry = new ProjectRegistry(projectPath);
+  await registerFileRoutes(app, registry);
+  await app.ready();
+  t.after(async () => {
+    await app.close();
+    await rm(projectPath, { recursive: true, force: true });
+  });
+  const project = registry.list()[0];
+
+  const response = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'directory-needle', contextLines: 0, includePatterns: ['src/**'] },
+  });
+  assert.deepEqual(parseTextSearchEvents(response.body).filter((event) => event.type === 'file').map((event) => event.path).sort(), [
+    'nested/src/nested.txt',
+    'src/root.txt',
+  ]);
+
+  const embeddedGlob = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'embedded-glob-needle', contextLines: 0, includePatterns: ['we**/**target'] },
+  });
+  assert.deepEqual(parseTextSearchEvents(embeddedGlob.body).filter((event) => event.type === 'file').map((event) => event.path).sort(), [
+    'web/target/web.txt',
+    'weird/nottarget/weird.txt',
+  ]);
+
+  const ignoredDirectory = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'ignored-directory-needle', contextLines: 0, includePatterns: ['dist/**'] },
+  });
+  assert.deepEqual(parseTextSearchEvents(ignoredDirectory.body).filter((event) => event.type === 'file').map((event) => event.path), [
+    'dist/generated.txt',
+  ]);
+
+  const ignoredDirectoryFile = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'file-specific-needle', contextLines: 0, includePatterns: ['dist/server/*.js'] },
+  });
+  assert.deepEqual(parseTextSearchEvents(ignoredDirectoryFile.body).filter((event) => event.type === 'file').map((event) => event.path), [
+    'dist/server/app.js',
+  ]);
+
+  const braceDirectories = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'brace-directory-needle', contextLines: 0, includePatterns: ['{dist/server,scripts}/*.js'] },
+  });
+  assert.deepEqual(parseTextSearchEvents(braceDirectories.body).filter((event) => event.type === 'file').map((event) => event.path).sort(), [
+    'dist/server/brace.js',
+    'scripts/build.js',
+  ]);
+
+  const bracketDirectories = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'bracket-directory-needle', contextLines: 0, includePatterns: ['ignored-classes/[]{,}]/file.txt'] },
+  });
+  assert.deepEqual(parseTextSearchEvents(bracketDirectories.body).filter((event) => event.type === 'file').map((event) => event.path).sort(), [
+    'ignored-classes/,/file.txt',
+    'ignored-classes/]/file.txt',
+    'ignored-classes/{/file.txt',
+    'ignored-classes/}/file.txt',
+  ]);
+});
+
 test('text search keeps previews bounded when matches are far apart on a long line', async (t) => {
   const projectPath = await mkdtemp(path.join(tmpdir(), 'pi-web-text-search-preview-'));
   await writeFile(path.join(projectPath, 'long.txt'), `needle${'x'.repeat(2_000)}needle`);
@@ -334,6 +488,35 @@ test('text search validates its options before starting a stream', async (t) => 
   });
   assert.equal(multiline.statusCode, 400, multiline.body);
   assert.match(multiline.json<{ error: string }>().error, /single line/);
+
+  const invalidPatterns = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'text', includePatterns: '*.ts' },
+  });
+  assert.equal(invalidPatterns.statusCode, 400, invalidPatterns.body);
+  assert.match(invalidPatterns.json<{ error: string }>().error, /files-to-include patterns/i);
+
+  const excessiveExpansion = await app.inject({
+    method: 'POST',
+    url: `/api/projects/${project.id}/files/text-search`,
+    headers: { 'content-type': 'application/json' },
+    payload: { query: 'text', includePatterns: [`${'{a,b}'.repeat(10)}/file.txt`] },
+  });
+  assert.equal(excessiveExpansion.statusCode, 400, excessiveExpansion.body);
+  assert.match(excessiveExpansion.json<{ error: string }>().error, /glob expansion cannot exceed/i);
+
+  for (const pattern of ['./dist', './', '../', 'C:\\']) {
+    const unsupportedSearchPath = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/files/text-search`,
+      headers: { 'content-type': 'application/json' },
+      payload: { query: 'text', excludePatterns: [pattern] },
+    });
+    assert.equal(unsupportedSearchPath.statusCode, 400, `${pattern}: ${unsupportedSearchPath.body}`);
+    assert.match(unsupportedSearchPath.json<{ error: string }>().error, /Search paths are not supported/);
+  }
 });
 
 function parseTextSearchEvents(body: string) {

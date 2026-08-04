@@ -104,7 +104,8 @@ import {
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
 import { buildReviewFileTree, type ReviewFileTreeNode } from './reviewFileTree';
-import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
+import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, isTextPath, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
+import { parseTextSearchPatternInput } from './textSearch';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
@@ -9474,6 +9475,11 @@ function FileSearchPanel(props: {
   let queuedTextFiles: TextSearchFileResult[] = [];
   const [input, setInput] = createSignal('');
   const [query, setQuery] = createSignal('');
+  const [includeInput, setIncludeInput] = createSignal('');
+  const [excludeInput, setExcludeInput] = createSignal('');
+  const [debouncedIncludeInput, setDebouncedIncludeInput] = createSignal('');
+  const [debouncedExcludeInput, setDebouncedExcludeInput] = createSignal('');
+  const [searchDetailsOpen, setSearchDetailsOpen] = createSignal(false);
   const [activeIndex, setActiveIndex] = createSignal(0);
   const [recentFiles, setRecentFiles] = createSignal(readRecentFiles(props.project.id));
   const [caseSensitive, setCaseSensitive] = createSignal(false);
@@ -9500,8 +9506,20 @@ function FileSearchPanel(props: {
     ? []
     : file.lines.flatMap((line) => line.targetRange ? [{ file, line, range: line.targetRange }] : [])));
   const textRowIndexes = createMemo(() => new Map(textRows().map((row, index) => [row.line, index])));
-  const textSearching = createMemo(() => props.mode === 'text' && Boolean(searchValue()) && textStatus() !== 'stopped' && (query() !== searchValue() || textStatus() === 'searching'));
-  const textRequestKey = createMemo(() => JSON.stringify([searchValue(), caseSensitive(), wholeWord(), contextLines()]));
+  const textSearching = createMemo(() => props.mode === 'text' && Boolean(searchValue()) && textStatus() !== 'stopped' && (
+    query() !== searchValue()
+    || debouncedIncludeInput() !== includeInput().trim()
+    || debouncedExcludeInput() !== excludeInput().trim()
+    || textStatus() === 'searching'
+  ));
+  const textRequestKey = createMemo(() => JSON.stringify([
+    searchValue(),
+    parseTextSearchPatternInput(includeInput()),
+    parseTextSearchPatternInput(excludeInput()),
+    caseSensitive(),
+    wholeWord(),
+    contextLines(),
+  ]));
   const visibleTextMatchCount = createMemo(() => textFiles().reduce((total, file) => total + file.matchCount, 0));
   const activeDescriptionId = `file-search-active-${props.project.id}`;
   const activeResultDescription = createMemo(() => {
@@ -9533,12 +9551,20 @@ function FileSearchPanel(props: {
 
   createEffect(() => {
     const value = input().trim();
-    const timeout = window.setTimeout(() => setQuery(value), FILE_SEARCH_DEBOUNCE_MS);
+    const includes = includeInput().trim();
+    const excludes = excludeInput().trim();
+    const timeout = window.setTimeout(() => {
+      setQuery(value);
+      setDebouncedIncludeInput(includes);
+      setDebouncedExcludeInput(excludes);
+    }, FILE_SEARCH_DEBOUNCE_MS);
     onCleanup(() => window.clearTimeout(timeout));
   });
 
   createEffect(() => {
     query();
+    debouncedIncludeInput();
+    debouncedExcludeInput();
     setActiveIndex(0);
   });
 
@@ -9546,6 +9572,9 @@ function FileSearchPanel(props: {
     const mode = props.mode;
     const value = searchValue();
     const debouncedQuery = query();
+    const includes = parseTextSearchPatternInput(debouncedIncludeInput());
+    const excludes = parseTextSearchPatternInput(debouncedExcludeInput());
+    const patternInputsPending = debouncedIncludeInput() !== includeInput().trim() || debouncedExcludeInput() !== excludeInput().trim();
     const sensitive = caseSensitive();
     const words = wholeWord();
     const context = contextLines();
@@ -9564,7 +9593,7 @@ function FileSearchPanel(props: {
       setTextStatus('stopped');
       return;
     }
-    if (value !== debouncedQuery) {
+    if (value !== debouncedQuery || patternInputsPending) {
       stopTextSearch();
       setTextFiles([]);
       setTextCompletion(undefined);
@@ -9587,6 +9616,8 @@ function FileSearchPanel(props: {
       caseSensitive: sensitive,
       wholeWord: words,
       contextLines: context,
+      includePatterns: includes,
+      excludePatterns: excludes,
     }, controller.signal, (event) => {
       if (sequence !== textSearchSequence || controller.signal.aborted) return;
       if (event.type === 'file') {
@@ -9711,6 +9742,10 @@ function FileSearchPanel(props: {
             <div class="flex items-center gap-1">
               <button class={`file-text-search-option ${caseSensitive() ? 'file-text-search-option-active' : ''}`} type="button" aria-label="Match case" aria-pressed={caseSensitive()} title="Match case" onClick={() => { setStoppedTextRequest(undefined); setCaseSensitive((value) => !value); }}>Aa</button>
               <button class={`file-text-search-option ${wholeWord() ? 'file-text-search-option-active' : ''}`} type="button" aria-label="Match whole word" aria-pressed={wholeWord()} title="Match whole word" onClick={() => { setStoppedTextRequest(undefined); setWholeWord((value) => !value); }}>ab</button>
+              <button class={`file-text-search-details-toggle ${searchDetailsOpen() ? 'file-text-search-option-active' : ''}`} type="button" aria-expanded={searchDetailsOpen()} aria-controls={`file-text-search-details-${props.project.id}`} title={searchDetailsOpen() ? 'Hide search details' : 'Show search details'} onClick={() => setSearchDetailsOpen((open) => !open)}>
+                {searchDetailsOpen() ? <ChevronDown class="size-3.5" /> : <ChevronRight class="size-3.5" />}
+                <span>Details</span>
+              </button>
             </div>
             <label class="file-text-search-context">Context
               <select value={contextLines()} onChange={(event) => { setStoppedTextRequest(undefined); setContextLines(Number(event.currentTarget.value)); }} aria-label="Context lines">
@@ -9718,6 +9753,18 @@ function FileSearchPanel(props: {
               </select>
             </label>
           </div>
+          <Show when={searchDetailsOpen()}>
+            <div id={`file-text-search-details-${props.project.id}`} class="file-text-search-details">
+              <label class="file-text-search-pattern">
+                <span>Files to include</span>
+                <input value={includeInput()} placeholder="e.g. *.ts, src/**" aria-label="Files to include" onInput={(event) => { setStoppedTextRequest(undefined); setIncludeInput(event.currentTarget.value); }} />
+              </label>
+              <label class="file-text-search-pattern">
+                <span>Files to exclude</span>
+                <input value={excludeInput()} placeholder="e.g. *.test.ts, dist/**" aria-label="Files to exclude" onInput={(event) => { setStoppedTextRequest(undefined); setExcludeInput(event.currentTarget.value); }} />
+              </label>
+            </div>
+          </Show>
         </Show>
       </div>
       <div class="file-search-results">
@@ -9796,7 +9843,7 @@ function fileSearchOptionId(projectId: string, mode: FileSearchMode, index: numb
   return `file-search-option-${projectId}-${mode}-${index}`;
 }
 
-async function streamTextSearch(projectId: string, options: { query: string; caseSensitive: boolean; wholeWord: boolean; contextLines: number }, signal: AbortSignal, onEvent: (event: TextSearchEvent) => void) {
+async function streamTextSearch(projectId: string, options: { query: string; caseSensitive: boolean; wholeWord: boolean; contextLines: number; includePatterns: string[]; excludePatterns: string[] }, signal: AbortSignal, onEvent: (event: TextSearchEvent) => void) {
   const response = await fetch(appUrl(`/api/projects/${projectId}/files/text-search`), {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/x-ndjson' },
@@ -13935,10 +13982,6 @@ function isVideoPath(filePath: string) {
 
 function isPdfPath(filePath: string) {
   return /\.pdf$/i.test(filePath);
-}
-
-function isTextPath(filePath: string) {
-  return /\.(txt|md|mdx|json|jsonc|ts|tsx|js|jsx|css|scss|html|xml|yaml|yml|toml|ini|env|sh|bash|zsh|py|rb|go|rs|java|kt|swift|c|cc|cpp|h|hpp|sql|log)$/i.test(filePath);
 }
 
 function activeFileMention(value: string, cursor: number): FileMention | undefined {

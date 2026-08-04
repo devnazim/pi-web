@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
+import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, isTextPath, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
 
 test('fileAncestorDirectories includes the root and each containing directory', () => {
   assert.deepEqual(fileAncestorDirectories('src/components/App.tsx'), ['', 'src', 'src/components']);
   assert.deepEqual(fileAncestorDirectories('README.md'), ['']);
+});
+
+test('text path detection includes common extensionless and dotfile configuration files', () => {
+  for (const path of ['Dockerfile', 'Dockerfile.dev', '.dockerfile', 'Containerfile', '.env.local', '.env.development.local', '.gitignore', '.dockerignore', '.npmignore', '.editorconfig', 'Makefile']) {
+    assert.equal(isTextPath(path), true, path);
+  }
+  for (const path of ['archive.bin', '.DS_Store', 'image.png', 'Dockerfile.png', 'Dockerfile.zip', 'Containerfile.pdf', 'Containerfile.wasm', '.env.mp4', '.env.gz']) assert.equal(isTextPath(path), false, path);
 });
 
 test('path prefix helpers respect path segment boundaries', () => {
