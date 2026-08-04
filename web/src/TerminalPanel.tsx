@@ -896,7 +896,8 @@ function terminalTheme() {
   };
   const cssColor = (name: string, fallback: string) => rootStyle.getPropertyValue(name).trim() || fallback;
   return {
-    background: 'rgba(0, 0, 0, 0)',
+    // Reverse-video cells use this as their foreground, so transparent black is not safe here.
+    background: oklch('--background', '0.16 0 0'),
     foreground: oklch('--foreground', '0.92 0 0'),
     cursor: cssColor('--terminal-cursor-color', '#d4d4d4'),
     cursorAccent: cssColor('--terminal-cursor-accent-color', '#1f1f1f'),
