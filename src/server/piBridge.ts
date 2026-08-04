@@ -772,6 +772,10 @@ export class PiBridge {
       if (!commandReportedError && (completedMirroredLifecycle || needsSyntheticFinish)) this.broadcast(key, { type: 'agent:finish', operationId, sessionId: body.sessionId });
       else if (!commandReportedError && lifecycle.started && !lifecycle.finished && !this.cachedSessionInUse(session)) {
         this.broadcast(key, { type: 'agent:finish', operationId, sessionId: body.sessionId });
+      } else if (!commandReportedError && extensionCommand && !lifecycle.started) {
+        // A status poll can observe the short-lived bridge lock for a state-only extension command.
+        // Publish an idle status so that stale `running: true` responses cannot keep the composer blocked.
+        this.broadcast(key, { type: 'agent:status', operationId, sessionId: body.sessionId, data: { running: false, statuses: this.statusEntries(session) } });
       }
     } catch (error) {
       clearCommandBusyTimer();
@@ -3233,6 +3237,7 @@ function projectIdFromStreamKey(key: string) {
 }
 
 function isWorkspaceNotificationEvent(event: AgentEvent) {
+  if (event.type === 'agent:status') return Boolean(event.data && typeof event.data === 'object' && (event.data as { running?: unknown }).running === false);
   if (['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'agent:ui-request', 'bash:start', 'bash:finish', 'bash:error', 'error'].includes(event.type)) return true;
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return false;
   const type = (event.data as { type?: unknown }).type;

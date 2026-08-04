@@ -1227,11 +1227,16 @@ function Shell() {
 
   function updateAgentStatusCache(projectId: string, eventSessionId: string, data: unknown) {
     if (!data || typeof data !== 'object') return;
-    const statuses = (data as { statuses?: unknown }).statuses;
-    if (!Array.isArray(statuses)) return;
-    const nextStatuses = statuses
+    const eventStatus = data as { running?: unknown; statuses?: unknown };
+    if (!Array.isArray(eventStatus.statuses)) return;
+    const statuses = eventStatus.statuses
       .filter((status): status is { key: string; text: string } => Boolean(status) && typeof status.key === 'string' && typeof status.text === 'string');
-    queryClient.setQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId], (current) => current ? { status: { ...current.status, statuses: nextStatuses } } : current);
+    const current = queryClient.getQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId]);
+    if (typeof eventStatus.running === 'boolean' && current) {
+      reconcileAuthoritativeAgentStatus(projectId, eventSessionId, { ...current.status, running: eventStatus.running, recovery: undefined, statuses });
+      return;
+    }
+    queryClient.setQueryData<{ status: AgentStatusInfo }>(['agent-status', projectId, eventSessionId], current ? { status: { ...current.status, statuses } } : current);
   }
 
   function updateAgentRunningCache(projectId: string, eventSessionId: string, running: boolean) {
@@ -1470,6 +1475,17 @@ function Shell() {
     const sessionId = event.sessionId;
     const read = isWorkspaceNotificationViewed(workspaceId, sessionId);
     const runningSessionId = sessionId ?? 'active';
+    const idleStatusEvent = event.type === 'agent:status'
+      && Boolean(event.data && typeof event.data === 'object' && (event.data as { running?: unknown }).running === false);
+    const idleAgentStatus = idleStatusEvent && !(
+      workspaceProject()?.id === workspaceId
+      && activeSessionId() === sessionId
+      && (
+        liveShellActivityValue.running
+        || Object.values(extensionUiRequests()).some((request) => request.sessionId === sessionId)
+        || (liveAgentActivityValue.running && Boolean(event.operationId && liveAgentActivityValue.operationId && event.operationId !== liveAgentActivityValue.operationId))
+      )
+    );
     if (event.type === 'agent:start' || event.type === 'bash:start') resetWorkspaceNotificationEventDeduplication(recentWorkspaceNotificationEvents, workspaceId, sessionId);
     const candidateNotification = workspaceNotificationFromEvent(event, workspaceId, read);
     const notification = candidateNotification && !isDuplicateWorkspaceNotificationEvent(recentWorkspaceNotificationEvents, workspaceId, event)
@@ -1479,9 +1495,22 @@ function Shell() {
     updateWorkspaceNotifications(workspaceId, (state) => {
       let runningSessionIds = state.runningSessionIds;
       if (event.type === 'agent:start' || event.type === 'bash:start') runningSessionIds = uniqueStrings([...runningSessionIds, runningSessionId]);
-      if (event.type === 'agent:finish' || event.type === 'agent:error' || event.type === 'bash:finish' || event.type === 'bash:error' || event.type === 'error') runningSessionIds = runningSessionIds.filter((id) => id !== runningSessionId);
+      if (idleAgentStatus || event.type === 'agent:finish' || event.type === 'agent:error' || event.type === 'bash:finish' || event.type === 'bash:error' || event.type === 'error') runningSessionIds = runningSessionIds.filter((id) => id !== runningSessionId);
       return notification ? { runningSessionIds, items: [notification, ...state.items] } : { ...state, runningSessionIds };
     });
+
+    if (idleAgentStatus && sessionId) {
+      const current = queryClient.getQueryData<{ status: AgentStatusInfo }>(['agent-status', workspaceId, sessionId]);
+      if (current) {
+        const eventStatuses = (event.data as { statuses?: unknown }).statuses;
+        const statuses = Array.isArray(eventStatuses)
+          ? eventStatuses.filter((status): status is { key: string; text: string } => Boolean(status) && typeof status.key === 'string' && typeof status.text === 'string')
+          : current.status.statuses;
+        const status = { ...current.status, running: false, recovery: undefined, statuses };
+        if (workspaceProject()?.id === workspaceId && activeSessionId() === sessionId) reconcileAuthoritativeAgentStatus(workspaceId, sessionId, status);
+        else queryClient.setQueryData(['agent-status', workspaceId, sessionId], { status });
+      }
+    }
 
     if ((event.type === 'agent:start' || event.type === 'bash:start') && sessionId) markSessionActivityStarted(completedSessionRefreshes, workspaceId, sessionId);
     if ((event.type === 'agent:finish' || event.type === 'agent:error' || event.type === 'bash:finish' || event.type === 'bash:error') && sessionId) {
@@ -5476,6 +5505,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
   const [composerHistory, setComposerHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'normal'));
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
+  const [composerSubmissions, setComposerSubmissions] = createSignal<Map<string, { submission: boolean; steering: boolean }>>(new Map());
   const [pendingTerminalRefreshKeys, setPendingTerminalRefreshKeys] = createSignal<Set<string>>(new Set<string>());
   const pendingTerminalRefreshActive = createMemo(() => {
     const sessionId = props.sessionId ?? commandSessionId();
@@ -5696,14 +5726,16 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     return voiceListening() ? 'Stop voice input' : 'Dictate prompt';
   });
   const voiceButtonLabel = createMemo(() => voiceSupported() ? voiceListening() ? 'Stop voice input' : 'Dictate prompt' : 'Voice input is not supported in this browser');
+  const composerSubmission = createMemo(() => composerSubmissions().get(composerDraftKey(props.project.id, props.sessionId, props.newComposerRevision)));
+  const composerSubmissionPending = createMemo(() => Boolean(composerSubmission()?.submission || composerSubmission()?.steering));
   const composerCanSubmit = createMemo(() => {
     const prompt = text().trim();
     if (!prompt || attachBusy() || aborting() || pendingTerminalRefreshActive()) return false;
-    if (parseAgentComposerCommand(prompt)) return !busy();
-    if (!busy()) return true;
+    if (parseAgentComposerCommand(prompt)) return !busy() && !composerSubmissionPending();
+    if (!busy()) return !composerSubmissionPending();
     const commandName = composerSlashCommandName(prompt);
     const extensionCommand = commandName ? slashCommands.data?.commands.find((command) => command.name === commandName)?.source === 'extension' : false;
-    return canSteerAgent() && !extensionCommand && !parseShellComposerCommand(prompt) && parseCompactComposerCommand(prompt) === undefined;
+    return canSteerAgent() && !composerSubmission()?.steering && !extensionCommand && !parseShellComposerCommand(prompt) && parseCompactComposerCommand(prompt) === undefined;
   });
   const showEmptySessionPrompt = createMemo(() => Boolean(props.sessionId && !session.isLoading && !session.error && visibleTranscriptEntries().length === 0 && !busy() && !pendingUserMessageVisible()));
   const centerTranscript = createMemo(() => (!props.sessionId && !pendingUserMessageVisible()) || showEmptySessionPrompt());
@@ -7114,12 +7146,19 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     const compactCommand = parseCompactComposerCommand(prompt);
     const agentCommand = parseAgentComposerCommand(prompt);
     const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined && !agentCommand;
-    if (!prompt || attachBusy() || aborting() || pendingTerminalRefreshActive() || (busy() && !steeringSubmit)) return;
-    stopVoiceRecognition(true);
     const projectId = props.project.id;
     const routeSessionId = props.sessionId;
     const submittedNavigationRevision = props.sessionNavigationRevision;
     const submittedDraftKey = activeComposerDraftKey ?? composerDraftKey(projectId, routeSessionId, props.newComposerRevision);
+    const submissionKind = steeringSubmit ? 'steering' : 'submission';
+    if (!prompt || attachBusy() || aborting() || composerSubmissions().get(submittedDraftKey)?.[submissionKind] || pendingTerminalRefreshActive() || (busy() && !steeringSubmit)) return;
+    setComposerSubmissions((submissions) => {
+      const next = new Map(submissions);
+      next.set(submittedDraftKey, { submission: false, steering: false, ...submissions.get(submittedDraftKey), [submissionKind]: true });
+      return next;
+    });
+    try {
+    stopVoiceRecognition(true);
     const submissionTargetStillActive = () => props.sessionNavigationRevision === submittedNavigationRevision && props.project.id === projectId && props.sessionId === routeSessionId && activeComposerDraftKey === submittedDraftKey;
     if (agentCommand) {
       const result = await handleComposerAgentCommand(agentCommand.argument, projectId, submittedDraftKey, submittedNavigationRevision);
@@ -7311,6 +7350,11 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
           awaitCompletion: extensionCommand || undefined,
         }),
       });
+      if (extensionCommand && submittedComposerStillActive() && submittedRuntimeStillCurrent()) {
+        props.invalidateAgentStatusRequests();
+        await queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, submittedSessionId] })
+          .catch((error) => console.warn('Could not refresh agent status after extension command', error));
+      }
       if (submittedPendingUserMessageId !== undefined) {
         const pendingMessageId = submittedPendingUserMessageId;
         setPendingUserMessages((pending) => pending.map((message) => message.id === pendingMessageId ? { ...message, accepted: true } : message));
@@ -7347,6 +7391,17 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
         await invalidateUnknownCommandSessionReservation(submittedDraftKey, submittedSessionId, error);
       }
       if (!submissionInterruptedByTerminalRefresh) console.error('Could not send chat message', error);
+    }
+    } finally {
+      setComposerSubmissions((submissions) => {
+        const current = submissions.get(submittedDraftKey);
+        if (!current?.[submissionKind]) return submissions;
+        const next = new Map(submissions);
+        const remaining = { ...current, [submissionKind]: false };
+        if (remaining.submission || remaining.steering) next.set(submittedDraftKey, remaining);
+        else next.delete(submittedDraftKey);
+        return next;
+      });
     }
   }
 
@@ -7560,7 +7615,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
               >
                 <Show when={voiceListening()} fallback={<Mic class="size-4" />}><MicOff class="size-4" /></Show>
               </button>
-              <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={busy() && composerCanSubmit() ? 'Send steering message' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><ArrowUp class="size-4" /></button>}>
+              <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={busy() && composerCanSubmit() ? 'Send steering message' : composerSubmissionPending() ? 'Sending...' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><Show when={!busy() && composerSubmissionPending()} fallback={<ArrowUp class="size-4" />}><LoaderCircle class="size-4 animate-spin" /></Show></button>}>
                 <button class="button-danger h-8 w-8 px-0" type="button" title="Interrupt agent (Esc, or double Esc anywhere)" onClick={() => void interruptAgent()} disabled={aborting()}><Square class="size-3.5 fill-current" /></button>
               </Show>
             </div>

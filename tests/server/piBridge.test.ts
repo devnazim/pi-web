@@ -64,6 +64,26 @@ test('applies explicit agent selection only before Pi Web review extension comma
   ]);
 });
 
+test('publishes idle status after a state-only extension command', async () => {
+  const bridge = new PiBridge();
+  const events: Array<{ type?: string; operationId?: string; data?: { running?: boolean; statuses?: unknown[] } }> = [];
+  const session = {
+    extensionRunner: { getCommand: (name: string) => name === 'state-only' ? {} : undefined },
+    prompt: async () => undefined,
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).waitForCommandActivity = async () => undefined;
+  (bridge as any).broadcast = (_key: string, event: { type?: string; operationId?: string; data?: { running?: boolean; statuses?: unknown[] } }) => { events.push(event); };
+
+  await bridge.prompt(process.cwd(), { sessionId: 'state-only-session', prompt: '/state-only' }, 'project:state-only-session');
+
+  assert.equal(events.some((event) => event.type === 'agent:start' || event.type === 'agent:finish'), false);
+  const status = events.find((event) => event.type === 'agent:status');
+  assert.equal(typeof status?.operationId, 'string');
+  assert.deepEqual(status?.data, { running: false, statuses: [] });
+});
+
 test('recovers a settled agent operation whose SDK promise never resolves', async () => {
   const bridge = new PiBridge({ runtimeSettledGraceMs: 5, runtimeIdleGraceMs: 20, runtimeWatchIntervalMs: 1 });
   const events: Array<{ type?: string; message?: string }> = [];
