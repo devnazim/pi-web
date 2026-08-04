@@ -3,6 +3,7 @@ import {
   Activity,
   AlignJustify,
   Archive,
+  ArrowLeft,
   ArrowUp,
   BadgeInfo,
   Bell,
@@ -36,7 +37,6 @@ import {
   FolderOpen,
   GitCompareArrows,
   GitFork,
-  Home,
   LoaderCircle,
   MessageSquare,
   Mic,
@@ -9260,13 +9260,11 @@ function FileWorkspace(props: { project: Project; state: FileWorkspaceState; the
             </div>
             <div class="flex shrink-0 items-center gap-1">
               <Show when={explorerView() === 'files'} fallback={
-                <button class="ghost" title="Show file explorer" onClick={() => setExplorerView('files')}><Files class="size-4" /></button>
+                <button class="ghost" title="Back to explorer" aria-label="Back to explorer" onClick={() => setExplorerView('files')}><ArrowLeft class="size-4" /></button>
               }>
-                <button class="ghost" title="Collapse folders" onClick={() => { setExpandedDirectories({ '': true }); setSelectedDirectory(''); }}><Home class="size-4" /></button>
                 <button class="ghost" title={`Search files (${formatBinding(getShortcutBinding('searchFiles'))})`} onClick={() => openFileSearch()}><Search class="size-4" /></button>
                 <button class="ghost" title={`Create file in ${selectedDirectory() || 'project root'}`} onClick={() => setCreateFileDir(selectedDirectory())}><FilePlus class="size-4" /></button>
               </Show>
-              <button class="ghost" title="Hide explorer" onClick={() => setExplorerOpen(false)}><X class="size-4" /></button>
             </div>
           </div>
           <Show when={explorerView() === 'files'} fallback={

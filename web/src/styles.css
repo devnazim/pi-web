@@ -560,7 +560,7 @@ body {
   }
 
   .file-search-controls {
-    @apply grid gap-2 border-b border-border p-2.5;
+    @apply grid gap-2 p-2.5;
   }
 
   .file-search-modes {
@@ -1319,7 +1319,7 @@ body {
   }
 
   .file-workspace-tab-actions {
-    @apply flex shrink-0 items-center gap-1 border-l border-border px-2;
+    @apply flex shrink-0 items-center gap-1 px-2;
   }
 
   .file-workspace-file-bar {
@@ -1372,6 +1372,7 @@ body {
   .file-workspace-explorer > .tool-panel-header {
     display: grid;
     grid-template-columns: minmax(0, 1fr) max-content;
+    border-bottom: 0;
   }
 
   .file-workspace-explorer > .tool-panel-header > :first-child {
