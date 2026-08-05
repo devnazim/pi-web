@@ -3878,9 +3878,6 @@ function Sidebar(props: {
             )}
           </Show>
           <div class="min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wide text-muted-foreground">Workspace</div>
-          <Show when={headerProject()}>
-            {(project) => <WorkspaceNotificationButton summary={props.workspaceNotifications[project().id]} onClick={() => props.onOpenNotifications(project().id)} />}
-          </Show>
           <button class="sidebar-toggle" title={`Hide sessions (${formatBinding(getShortcutBinding('toggleSidebar'))})`} onClick={props.onToggleSidebar}><PanelLeftClose class="size-4" /></button>
         </div>
         <div class="mb-5 flex items-start justify-between gap-3">
@@ -4890,7 +4887,7 @@ function Topbar(props: { project?: Project; sessionId?: string; sessionSidebarOp
         </div>
       </Show>
       <div class="flex-1" />
-      <Show when={!props.sessionSidebarOpen && props.project}>
+      <Show when={props.project}>
         {(project) => <WorkspaceNotificationButton summary={props.notificationSummary} onClick={props.onOpenNotifications} label={`Notifications for ${project().name}`} />}
       </Show>
       <div class="floating-tool-group hidden lg:flex">
