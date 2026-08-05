@@ -109,6 +109,9 @@ import { parseTextSearchPatternInput } from './textSearch';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
+import MermaidDiagram from './MermaidDiagram';
+import { writeClipboardText } from './clipboard';
+import { isCompleteMermaidFence, isMermaidCodeFence } from './mermaidRenderer';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
 
@@ -12317,7 +12320,7 @@ function TranscriptEntry(props: { entry: SessionEntry; project: Project; hideThi
   }
 
   if (props.entry.type === 'message' && props.entry.message?.role === 'assistant') {
-    return <Show when={parts().length}><div class="assistant-message"><MessageParts parts={parts()} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} /></div></Show>;
+    return <Show when={parts().length}><div class="assistant-message"><MessageParts parts={parts()} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid /></div></Show>;
   }
 
   return <div class="chat-meta"><span>{role()}</span><span><RichText text={entryText(props.entry)} searchQuery={props.searchQuery} /></span></div>;
@@ -12384,11 +12387,11 @@ function InlinePlainText(props: { text: string; searchQuery?: string }) {
   );
 }
 
-function MarkdownContent(props: { text: string; compact?: boolean; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string }) {
+function MarkdownContent(props: { text: string; compact?: boolean; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; renderMermaid?: boolean }) {
   const tokens = createMemo(() => markdownTokens(props.text));
   return (
     <div class={`markdown-content ${props.compact ? 'markdown-content-compact' : ''}`}>
-      <For each={tokens()}>{(token) => <MarkdownBlock token={token} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />}</For>
+      <For each={tokens()}>{(token) => <MarkdownBlock token={token} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid={props.renderMermaid} />}</For>
     </div>
   );
 }
@@ -12401,24 +12404,36 @@ function markdownTokens(text: string): Token[] {
   }
 }
 
-function MarkdownBlock(props: { token: Token; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string }): JSX.Element {
+function MarkdownBlock(props: { token: Token; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; renderMermaid?: boolean }): JSX.Element {
   const token = props.token as MarkdownToken;
   if (token.type === 'heading') {
     return <MarkdownHeading depth={token.depth ?? 1}><MarkdownInline tokens={token.tokens} text={token.text ?? ''} searchQuery={props.searchQuery} /></MarkdownHeading>;
   }
   if (token.type === 'paragraph') return <p><MarkdownInline tokens={token.tokens} text={token.text ?? ''} searchQuery={props.searchQuery} /></p>;
   if (token.type === 'text') return <p><MarkdownInline tokens={token.tokens} text={token.text ?? token.raw ?? ''} searchQuery={props.searchQuery} /></p>;
-  if (token.type === 'code') return <MarkdownCodeBlock code={token.text ?? ''} info={token.lang} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />;
+  if (token.type === 'code') {
+    if (isMermaidCodeFence(token.lang) && isCompleteMermaidFence(token.raw)) {
+      return (
+        <Show
+          when={props.renderMermaid === true && !props.searchQuery}
+          fallback={<MarkdownCodeBlock code={token.text ?? ''} info={token.lang} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />}
+        >
+          <MermaidDiagram code={token.text ?? ''} />
+        </Show>
+      );
+    }
+    return <MarkdownCodeBlock code={token.text ?? ''} info={token.lang} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />;
+  }
   if (token.type === 'blockquote') {
     return (
       <blockquote class="markdown-blockquote">
         <Show when={token.tokens?.length} fallback={<p><InlinePlainText text={token.text ?? ''} searchQuery={props.searchQuery} /></p>}>
-          <For each={token.tokens}>{(child) => <MarkdownBlock token={child} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />}</For>
+          <For each={token.tokens}>{(child) => <MarkdownBlock token={child} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid={props.renderMermaid} />}</For>
         </Show>
       </blockquote>
     );
   }
-  if (token.type === 'list') return <MarkdownList token={token} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />;
+  if (token.type === 'list') return <MarkdownList token={token} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid={props.renderMermaid} />;
   if (token.type === 'table') {
     return (
       <div class="markdown-table-wrap">
@@ -12526,27 +12541,27 @@ function MarkdownCodeBlock(props: { code: string; info?: string; syntaxTheme: Sh
   );
 }
 
-function MarkdownList(props: { token: MarkdownToken; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string }) {
+function MarkdownList(props: { token: MarkdownToken; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; renderMermaid?: boolean }) {
   const start = typeof props.token.start === 'number' ? props.token.start : undefined;
   const className = `markdown-list ${props.token.ordered ? 'markdown-list-ordered' : 'markdown-list-unordered'}`;
   return props.token.ordered ? (
     <ol class={className} start={start}>
-      <For each={props.token.items ?? []}>{(item) => <MarkdownListItem item={item} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />}</For>
+      <For each={props.token.items ?? []}>{(item) => <MarkdownListItem item={item} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid={props.renderMermaid} />}</For>
     </ol>
   ) : (
     <ul class={className}>
-      <For each={props.token.items ?? []}>{(item) => <MarkdownListItem item={item} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />}</For>
+      <For each={props.token.items ?? []}>{(item) => <MarkdownListItem item={item} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid={props.renderMermaid} />}</For>
     </ul>
   );
 }
 
-function MarkdownListItem(props: { item: MarkdownListItemToken; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string }) {
+function MarkdownListItem(props: { item: MarkdownListItemToken; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; renderMermaid?: boolean }) {
   return (
     <li class={`markdown-list-item ${props.item.task ? 'markdown-task-item' : ''}`}>
       <Show when={props.item.task}><span class={`markdown-task-box ${props.item.checked ? 'markdown-task-box-checked' : ''}`}>{props.item.checked ? '✓' : ''}</span></Show>
       <div class="markdown-list-item-content">
         <Show when={props.item.tokens?.length} fallback={<InlinePlainText text={props.item.text ?? ''} searchQuery={props.searchQuery} />}>
-          <For each={props.item.tokens}>{(child) => <MarkdownBlock token={child} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />}</For>
+          <For each={props.item.tokens}>{(child) => <MarkdownBlock token={child} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid={props.renderMermaid} />}</For>
         </Show>
       </div>
     </li>
@@ -12677,27 +12692,7 @@ function shikiTokenStyle(token: ShikiToken) {
   return style || undefined;
 }
 
-async function writeClipboardText(text: string) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.setAttribute('readonly', '');
-  textarea.style.position = 'fixed';
-  textarea.style.opacity = '0';
-  textarea.style.pointerEvents = 'none';
-  document.body.append(textarea);
-  textarea.select();
-  try {
-    if (!document.execCommand('copy')) throw new Error('Copy failed');
-  } finally {
-    textarea.remove();
-  }
-}
-
-function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string }) {
+function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; syntaxTheme: ShikiSyntaxTheme; searchQuery?: string; renderMermaid?: boolean }) {
   return (
     <div class={props.compact ? 'space-y-1' : 'space-y-3'}>
       <For each={props.parts.length ? props.parts : [{ type: 'text', text: '' } as ChatContentPart]}>
@@ -12705,7 +12700,7 @@ function MessageParts(props: { parts: ChatContentPart[]; compact?: boolean; synt
           if (part.type === 'thinking') {
             return <Collapsible class="thinking-block" triggerClass="thinking-trigger" title="Thinking"><div class="mt-2 whitespace-pre-wrap"><RichText text={part.text} searchQuery={props.searchQuery} /></div></Collapsible>;
           }
-          if (part.type === 'text') return <MarkdownContent text={part.text} compact={props.compact} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} />;
+          if (part.type === 'text') return <MarkdownContent text={part.text} compact={props.compact} syntaxTheme={props.syntaxTheme} searchQuery={props.searchQuery} renderMermaid={props.renderMermaid} />;
           return <div class={`whitespace-pre-wrap ${part.type === 'error' ? 'text-destructive' : part.type === 'tool' || part.type === 'image' ? 'text-muted-foreground' : ''}`}><RichText text={part.text} searchQuery={props.searchQuery} /></div>;
         }}
       </For>
@@ -12775,7 +12770,7 @@ function LiveAgentActivityItem(props: { item: Exclude<AgentActivityItem, { type:
 function LiveAgentText(props: { text: string; optimizeStreamingRender: boolean; syntaxTheme: ShikiSyntaxTheme }) {
   return (
     <div class="assistant-message assistant-message-live">
-      <Show when={props.optimizeStreamingRender} fallback={<MarkdownContent text={props.text} syntaxTheme={props.syntaxTheme} />}>
+      <Show when={props.optimizeStreamingRender} fallback={<MarkdownContent text={props.text} syntaxTheme={props.syntaxTheme} renderMermaid={false} />}>
         <div class="whitespace-pre-wrap break-words">{props.text}</div>
       </Show>
     </div>

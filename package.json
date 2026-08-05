@@ -52,6 +52,7 @@
     "fastify": "^5.11.2",
     "lucide-solid": "^1.28.0",
     "marked": "^18.0.9",
+    "mermaid": "^11.16.1",
     "monaco-editor": "^0.55.1",
     "node-pty": "^1.2.0-beta.15",
     "shiki": "^4.4.1",

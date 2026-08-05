@@ -1944,6 +1944,173 @@ body {
     @apply inline-flex h-7 shrink-0 select-none items-center justify-center gap-1.5 rounded-4xl px-2 text-xs font-medium text-muted-foreground outline-none transition-all hover:bg-muted hover:text-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 active:translate-y-px;
   }
 
+  .markdown-code-actions {
+    @apply flex shrink-0 items-center gap-1;
+  }
+
+  .markdown-mermaid-frame {
+    @apply bg-card/70;
+  }
+
+  .markdown-mermaid-svg {
+    @apply max-h-[70vh] min-h-40 overflow-auto bg-background/45 p-4;
+  }
+
+  .markdown-mermaid-svg svg {
+    display: block;
+    height: auto;
+    max-width: 100%;
+    margin: 0 auto;
+  }
+
+  .markdown-mermaid-placeholder {
+    @apply bg-background/45;
+  }
+
+  .markdown-mermaid-status {
+    @apply flex min-h-40 items-center justify-center gap-2 bg-background/45 p-4 text-sm text-muted-foreground;
+  }
+
+  .markdown-mermaid-error {
+    @apply flex flex-col gap-1 bg-destructive/10 px-3 py-2.5 text-sm text-destructive;
+  }
+
+  .markdown-mermaid-error span {
+    @apply break-words font-mono text-xs;
+  }
+
+  .markdown-mermaid-source {
+    @apply max-h-[70vh] border-t border-border bg-muted/35;
+  }
+
+  .mermaid-viewer-backdrop {
+    @apply z-[90];
+    padding-block-start: max(clamp(0.5rem, 3vw, 2.5rem), env(safe-area-inset-top, 0px));
+    padding-block-end: max(clamp(0.5rem, 3vw, 2.5rem), env(safe-area-inset-bottom, 0px));
+    padding-inline-start: max(clamp(0.5rem, 3vw, 2.5rem), env(safe-area-inset-left, 0px));
+    padding-inline-end: max(clamp(0.5rem, 3vw, 2.5rem), env(safe-area-inset-right, 0px));
+  }
+
+  .mermaid-viewer-modal {
+    @apply grid min-h-0 min-w-0 grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-3xl bg-popover text-sm text-popover-foreground shadow-2xl outline-none ring-1 ring-foreground/10;
+    block-size: min(92vh, calc(100vh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 1rem));
+    block-size: min(92dvh, calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 1rem));
+    inline-size: min(96vw, 112rem, calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 1rem));
+  }
+
+  .mermaid-viewer-header {
+    @apply flex min-w-0 items-center gap-4 border-b border-border px-4 py-3;
+  }
+
+  .mermaid-viewer-header-actions {
+    @apply ml-auto flex shrink-0 items-center gap-1;
+  }
+
+  .mermaid-viewer-body {
+    @apply min-h-0 min-w-0 overflow-hidden bg-background/70;
+  }
+
+  .mermaid-viewer-viewport {
+    @apply h-full w-full min-h-0 min-w-0 cursor-grab overflow-auto;
+    overscroll-behavior: contain;
+    touch-action: none;
+  }
+
+  .mermaid-viewer-viewport:focus-visible,
+  .mermaid-viewer-source:focus-visible {
+    outline: 2px solid oklch(var(--ring));
+    outline-offset: -2px;
+  }
+
+  .mermaid-viewer-viewport-dragging {
+    @apply cursor-grabbing select-none;
+  }
+
+  .mermaid-viewer-canvas {
+    @apply grid min-h-full min-w-full place-items-center;
+    box-sizing: border-box;
+    height: max-content;
+    width: max-content;
+    padding: 2rem;
+  }
+
+  .mermaid-viewer-svg {
+    @apply shrink-0;
+  }
+
+  .mermaid-viewer-svg svg {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+    max-width: none !important;
+  }
+
+  .mermaid-viewer-source {
+    @apply h-full max-h-none min-h-0 w-full overflow-auto border-0 bg-muted/20 p-5 text-sm leading-6;
+  }
+
+  .mermaid-viewer-error {
+    @apply grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden;
+  }
+
+  .mermaid-viewer-footer {
+    @apply flex min-w-0 flex-wrap items-center justify-between gap-3 border-t border-border px-4 py-2.5;
+  }
+
+  .mermaid-viewer-hint {
+    @apply text-xs text-muted-foreground;
+  }
+
+  .mermaid-viewer-zoom-controls {
+    @apply ml-auto flex items-center gap-1 rounded-xl bg-muted/55 p-1 ring-1 ring-foreground/5;
+  }
+
+  .mermaid-viewer-zoom-button,
+  .mermaid-viewer-zoom-value,
+  .mermaid-viewer-fit-button {
+    @apply inline-flex h-8 select-none items-center justify-center rounded-lg text-xs font-medium text-muted-foreground outline-none transition-colors hover:bg-background hover:text-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50;
+  }
+
+  .mermaid-viewer-zoom-button {
+    @apply w-8;
+  }
+
+  .mermaid-viewer-zoom-value {
+    @apply min-w-14 px-2 font-mono;
+  }
+
+  .mermaid-viewer-fit-button {
+    @apply px-2.5;
+  }
+
+  @media (max-width: 640px) {
+    .mermaid-viewer-modal {
+      @apply rounded-2xl;
+      block-size: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 1rem);
+      inline-size: calc(100vw - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px) - 1rem);
+    }
+
+    .mermaid-viewer-header {
+      @apply gap-2 px-3;
+    }
+
+    .mermaid-viewer-hint {
+      display: none;
+    }
+
+    .mermaid-viewer-footer {
+      @apply justify-center px-2;
+    }
+
+    .mermaid-viewer-zoom-controls {
+      @apply mx-auto;
+    }
+
+    .mermaid-viewer-canvas {
+      padding: 1rem;
+    }
+  }
+
   .markdown-code-block {
     @apply overflow-x-auto p-3 font-mono text-xs leading-5;
   }
