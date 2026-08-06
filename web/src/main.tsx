@@ -131,7 +131,6 @@ type SessionEntry = { type: string; id: string; parentId: string | null; timesta
 type SessionTreeNode = { entry: SessionEntry; children: SessionTreeNode[]; label?: string; labelTimestamp?: string };
 type TreeViewNode = Omit<SessionTreeNode, 'children'> & { id: string; children: TreeViewNode[]; isSettingsEntry: boolean; isEmptyAssistant: boolean };
 type SessionDetail = { sessionId: string; path: string; entries: SessionEntry[]; leafId: string | null; name?: string };
-type SessionTreeView = SessionDetail & { tree: TreeViewNode[] };
 type GitFile = { path: string; oldPath?: string; status: string; staged: boolean; unstaged: boolean; additions?: number; deletions?: number; stagedAdditions?: number; stagedDeletions?: number; unstagedAdditions?: number; unstagedDeletions?: number };
 type GitFileSelection = { path: string; staged: boolean };
 type GitFileActionMenuState = { file: GitFile; staged: boolean; x: number; y: number };
@@ -8485,9 +8484,9 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
   const session = createQuery(() => ({
     queryKey: ['session', props.project.id, props.sessionId],
     queryFn: ({ signal }) => api<SessionDetail>(`/api/projects/${props.project.id}/session?sessionId=${encodeURIComponent(props.sessionId)}`, { signal }),
-    select: sessionTreeViewFromDetail,
     staleTime: SESSION_DETAIL_CACHE_STALE_TIME_MS,
   }));
+  const sessionTreeRoots = createMemo(() => session.data ? sessionTreeRootsFromDetail(session.data) : []);
   const activePathIds = createMemo(() => new Set(session.data ? branchForEntry(session.data.entries, session.data.leafId).map((entry) => entry.id) : []));
   const [collapsedIds, setCollapsedIds] = createSignal<Set<string>>(new Set());
   const [nodeMenu, setNodeMenu] = createSignal<TreeNodeMenuState>();
@@ -8496,7 +8495,7 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
   const [customSummaryTarget, setCustomSummaryTarget] = createSignal<SessionEntry>();
   const [summarizingId, setSummarizingId] = createSignal<string>();
   const [summaryError, setSummaryError] = createSignal('');
-  const flatNodes = createMemo(() => flattenSessionTree(session.data?.tree ?? [], collapsedIds()));
+  const flatNodes = createMemo(() => flattenSessionTree(sessionTreeRoots(), collapsedIds()));
   const filteredNodes = createMemo(() => filterTreeNodes(flatNodes(), deferredSearch(), filterMode(), session.data?.leafId ?? null, cachedTreeEntrySearchText));
   const focusedTreeIndex = createMemo(() => filteredNodes().findIndex((flatNode) => flatNode.node.entry.id === focusedTreeEntryId()));
   const treeVirtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
@@ -8806,7 +8805,7 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
                               onClick={() => { setFocusedTreeEntryId(entry().id); treeScrollerRef?.focus(); continueFrom(entry()); }}
                               onContextMenu={(event) => openNodeMenu(flatNode(), event)}
                             >
-                              <TreeIndent flatNode={flatNode()} multipleRoots={(session.data?.tree.length ?? 0) > 1} />
+                              <TreeIndent flatNode={flatNode()} multipleRoots={sessionTreeRoots().length > 1} />
                               <button
                                 class={`tree-fold ${hasChildren() ? '' : 'tree-fold-empty'}`}
                                 title={hasChildren() ? (collapsed() ? 'Expand' : 'Collapse') : undefined}
@@ -14075,10 +14074,10 @@ function treeSummaryOptions(selection: TreeSelection) {
   return { mode: 'custom', instructions: selection.customInstructions, replace: selection.replaceInstructions };
 }
 
-function sessionTreeViewFromDetail(detail: SessionDetail): SessionTreeView {
+function sessionTreeRootsFromDetail(detail: SessionDetail): TreeViewNode[] {
   const tree = sessionTreeNodesFromEntries(detail.entries);
   const containsActive = treeActivePathMap(tree, detail.leafId);
-  return { ...detail, tree: treeViewNodesFromSessionNodes(tree, containsActive) };
+  return treeViewNodesFromSessionNodes(tree, containsActive);
 }
 
 function sessionTreeNodesFromEntries(entries: SessionEntry[]): SessionTreeNode[] {
