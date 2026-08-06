@@ -7,6 +7,7 @@ import { clearProjectFileCaches } from './files.js';
 import type { ProjectRegistry } from './projects.js';
 import { createTerminalReplaySanitizerState, sanitizeTerminalReplayChunk, terminalReplaySanitizerIsGround, trimTerminalReplay, type TerminalReplaySanitizerState } from './terminalReplay.js';
 import { resolveWithin } from './util.js';
+import { WorkspaceLifecycleConflictError, type WorkspaceLifecycleCoordinator, type WorkspaceLifecycleLease } from './workspaceLifecycle.js';
 
 const MAX_COMMAND_LENGTH = 4000;
 const MAX_TERMINAL_INPUT_LENGTH = 64 * 1024;
@@ -73,29 +74,32 @@ type TerminalSession = {
   disposed?: boolean;
   dataDisposable?: Disposable;
   exitDisposable?: Disposable;
+  workspaceLease?: WorkspaceLifecycleLease;
 };
 
-export async function registerTerminalRoutes(app: FastifyInstance, registry: ProjectRegistry, options: { isClosing?: () => boolean } = {}) {
+export async function registerTerminalRoutes(app: FastifyInstance, registry: ProjectRegistry, options: { isClosing?: () => boolean; workspaceLifecycle?: WorkspaceLifecycleCoordinator } = {}) {
   const terminalSessions = new Map<string, TerminalSession>();
   const commandChildren = new Set<ChildProcess>();
-  const commandProcessSessions = new Set<number>();
+  const processActivityLeases = new Map<number, WorkspaceLifecycleLease | undefined>();
   let closing = false;
-  const commandGroupSweepTimer = process.platform === 'win32' ? undefined : setInterval(() => {
-    for (const sessionId of commandProcessSessions) {
-      if (!processGroupExists(sessionId) && !processGroupsForSessions([sessionId]).length) commandProcessSessions.delete(sessionId);
+  const processActivitySweepTimer = setInterval(() => {
+    for (const [sessionId, lease] of processActivityLeases) {
+      if (processSessionActive(sessionId)) continue;
+      processActivityLeases.delete(sessionId);
+      lease?.release();
     }
   }, 1_000);
-  commandGroupSweepTimer?.unref();
+  processActivitySweepTimer.unref();
 
   app.addHook('preClose', async () => {
     closing = true;
     const terminalProcessSessions = process.platform === 'win32'
       ? []
       : [...terminalSessions.values()].map((session) => session.terminal.pid).filter((pid) => pid > 0);
-    const processSessionIds = [...new Set([...commandProcessSessions, ...terminalProcessSessions])];
+    const processSessionIds = [...new Set([...processActivityLeases.keys(), ...terminalProcessSessions])];
     const processGroupIds = [...new Set([...processSessionIds, ...processGroupsForSessions(processSessionIds)])];
     for (const session of terminalSessions.values()) disposeTerminalSession(terminalSessions, session, true);
-    if (commandGroupSweepTimer) clearInterval(commandGroupSweepTimer);
+    clearInterval(processActivitySweepTimer);
     for (const processGroupId of processGroupIds) signalProcessGroup(processGroupId, 'SIGTERM');
     for (const child of commandChildren) if (process.platform === 'win32') signalCommandChild(child, 'SIGTERM');
     await waitForCommandProcesses(processGroupIds, commandChildren, 1_000);
@@ -103,7 +107,8 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
     for (const processGroupId of remainingProcessGroupIds) if (processGroupExists(processGroupId)) signalProcessGroup(processGroupId, 'SIGKILL');
     for (const child of commandChildren) if (process.platform === 'win32') signalCommandChild(child, 'SIGKILL');
     await waitForCommandProcesses(remainingProcessGroupIds, commandChildren, 250);
-    commandProcessSessions.clear();
+    for (const lease of processActivityLeases.values()) lease?.release();
+    processActivityLeases.clear();
     commandChildren.clear();
   });
 
@@ -116,7 +121,8 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
     try {
       const project = registry.get(request.params.projectId);
       const cwd = resolveWithin(project.path, request.body?.cwd ?? '.');
-      const options = {
+      const workspaceLease = options.workspaceLifecycle?.acquireActivity(project.path);
+      const commandOptions = {
         cwd,
         shell: resolveShell(),
         timeout: 120_000,
@@ -126,7 +132,7 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
       };
 
       try {
-        const { stdout, stderr } = await executeTrackedCommand(commandChildren, commandProcessSessions, command, options);
+        const { stdout, stderr } = await executeTrackedCommand(commandChildren, processActivityLeases, command, commandOptions, workspaceLease);
         return { stdout, stderr, exitCode: 0, cwd };
       } catch (error) {
         const failed = error as Error & { stdout?: string; stderr?: string; code?: number | string; signal?: string };
@@ -141,7 +147,7 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
         clearProjectFileCaches(project.id);
       }
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Command failed' });
+      return reply.code(error instanceof WorkspaceLifecycleConflictError ? error.statusCode : 400).send({ error: error instanceof Error ? error.message : 'Command failed' });
     }
   });
 
@@ -153,8 +159,16 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
       return;
     }
 
+    let registrationLease: WorkspaceLifecycleLease | undefined;
+    let projectLease: WorkspaceLifecycleLease | undefined;
     try {
+      const blockedReason = registry.blockReason?.(request.params.projectId);
+      if (blockedReason) throw new WorkspaceLifecycleConflictError('WORKSPACE_DELETING', blockedReason);
+      if (request.query.projectPath) registrationLease = options.workspaceLifecycle?.acquireActivity(request.query.projectPath);
       const project = registry.getOrAdd(request.params.projectId, request.query.projectPath, { hidden: true });
+      projectLease = options.workspaceLifecycle?.acquireActivity(project.path);
+      registrationLease?.release();
+      registrationLease = undefined;
       const cwd = resolveWithin(project.path, request.query.cwd ?? '.');
       const shell = resolveShell();
       const terminalId = normalizeTerminalId(request.query.terminalId);
@@ -164,12 +178,23 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
       let session = terminalSessions.get(key);
       if (!session) {
         session = createTerminalSession(terminalSessions, key, terminalId, project.id, cwd, shell, cols, rows);
+        if (session.terminal.pid > 0) {
+          processActivityLeases.get(session.terminal.pid)?.release();
+          processActivityLeases.set(session.terminal.pid, projectLease);
+        } else session.workspaceLease = projectLease;
+        projectLease = undefined;
         terminalSessions.set(key, session);
       }
       attachTerminalSocket(terminalSessions, session, socket, cols, rows);
     } catch (error) {
+      registrationLease?.release();
+      projectLease?.release();
       sendTerminalMessage(socket, { type: 'error', message: error instanceof Error ? error.message : 'Could not start terminal' });
       socket.close();
+      return;
+    } finally {
+      registrationLease?.release();
+      projectLease?.release();
     }
   });
 }
@@ -440,6 +465,8 @@ function disposeTerminalSession(sessions: Map<string, TerminalSession>, session:
   session.dataDisposable = undefined;
   session.exitDisposable = undefined;
   sessions.delete(session.key);
+  session.workspaceLease?.release();
+  session.workspaceLease = undefined;
   if (!kill) return;
   if (process.platform !== 'win32' && session.terminal.pid > 0) signalProcessGroup(session.terminal.pid, 'SIGTERM');
   try {
@@ -475,6 +502,16 @@ export function processGroupsForSessions(sessionIds: number[]) {
   }
 }
 
+function processSessionActive(sessionId: number) {
+  if (process.platform !== 'win32') return processGroupExists(sessionId) || Boolean(processGroupsForSessions([sessionId]).length);
+  try {
+    process.kill(sessionId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 export function processGroupExists(processGroupId: number) {
   if (process.platform === 'win32') return false;
   try {
@@ -500,18 +537,35 @@ async function waitForCommandProcesses(processGroupIds: number[], children: Set<
   }
 }
 
-function executeTrackedCommand(children: Set<ChildProcess>, processSessions: Set<number>, command: string, options: Parameters<typeof exec>[1]) {
+function executeTrackedCommand(
+  children: Set<ChildProcess>,
+  processActivityLeases: Map<number, WorkspaceLifecycleLease | undefined>,
+  command: string,
+  options: Parameters<typeof exec>[1],
+  workspaceLease?: WorkspaceLifecycleLease,
+) {
   return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    const child = exec(command, options, (error, stdout, stderr) => {
-      children.delete(child);
-      if (error) {
-        Object.assign(error, { stdout: String(stdout), stderr: String(stderr) });
-        reject(error);
-      } else resolve({ stdout: String(stdout), stderr: String(stderr) });
-    });
-    children.add(child);
-    if (process.platform !== 'win32' && child.pid) processSessions.add(child.pid);
-    child.once('exit', () => children.delete(child));
+    let trackedByProcess = false;
+    try {
+      const child = exec(command, options, (error, stdout, stderr) => {
+        children.delete(child);
+        if (!trackedByProcess) workspaceLease?.release();
+        if (error) {
+          Object.assign(error, { stdout: String(stdout), stderr: String(stderr) });
+          reject(error);
+        } else resolve({ stdout: String(stdout), stderr: String(stderr) });
+      });
+      children.add(child);
+      if (child.pid) {
+        trackedByProcess = true;
+        processActivityLeases.get(child.pid)?.release();
+        processActivityLeases.set(child.pid, workspaceLease);
+      }
+      child.once('exit', () => children.delete(child));
+    } catch (error) {
+      workspaceLease?.release();
+      reject(error);
+    }
   });
 }
 

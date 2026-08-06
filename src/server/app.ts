@@ -17,6 +17,7 @@ import { registerSettingsRoutes } from './settings.js';
 import { registerTerminalRoutes } from './terminal.js';
 import type { ServerOptions } from './types.js';
 import { basePathWithTrailingSlash } from './util.js';
+import { registerWorkspaceActivityHooks, WorkspaceLifecycleCoordinator } from './workspaceLifecycle.js';
 
 export async function buildApp(options: ServerOptions) {
   const logMode = options.logMode ?? 'quiet';
@@ -27,7 +28,8 @@ export async function buildApp(options: ServerOptions) {
     rewriteUrl: options.basePath === '/' ? undefined : (request) => stripBasePathFromUrl(request.url ?? '/', options.basePath),
   });
   const registry = new ProjectRegistry(options.workspace);
-  const bridge = new PiBridge();
+  const workspaceLifecycle = new WorkspaceLifecycleCoordinator();
+  const bridge = new PiBridge({ workspaceLifecycle });
   let closing = false;
   let bridgeDisposal: Promise<void> | undefined;
   app.addHook('preClose', async () => {
@@ -42,14 +44,18 @@ export async function buildApp(options: ServerOptions) {
   app.get('/healthz', async () => ({ ok: true }));
 
   await registerAuth(app, options.password, options.basePath);
-  await registerProjectRoutes(app, registry);
+  registerWorkspaceActivityHooks(app, registry, workspaceLifecycle);
+  await registerProjectRoutes(app, registry, {
+    workspaceLifecycle,
+    beforeWorkspaceDelete: (worktreePath, projectPaths) => bridge.disposeWorkspaceScope(worktreePath, projectPaths),
+  });
   await registerSessionRoutes(app, registry, bridge);
   await registerReviewThreadRoutes(app, registry);
   await registerSettingsRoutes(app, registry);
-  await registerFileRoutes(app, registry, bridge);
+  await registerFileRoutes(app, registry, bridge, workspaceLifecycle);
   await registerGitRoutes(app, registry);
-  await registerTerminalRoutes(app, registry, { isClosing: () => closing });
-  await registerPiRoutes(app, registry, bridge);
+  await registerTerminalRoutes(app, registry, { isClosing: () => closing, workspaceLifecycle });
+  await registerPiRoutes(app, registry, bridge, workspaceLifecycle);
 
   if (!options.dev) {
     const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');

@@ -1,15 +1,39 @@
 import type { FastifyInstance } from 'fastify';
 import { execFile } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { Project, ProjectWorkspace } from './types.js';
 import { assertDirectory, projectId, resolveWithin, safeProjectName } from './util.js';
+import { workspaceLifecycleKey, WorkspaceLifecycleConflictError, type WorkspaceLifecycleCoordinator } from './workspaceLifecycle.js';
 
 type ProjectMetadataUpdate = { color?: string | null; image?: string | null };
+type ProjectRouteOptions = {
+  workspaceLifecycle?: WorkspaceLifecycleCoordinator;
+  worktreeRoot?: string;
+  beforeWorkspaceDelete?: (worktreePath: string, projectPaths: string[]) => Promise<void>;
+  platform?: NodeJS.Platform;
+};
+type WorktreeEntry = { path?: string; branch?: string; locked?: boolean; prunable?: boolean };
+type OpenFilesystemIdentity = {
+  handle: { close: () => Promise<void> };
+  dev: bigint;
+  ino: bigint;
+  kind: 'directory' | 'file' | 'other';
+};
+type WorktreeFilesystemIdentity = {
+  root?: OpenFilesystemIdentity;
+  administrationPath?: string;
+  administration?: OpenFilesystemIdentity;
+};
+
+class WorkspaceDeletionConflictError extends Error {
+  readonly statusCode = 409;
+}
 
 const PROJECT_COLOR_IDS = new Set([
   'slate', 'gray', 'zinc', 'neutral', 'stone', 'red', 'orange', 'amber', 'yellow', 'lime', 'green', 'emerald', 'teal', 'cyan', 'sky', 'blue', 'indigo', 'violet', 'purple', 'fuchsia', 'pink', 'rose',
@@ -21,6 +45,8 @@ const execFileAsync = promisify(execFile);
 
 export class ProjectRegistry {
   private readonly projects = new Map<string, Project>();
+  private readonly blockedProjects = new Map<string, string>();
+  private readonly managedWorktreeRoots = new Set<string>();
 
   constructor(initialWorkspace?: string) {
     if (initialWorkspace) this.add(initialWorkspace);
@@ -31,7 +57,10 @@ export class ProjectRegistry {
   }
 
   add(projectPath: string, options?: { hidden?: boolean }) {
-    const resolved = assertDirectory(projectPath);
+    const resolved = assertDirectory(path.resolve(projectPath));
+    if ([...this.managedWorktreeRoots].some((worktreeRoot) => isManagedDeletionQuarantineProjectPath(resolved, worktreeRoot))) {
+      throw new Error('This path resolves into a preserved workspace deletion quarantine and is available only for manual recovery.');
+    }
     const id = projectId(resolved);
     const existing = this.projects.get(id);
     const project: Project = {
@@ -43,6 +72,13 @@ export class ProjectRegistry {
     };
     this.projects.set(project.id, project);
     return project;
+  }
+
+  addManagedWorktreeRoot(worktreeRoot: string) {
+    this.managedWorktreeRoots.add(path.resolve(worktreeRoot));
+    if ([...this.projects.values()].some((project) => isManagedDeletionQuarantineProjectPath(project.path, worktreeRoot))) {
+      throw new Error('A configured project resolves into a preserved workspace deletion quarantine and is available only for manual recovery.');
+    }
   }
 
   get(id: string) {
@@ -74,18 +110,47 @@ export class ProjectRegistry {
   remove(id: string) {
     const project = this.get(id);
     this.projects.delete(id);
+    this.blockedProjects.delete(id);
     return project;
+  }
+
+  blockReason(id: string) {
+    return this.blockedProjects.get(id);
+  }
+
+  blockWithin(rootPath: string, reason: string) {
+    for (const id of this.idsWithin(rootPath)) this.blockedProjects.set(id, reason);
+  }
+
+  projectsWithin(rootPath: string) {
+    const rootKey = workspaceLifecycleKey(rootPath);
+    const rootLexical = lexicalPath(rootPath);
+    return [...this.projects.values()]
+      .filter((project) => pathContains(rootKey, workspaceLifecycleKey(project.path)) || pathContains(rootLexical, lexicalPath(project.path)));
+  }
+
+  idsWithin(rootPath: string) {
+    return this.projectsWithin(rootPath).map((project) => project.id);
+  }
+
+  removeIds(ids: Iterable<string>) {
+    for (const id of ids) {
+      this.projects.delete(id);
+      this.blockedProjects.delete(id);
+    }
   }
 }
 
-export async function registerProjectRoutes(app: FastifyInstance, registry: ProjectRegistry) {
+export async function registerProjectRoutes(app: FastifyInstance, registry: ProjectRegistry, options: ProjectRouteOptions = {}) {
+  const worktreeRoot = options.worktreeRoot ?? WORKTREE_ROOT;
+  registry.addManagedWorktreeRoot(worktreeRoot);
   app.get('/api/projects', async () => ({ projects: registry.list() }));
 
   app.get<{ Querystring: { query?: string } }>('/api/projects/folders', async (request) => ({ folders: await findFolders(request.query.query ?? '') }));
 
   app.get<{ Params: { projectId: string } }>('/api/projects/:projectId/workspaces', async (request, reply) => {
     try {
-      return { workspaces: await listProjectWorkspaces(registry, registry.get(request.params.projectId)) };
+      return { workspaces: await listProjectWorkspaces(registry, registry.get(request.params.projectId), worktreeRoot, options.workspaceLifecycle) };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not list workspaces' });
     }
@@ -93,27 +158,49 @@ export async function registerProjectRoutes(app: FastifyInstance, registry: Proj
 
   app.post<{ Params: { projectId: string }; Body: { name?: string } }>('/api/projects/:projectId/workspaces', async (request, reply) => {
     try {
-      return { workspace: await createProjectWorkspace(registry, registry.get(request.params.projectId), request.body?.name) };
+      return { workspace: await createProjectWorkspace(registry, registry.get(request.params.projectId), request.body?.name, worktreeRoot) };
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not create workspace' });
     }
   });
 
-  app.delete<{ Params: { projectId: string; workspaceId: string }; Querystring: { force?: string } }>('/api/projects/:projectId/workspaces/:workspaceId', async (request, reply) => {
+  app.get<{ Params: { projectId: string; workspaceId: string } }>('/api/projects/:projectId/workspaces/:workspaceId/deletion-scope', async (request, reply) => {
     try {
-      await deleteProjectWorkspace(registry, registry.get(request.params.projectId), request.params.workspaceId, { force: request.query.force === 'true' });
+      return await projectWorkspaceDeletionScope(registry, registry.get(request.params.projectId), request.params.workspaceId, worktreeRoot);
+    } catch (error) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not resolve workspace deletion scope' });
+    }
+  });
+
+  app.delete<{ Params: { projectId: string; workspaceId: string }; Querystring: { force?: string; scope?: string } }>('/api/projects/:projectId/workspaces/:workspaceId', async (request, reply) => {
+    try {
+      await deleteProjectWorkspace(registry, registry.get(request.params.projectId), request.params.workspaceId, {
+        force: request.query.force === 'true',
+        workspaceLifecycle: options.workspaceLifecycle,
+        worktreeRoot,
+        beforeWorkspaceDelete: options.beforeWorkspaceDelete,
+        platform: options.platform ?? process.platform,
+        expectedScope: request.query.scope,
+      });
       return { ok: true };
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not delete workspace' });
+      const statusCode = error instanceof WorkspaceLifecycleConflictError || error instanceof WorkspaceDeletionConflictError ? error.statusCode : 400;
+      return reply.code(statusCode).send({ error: error instanceof Error ? error.message : 'Could not delete workspace' });
     }
   });
 
   app.post<{ Body: { path: string } }>('/api/projects', async (request, reply) => {
     if (!request.body?.path) return reply.code(400).send({ error: 'Missing path' });
+    const projectPath = expandHome(request.body.path, homedir());
+    let workspaceLease;
     try {
-      return { project: registry.add(expandHome(request.body.path, homedir())) };
+      workspaceLease = options.workspaceLifecycle?.acquireActivity(projectPath);
+      return { project: registry.add(projectPath) };
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Invalid project' });
+      const statusCode = error instanceof WorkspaceLifecycleConflictError ? error.statusCode : 400;
+      return reply.code(statusCode).send({ error: error instanceof Error ? error.message : 'Invalid project' });
+    } finally {
+      workspaceLease?.release();
     }
   });
 
@@ -143,7 +230,12 @@ export async function registerProjectRoutes(app: FastifyInstance, registry: Proj
   });
 }
 
-async function listProjectWorkspaces(registry: ProjectRegistry, project: Project): Promise<ProjectWorkspace[]> {
+async function listProjectWorkspaces(
+  registry: ProjectRegistry,
+  project: Project,
+  worktreeRoot: string,
+  workspaceLifecycle?: WorkspaceLifecycleCoordinator,
+): Promise<ProjectWorkspace[]> {
   const context = await gitWorkspaceContext(project.path);
   const entries = parseWorktreeList((await runGit(context.repoRoot, ['worktree', 'list', '--porcelain'])).stdout);
   const localBranch = (await runGit(project.path, ['branch', '--show-current']).catch(() => ({ stdout: '' }))).stdout.trim();
@@ -161,7 +253,9 @@ async function listProjectWorkspaces(registry: ProjectRegistry, project: Project
     if (!entry.path) continue;
     if (samePath(entry.path, context.repoRoot)) continue;
     const workspacePath = path.join(entry.path, context.relativeProjectPath);
-    if (!isDirectory(workspacePath)) continue;
+    if (!isDirectory(workspacePath)
+      || isManagedDeletionQuarantinePath(entry.path, worktreeRoot)
+      || workspaceLifecycle?.isDeleting(workspacePath)) continue;
     const workspaceProject = registry.add(workspacePath, { hidden: true });
     const branch = normalizeBranch(entry.branch);
     workspaces.push({
@@ -171,16 +265,16 @@ async function listProjectWorkspaces(registry: ProjectRegistry, project: Project
       path: workspacePath,
       branch,
       local: false,
-      removable: isManagedWorktreePath(project.id, entry.path),
+      removable: isManagedWorktreePath(project.id, entry.path, worktreeRoot),
     });
   }
 
   return workspaces;
 }
 
-async function createProjectWorkspace(registry: ProjectRegistry, project: Project, name?: string): Promise<ProjectWorkspace> {
+async function createProjectWorkspace(registry: ProjectRegistry, project: Project, name: string | undefined, worktreeRoot: string): Promise<ProjectWorkspace> {
   const context = await gitWorkspaceContext(project.path);
-  const info = await nextWorktreeInfo(project.id, context.repoRoot, name);
+  const info = await nextWorktreeInfo(project.id, context.repoRoot, name, worktreeRoot);
   await mkdir(path.dirname(info.directory), { recursive: true });
 
   const created = await runGit(context.repoRoot, ['worktree', 'add', '--no-checkout', '-b', info.branch, info.directory]).catch((error) => {
@@ -215,34 +309,325 @@ async function createProjectWorkspace(registry: ProjectRegistry, project: Projec
   }
 }
 
-async function deleteProjectWorkspace(registry: ProjectRegistry, project: Project, workspaceId: string, options?: { force?: boolean }) {
+async function projectWorkspaceDeletionScope(registry: ProjectRegistry, project: Project, workspaceId: string, worktreeRoot: string) {
   if (workspaceId === project.id) throw new Error('Cannot delete the local workspace');
   const workspaceProject = registry.get(workspaceId);
   const context = await gitWorkspaceContext(project.path);
   const entries = parseWorktreeList((await runGit(context.repoRoot, ['worktree', 'list', '--porcelain'])).stdout);
-  const entry = entries.find((item) => item.path && samePath(path.join(item.path, context.relativeProjectPath), workspaceProject.path));
+  const entry = entries.find((item) => item.path && sameLexicalPath(path.join(item.path, context.relativeProjectPath), workspaceProject.path));
   const worktreePath = entry?.path ?? worktreePathFromWorkspacePath(workspaceProject.path, context.relativeProjectPath);
-  const branch = normalizeBranch(entry?.branch) ?? (entry?.path ? undefined : managedBranchFromWorktreePath(worktreePath));
-  if (!samePath(path.join(worktreePath, context.relativeProjectPath), workspaceProject.path)) throw new Error('Unknown git worktree');
-  if (!isManagedWorktreePath(project.id, worktreePath)) throw new Error('Only pi-web generated workspaces can be deleted');
-  if (entry?.path && !options?.force) await assertWorkspaceClean(workspaceProject.path);
-
-  await stopFsmonitor(worktreePath);
-  if (entry?.path) await removeGitWorktree(context.repoRoot, worktreePath);
-  await removeWorktreeDirectory(worktreePath);
-  if (branch?.startsWith(WORKTREE_BRANCH_PREFIX)) {
-    await runGit(context.repoRoot, ['branch', '-d', branch]).catch(() => undefined);
-  }
-  registry.remove(workspaceId);
+  if (!sameLexicalPath(path.join(worktreePath, context.relativeProjectPath), workspaceProject.path)) throw new Error('Unknown git worktree');
+  if (!isManagedWorktreePath(project.id, worktreePath, worktreeRoot)) throw new Error('Only pi-web generated workspaces can be deleted');
+  return workspaceDeletionScope(registry, worktreePath, workspaceId);
 }
 
-async function assertWorkspaceClean(workspacePath: string) {
-  const { stdout } = await runGit(workspacePath, ['status', '--porcelain=v1']).catch((error) => {
-    throw new Error(gitErrorMessage(error, 'Could not verify workspace status'));
+function workspaceDeletionScope(registry: ProjectRegistry, worktreePath: string, workspaceId: string) {
+  const projects = [registry.get(workspaceId), ...registry.projectsWithin(worktreePath)]
+    .filter((project, index, items) => items.findIndex((item) => item.id === project.id) === index);
+  const workspaceIds = projects.map((project) => project.id).sort();
+  const projectPaths = projects.map((project) => project.path);
+  const lockTargets = workspaceDeletionLockTargets(worktreePath, projectPaths);
+  const participants = registry.list({ includeHidden: true }).filter((project) => (
+    workspaceIds.includes(project.id)
+    || lockTargets.some(({ key }) => pathsOverlap(key, workspaceLifecycleKey(project.path)))
+  ));
+  const participantIds = participants.map((project) => project.id).sort();
+  const identity = {
+    workspaces: workspaceIds.map((id) => {
+      const project = registry.get(id);
+      return [id, lexicalPath(project.path), workspaceLifecycleKey(project.path)];
+    }),
+    participants: participantIds.map((id) => {
+      const project = registry.get(id);
+      return [id, workspaceLifecycleKey(project.path)];
+    }),
+  };
+  const scopeToken = createHash('sha256').update(JSON.stringify(identity)).digest('base64url');
+  return { workspaceIds, projectPaths, participantIds, scopeToken };
+}
+
+function workspaceDeletionLockTargets(worktreePath: string, projectPaths: string[]) {
+  const candidates = [worktreePath, ...projectPaths]
+    .map((projectPath) => ({ path: projectPath, key: workspaceLifecycleKey(projectPath) }))
+    .filter(({ key }, index, items) => items.findIndex((item) => item.key === key) === index)
+    .sort((left, right) => left.key.split(path.sep).length - right.key.split(path.sep).length || left.key.localeCompare(right.key));
+  const selected: typeof candidates = [];
+  for (const candidate of candidates) {
+    if (!selected.some(({ key }) => pathContains(key, candidate.key))) selected.push(candidate);
+  }
+  return selected;
+}
+
+function workspaceDeletionLockPaths(worktreePath: string, projectPaths: string[]) {
+  return workspaceDeletionLockTargets(worktreePath, projectPaths).map((item) => item.path);
+}
+
+async function deleteProjectWorkspace(
+  registry: ProjectRegistry,
+  project: Project,
+  workspaceId: string,
+  options: { force?: boolean; workspaceLifecycle?: WorkspaceLifecycleCoordinator; worktreeRoot: string; beforeWorkspaceDelete?: (worktreePath: string, projectPaths: string[]) => Promise<void>; platform: NodeJS.Platform; expectedScope?: string },
+) {
+  if (workspaceId === project.id) throw new Error('Cannot delete the local workspace');
+  const workspaceProject = registry.get(workspaceId);
+  if (options.platform === 'win32') {
+    throw new WorkspaceDeletionConflictError('Workspace deletion is disabled on Windows because Pi Web cannot prove that all terminal and command processes have exited. Nothing was deleted.');
+  }
+  const context = await gitWorkspaceContext(project.path);
+  const entries = parseWorktreeList((await runGit(context.repoRoot, ['worktree', 'list', '--porcelain'])).stdout);
+  const initialEntry = entries.find((item) => item.path && sameLexicalPath(path.join(item.path, context.relativeProjectPath), workspaceProject.path));
+  const worktreePath = initialEntry?.path ?? worktreePathFromWorkspacePath(workspaceProject.path, context.relativeProjectPath);
+  if (!samePath(path.join(worktreePath, context.relativeProjectPath), workspaceProject.path)) throw new Error('Unknown git worktree');
+  if (!isManagedWorktreePath(project.id, worktreePath, options.worktreeRoot)) throw new Error('Only pi-web generated workspaces can be deleted');
+  if (isDeletionQuarantinePath(worktreePath)) {
+    throw new WorkspaceDeletionConflictError('This path is a preserved workspace deletion quarantine. Nothing was deleted; recover or remove it manually.');
+  }
+  const preservedQuarantine = await findPreservedQuarantine(worktreePath);
+  if (preservedQuarantine) {
+    const message = `A previous deletion could not restore this workspace. Nothing was deleted; workspace files remain at ${preservedQuarantine} for manual recovery.`;
+    registry.blockWithin(worktreePath, message);
+    throw new WorkspaceDeletionConflictError(message);
+  }
+  if (initialEntry?.locked) throw new WorkspaceDeletionConflictError('Workspace is locked by Git. Unlock it before deleting.');
+  if (initialEntry?.prunable) throw new WorkspaceDeletionConflictError('Git reports this workspace as prunable or missing. Nothing was deleted; inspect the worktree path and run Git worktree repair or prune manually.');
+  const initialFilesystemIdentity = await captureWorktreeFilesystemIdentity(worktreePath);
+  const initialScope = workspaceDeletionScope(registry, worktreePath, workspaceId);
+  const deletionLeases: Array<{ release: () => void }> = [];
+  try {
+    if (initialEntry?.path && (!initialFilesystemIdentity.root || !initialFilesystemIdentity.administrationPath || !initialFilesystemIdentity.administration)) {
+      throw new WorkspaceDeletionConflictError('Could not verify the Git worktree identity. Nothing was deleted; repair the worktree metadata manually.');
+    }
+    for (const lockPath of workspaceDeletionLockPaths(worktreePath, initialScope.projectPaths)) {
+      const lease = options.workspaceLifecycle?.acquireDeletion(lockPath);
+      if (lease) deletionLeases.push(lease);
+    }
+    const lockedScope = workspaceDeletionScope(registry, worktreePath, workspaceId);
+    if (lockedScope.scopeToken !== initialScope.scopeToken) {
+      throw new WorkspaceDeletionConflictError('Workspace deletion scope changed while deletion was locking. Nothing was deleted; refresh the workspace list and retry.');
+    }
+    if (options.expectedScope && options.expectedScope !== lockedScope.scopeToken) {
+      throw new WorkspaceDeletionConflictError('Workspace deletion scope changed. Nothing was deleted; refresh the workspace list and retry.');
+    }
+    const projectIdsToRemove = lockedScope.workspaceIds;
+    await options.beforeWorkspaceDelete?.(worktreePath, lockedScope.projectPaths);
+    const refreshedScope = workspaceDeletionScope(registry, worktreePath, workspaceId);
+    if (refreshedScope.scopeToken !== lockedScope.scopeToken) {
+      throw new WorkspaceDeletionConflictError('Workspace deletion scope changed while deletion was preparing. Nothing was deleted; refresh the workspace list and retry.');
+    }
+    const quarantineAfterLease = await findPreservedQuarantine(worktreePath);
+    if (quarantineAfterLease) {
+      const message = `A previous deletion could not restore this workspace. Nothing was deleted; workspace files remain at ${quarantineAfterLease} for manual recovery.`;
+      registry.blockWithin(worktreePath, message);
+      throw new WorkspaceDeletionConflictError(message);
+    }
+    const refreshedEntries = parseWorktreeList((await runGit(context.repoRoot, ['worktree', 'list', '--porcelain'])).stdout);
+    const entry = refreshedEntries.find((item) => item.path && sameLexicalPath(path.join(item.path, context.relativeProjectPath), workspaceProject.path));
+    const refreshedPath = await lstat(worktreePath).catch(() => undefined);
+    const registrationChanged = Boolean(initialEntry?.path) !== Boolean(entry?.path)
+      || !await worktreeFilesystemIdentityMatches(worktreePath, initialFilesystemIdentity);
+    if (registrationChanged) {
+      throw new WorkspaceDeletionConflictError('The Git worktree identity changed while deletion was preparing. Nothing was deleted; refresh the workspace list and retry.');
+    }
+
+    if (!entry?.path) {
+      const stalePath = refreshedPath;
+      if (!stalePath) {
+        registry.removeIds(projectIdsToRemove);
+        return;
+      }
+      if (!options.force) {
+        throw new WorkspaceDeletionConflictError('Git no longer recognizes this workspace. Nothing was deleted. Force deletion is available only after Pi Web verifies the managed worktree metadata.');
+      }
+      await forceRemoveStaleManagedWorktree(context.repoRoot, worktreePath, initialFilesystemIdentity);
+      registry.removeIds(projectIdsToRemove);
+      return;
+    }
+
+    if (entry.locked || entry.prunable) {
+      throw new WorkspaceDeletionConflictError('The Git worktree state changed while deletion was preparing. Nothing was deleted; refresh the workspace list and retry.');
+    }
+    if (await hasInitializedSubmodules(worktreePath)) {
+      throw new WorkspaceDeletionConflictError('Git cannot safely move a linked worktree with initialized submodules. Nothing was deleted; deinitialize its submodules or remove the worktree manually.');
+    }
+
+    const quarantinePath = path.join(path.dirname(worktreePath), `.${path.basename(worktreePath)}.deleting-${randomUUID()}`);
+    options.workspaceLifecycle?.bindDeletionAlias(worktreePath, quarantinePath);
+    await moveGitWorktree(context.repoRoot, worktreePath, quarantinePath);
+    try {
+      await assertWorktreeFilesystemIdentity(quarantinePath, initialFilesystemIdentity);
+      if (!options.force) await assertWorkspaceClean(quarantinePath);
+      await stopFsmonitor(quarantinePath);
+      await assertWorktreeFilesystemIdentity(quarantinePath, initialFilesystemIdentity);
+      await removeGitWorktree(context.repoRoot, quarantinePath, Boolean(options.force));
+      if (existsSync(quarantinePath)) {
+        throw new Error(`Git removed the worktree registration, but files remain at ${quarantinePath}. Pi Web left them in place for manual recovery.`);
+      }
+      const branch = normalizeBranch(entry.branch);
+      if (branch?.startsWith(WORKTREE_BRANCH_PREFIX)) {
+        await runGit(context.repoRoot, ['branch', '-d', branch]).catch(() => undefined);
+      }
+      registry.removeIds([...projectIdsToRemove, ...registry.idsWithin(quarantinePath)]);
+    } catch (error) {
+      const preservedPath = await restoreMovedWorktree(context.repoRoot, quarantinePath, worktreePath);
+      if (preservedPath) {
+        const message = `${error instanceof Error ? error.message : 'Could not delete workspace'}. Workspace files were preserved at ${preservedPath}.`;
+        registry.blockWithin(worktreePath, message);
+        throw new WorkspaceDeletionConflictError(message);
+      }
+      throw error;
+    }
+  } finally {
+    for (const lease of deletionLeases.reverse()) lease.release();
+    await closeWorktreeFilesystemIdentity(initialFilesystemIdentity);
+  }
+}
+
+async function worktreeAdministrationIdentity(worktreePath: string, markerBasePath = worktreePath) {
+  const markerPath = path.join(worktreePath, '.git');
+  const marker = await lstat(markerPath).catch(() => undefined);
+  if (!marker?.isFile() || marker.isSymbolicLink()) return undefined;
+  const match = /^gitdir:\s*(.+)\s*$/i.exec((await readFile(markerPath, 'utf8').catch(() => '')).trim());
+  return match ? canonicalPath(path.resolve(markerBasePath, match[1])) : undefined;
+}
+
+function filesystemKind(stats: { isDirectory: () => boolean; isFile: () => boolean }): OpenFilesystemIdentity['kind'] {
+  if (stats.isDirectory()) return 'directory';
+  if (stats.isFile()) return 'file';
+  return 'other';
+}
+
+async function captureOpenFilesystemIdentity(filePath: string) {
+  let handle;
+  try {
+    const before = await lstat(filePath, { bigint: true });
+    handle = await open(filePath, 'r');
+    const opened = await handle.stat({ bigint: true });
+    if (before.dev !== opened.dev || before.ino !== opened.ino || filesystemKind(before) !== filesystemKind(opened)) {
+      throw new Error('Filesystem identity changed while it was being captured.');
+    }
+    return { handle, dev: before.dev, ino: before.ino, kind: filesystemKind(before) } satisfies OpenFilesystemIdentity;
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new WorkspaceDeletionConflictError(`Could not capture the workspace filesystem identity: ${error instanceof Error ? error.message : 'identity inspection failed'}. Nothing was deleted.`);
+  }
+}
+
+async function captureWorktreeFilesystemIdentity(worktreePath: string): Promise<WorktreeFilesystemIdentity> {
+  const root = await captureOpenFilesystemIdentity(worktreePath);
+  try {
+    const administrationPath = await worktreeAdministrationIdentity(worktreePath);
+    const administration = administrationPath ? await captureOpenFilesystemIdentity(administrationPath) : undefined;
+    return { root, administrationPath, administration };
+  } catch (error) {
+    await root?.handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function openFilesystemIdentityMatches(filePath: string, identity: OpenFilesystemIdentity | undefined) {
+  const current = await lstat(filePath, { bigint: true }).catch(() => undefined);
+  if (!identity) return !current;
+  return Boolean(current)
+    && current!.dev === identity.dev
+    && current!.ino === identity.ino
+    && filesystemKind(current!) === identity.kind;
+}
+
+async function worktreeFilesystemIdentityMatches(worktreePath: string, identity: WorktreeFilesystemIdentity, markerBasePath = worktreePath) {
+  if (!await openFilesystemIdentityMatches(worktreePath, identity.root)) return false;
+  const administrationPath = await worktreeAdministrationIdentity(worktreePath, markerBasePath);
+  if (administrationPath !== identity.administrationPath) return false;
+  return administrationPath
+    ? openFilesystemIdentityMatches(administrationPath, identity.administration)
+    : !identity.administration;
+}
+
+async function assertWorktreeFilesystemIdentity(worktreePath: string, identity: WorktreeFilesystemIdentity, markerBasePath = worktreePath) {
+  if (!await worktreeFilesystemIdentityMatches(worktreePath, identity, markerBasePath)) {
+    throw new WorkspaceDeletionConflictError('The Git worktree identity changed during deletion isolation. Nothing was deleted; workspace files were preserved for recovery.');
+  }
+}
+
+async function closeWorktreeFilesystemIdentity(identity: WorktreeFilesystemIdentity) {
+  await Promise.allSettled([identity.root?.handle.close(), identity.administration?.handle.close()].filter((task): task is Promise<void> => Boolean(task)));
+}
+
+async function hasInitializedSubmodules(worktreePath: string) {
+  const { stdout } = await runGit(worktreePath, ['submodule', 'status', '--recursive']).catch((error) => {
+    throw new WorkspaceDeletionConflictError(`Could not verify workspace submodules: ${gitErrorMessage(error, 'Git submodule status failed')}`);
   });
-  const changeCount = stdout.split('\n').filter(Boolean).length;
-  if (changeCount) {
-    throw new Error(`Workspace has ${changeCount} uncommitted ${changeCount === 1 ? 'change' : 'changes'}. Review them or force delete the workspace to discard them.`);
+  return stdout.split(/\r?\n/).some((line) => line.length > 0 && !line.startsWith('-'));
+}
+
+async function assertWorkspaceClean(worktreePath: string) {
+  const { stdout } = await runGit(worktreePath, [
+    '-c', 'status.showUntrackedFiles=all',
+    '-c', 'core.fsmonitor=false',
+    'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--ignore-submodules=none',
+  ]).catch((error) => {
+    throw new WorkspaceDeletionConflictError(`Could not verify all workspace files: ${gitErrorMessage(error, 'Git status failed')}`);
+  });
+  if (stdout.length) {
+    throw new WorkspaceDeletionConflictError('Workspace contains uncommitted changes, untracked files, or ignored local files. Review them or force delete the workspace to permanently discard them.');
+  }
+  const { stdout: indexEntries } = await runGit(worktreePath, ['ls-files', '-v', '-z']).catch((error) => {
+    throw new WorkspaceDeletionConflictError(`Could not verify all workspace files: ${gitErrorMessage(error, 'Git index inspection failed')}`);
+  });
+  if (indexEntries.split('\0').some((entry) => entry && (/^[a-z]$/.test(entry[0]) || entry[0] === 'S'))) {
+    throw new WorkspaceDeletionConflictError('Workspace has tracked files hidden by Git index flags such as assume-unchanged or skip-worktree. Review them or force delete the workspace to permanently discard local changes.');
+  }
+}
+
+async function assertStaleManagedWorktreeProvenance(repoRoot: string, quarantinedPath: string, originalWorktreePath: string) {
+  const directory = await lstat(quarantinedPath).catch(() => undefined);
+  const markerPath = path.join(quarantinedPath, '.git');
+  const marker = await lstat(markerPath).catch(() => undefined);
+  if (!directory?.isDirectory() || directory.isSymbolicLink() || !marker?.isFile() || marker.isSymbolicLink()) {
+    throw new WorkspaceDeletionConflictError('Pi Web could not verify the stale workspace directory. Nothing was deleted; remove it manually after reviewing the path.');
+  }
+  const match = /^gitdir:\s*(.+)\s*$/i.exec((await readFile(markerPath, 'utf8')).trim());
+  const commonGitOutput = await runGit(repoRoot, ['rev-parse', '--git-common-dir']).catch((error) => {
+    throw new Error(gitErrorMessage(error, 'Could not verify the Git repository'));
+  });
+  const commonGitDirectory = path.resolve(repoRoot, commonGitOutput.stdout.trim());
+  const administrationDirectory = match ? path.resolve(originalWorktreePath, match[1]) : '';
+  if (!match || !pathIsWithin(path.join(commonGitDirectory, 'worktrees'), administrationDirectory)) {
+    throw new WorkspaceDeletionConflictError('Pi Web could not verify the stale workspace Git metadata. Nothing was deleted; remove it manually after reviewing the path.');
+  }
+  const administration = await lstat(administrationDirectory).catch(() => undefined);
+  if (administration?.isDirectory()) {
+    const backpointer = await readFile(path.join(administrationDirectory, 'gitdir'), 'utf8').catch(() => '');
+    if (!sameLexicalPath(path.resolve(administrationDirectory, backpointer.trim()), path.join(originalWorktreePath, '.git'))) {
+      throw new WorkspaceDeletionConflictError('Pi Web could not verify the stale workspace Git backpointer. Nothing was deleted; remove it manually after reviewing the path.');
+    }
+  }
+  return canonicalPath(administrationDirectory);
+}
+
+async function forceRemoveStaleManagedWorktree(repoRoot: string, worktreePath: string, expectedIdentity: WorktreeFilesystemIdentity) {
+  const quarantinePath = path.join(path.dirname(worktreePath), `.${path.basename(worktreePath)}.deleting-${randomUUID()}`);
+  await rename(worktreePath, quarantinePath);
+  try {
+    await assertWorktreeFilesystemIdentity(quarantinePath, expectedIdentity, worktreePath);
+    const administrationIdentity = await assertStaleManagedWorktreeProvenance(repoRoot, quarantinePath, worktreePath);
+    if (!expectedIdentity.administrationPath || administrationIdentity !== expectedIdentity.administrationPath) {
+      throw new WorkspaceDeletionConflictError('The stale Git worktree identity changed while deletion was preparing. Nothing was deleted.');
+    }
+  } catch (error) {
+    if (!await lstat(worktreePath).catch(() => undefined)) {
+      await rename(quarantinePath, worktreePath).catch(() => undefined);
+    }
+    if (await lstat(quarantinePath).catch(() => undefined)) {
+      throw new WorkspaceDeletionConflictError(`${error instanceof Error ? error.message : 'Pi Web could not verify the stale workspace.'} The selected directory was preserved at ${quarantinePath}.`);
+    }
+    throw error;
+  }
+  try {
+    await assertWorktreeFilesystemIdentity(quarantinePath, expectedIdentity, worktreePath);
+    await removeWorktreeDirectory(quarantinePath);
+  } catch (error) {
+    throw new Error(`${gitErrorMessage(error, 'Could not remove stale workspace')}. The workspace was moved to ${quarantinePath} for recovery.`);
   }
 }
 
@@ -256,12 +641,12 @@ async function gitWorkspaceContext(projectPath: string) {
   return { repoRoot, relativeProjectPath };
 }
 
-async function nextWorktreeInfo(projectIdValue: string, repoRoot: string, name?: string) {
+async function nextWorktreeInfo(projectIdValue: string, repoRoot: string, name: string | undefined, worktreeRoot: string) {
   const base = slugify(name || `workspace-${Date.now().toString(36)}`) || `workspace-${Date.now().toString(36)}`;
   for (let index = 0; index < 50; index += 1) {
     const slug = index === 0 ? base : `${base}-${index + 1}`;
     const branch = `${WORKTREE_BRANCH_PREFIX}${slug}`;
-    const directory = path.join(WORKTREE_ROOT, projectIdValue, slug);
+    const directory = path.join(worktreeRoot, projectIdValue, slug);
     if (existsSync(directory)) continue;
     const branchExists = await runGit(repoRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]).then(() => true).catch(() => false);
     if (!branchExists) return { branch, directory };
@@ -270,7 +655,7 @@ async function nextWorktreeInfo(projectIdValue: string, repoRoot: string, name?:
 }
 
 function parseWorktreeList(text: string) {
-  return text.split('\n').reduce<Array<{ path?: string; branch?: string }>>((items, line) => {
+  return text.split('\n').reduce<WorktreeEntry[]>((items, line) => {
     const trimmed = line.trim();
     if (!trimmed) return items;
     if (trimmed.startsWith('worktree ')) {
@@ -279,6 +664,8 @@ function parseWorktreeList(text: string) {
     }
     const current = items[items.length - 1];
     if (current && trimmed.startsWith('branch ')) current.branch = trimmed.slice('branch '.length).trim();
+    if (current && (trimmed === 'locked' || trimmed.startsWith('locked '))) current.locked = true;
+    if (current && (trimmed === 'prunable' || trimmed.startsWith('prunable '))) current.prunable = true;
     return items;
   }, []);
 }
@@ -298,17 +685,46 @@ function worktreePathFromWorkspacePath(workspacePath: string, relativeProjectPat
   return path.resolve(workspacePath, ...Array(depth).fill('..'));
 }
 
-function managedBranchFromWorktreePath(worktreePath: string) {
-  const name = path.basename(worktreePath);
-  return name ? `${WORKTREE_BRANCH_PREFIX}${name}` : undefined;
-}
-
 async function stopFsmonitor(worktreePath: string) {
   if (isDirectory(worktreePath)) await runGit(worktreePath, ['fsmonitor--daemon', 'stop']).catch(() => undefined);
 }
 
-async function removeGitWorktree(repoRoot: string, worktreePath: string) {
-  await runGit(repoRoot, ['worktree', 'remove', '--force', worktreePath]).catch(async (error) => {
+function isDeletionQuarantinePath(worktreePath: string) {
+  const name = path.basename(worktreePath);
+  return name.startsWith('.') && name.includes('.deleting-');
+}
+
+async function findPreservedQuarantine(worktreePath: string) {
+  const prefix = `.${path.basename(worktreePath)}.deleting-`;
+  const entries = await readdir(path.dirname(worktreePath), { withFileTypes: true }).catch((error) => {
+    throw new WorkspaceDeletionConflictError(`Could not inspect the managed workspace directory for preserved recovery data: ${error instanceof Error ? error.message : 'directory inspection failed'}. Nothing was deleted.`);
+  });
+  const match = entries.find((candidate) => candidate.name.startsWith(prefix) && isDeletionQuarantinePath(candidate.name));
+  return match ? path.join(path.dirname(worktreePath), match.name) : undefined;
+}
+
+async function moveGitWorktree(repoRoot: string, worktreePath: string, quarantinePath: string) {
+  await runGit(repoRoot, ['worktree', 'move', worktreePath, quarantinePath]).catch((error) => {
+    throw new WorkspaceDeletionConflictError(`Could not safely isolate the workspace before deletion: ${gitErrorMessage(error, 'Git worktree move failed')}`);
+  });
+}
+
+async function restoreMovedWorktree(repoRoot: string, quarantinePath: string, worktreePath: string) {
+  if (!await lstat(quarantinePath).catch(() => undefined)) return undefined;
+  if (await lstat(worktreePath).catch(() => undefined)) return quarantinePath;
+  try {
+    await runGit(repoRoot, ['worktree', 'move', quarantinePath, worktreePath]);
+    return undefined;
+  } catch {
+    return quarantinePath;
+  }
+}
+
+async function removeGitWorktree(repoRoot: string, worktreePath: string, force: boolean) {
+  const args = ['worktree', 'remove'];
+  if (force) args.push('--force');
+  args.push(worktreePath);
+  await runGit(repoRoot, args).catch(async (error) => {
     const { stdout } = await runGit(repoRoot, ['worktree', 'list', '--porcelain']).catch((listError) => {
       throw new Error(gitErrorMessage(listError, gitErrorMessage(error, 'Failed to remove git worktree')));
     });
@@ -330,10 +746,50 @@ async function removeWorktreeDirectory(worktreePath: string) {
   }
 }
 
-function isManagedWorktreePath(projectIdValue: string, worktreePath: string) {
-  const root = canonicalPath(path.join(WORKTREE_ROOT, projectIdValue));
+function isManagedWorktreePath(projectIdValue: string, worktreePath: string, worktreeRoot: string) {
+  const root = canonicalPath(path.join(worktreeRoot, projectIdValue));
   const target = canonicalPath(worktreePath);
-  return target !== root && target.startsWith(`${root}${path.sep}`);
+  return path.dirname(target) === root;
+}
+
+function isManagedDeletionQuarantinePath(worktreePath: string, worktreeRoot: string) {
+  return isManagedDeletionQuarantineProjectPath(worktreePath, worktreeRoot);
+}
+
+function isManagedDeletionQuarantineProjectPath(projectPath: string, worktreeRoot: string) {
+  return pathContainsManagedDeletionQuarantine(lexicalPath(projectPath), lexicalPath(worktreeRoot))
+    || pathContainsManagedDeletionQuarantine(canonicalPath(projectPath), canonicalPath(worktreeRoot));
+}
+
+function pathContainsManagedDeletionQuarantine(projectPath: string, worktreeRoot: string) {
+  const relative = path.relative(worktreeRoot, projectPath);
+  if (relative === '' || relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)) return false;
+  const segments = relative.split(path.sep);
+  return segments.length >= 2 && isDeletionQuarantinePath(segments[1]);
+}
+
+function pathsOverlap(first: string, second: string) {
+  return pathContains(first, second) || pathContains(second, first);
+}
+
+function pathContains(parent: string, candidate: string) {
+  const relative = path.relative(parent, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function lexicalPath(filePath: string) {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function sameLexicalPath(left: string, right: string) {
+  return lexicalPath(left) === lexicalPath(right);
+}
+
+function pathIsWithin(root: string, target: string) {
+  const normalizedRoot = process.platform === 'win32' ? path.resolve(root).toLowerCase() : path.resolve(root);
+  const normalizedTarget = process.platform === 'win32' ? path.resolve(target).toLowerCase() : path.resolve(target);
+  return normalizedTarget !== normalizedRoot && normalizedTarget.startsWith(`${normalizedRoot}${path.sep}`);
 }
 
 function isDirectory(value: string) {

@@ -360,6 +360,10 @@ async function readFirstLine(filePath: string) {
   }
 }
 
+type SessionRouteOptions = {
+  cleanupOrphanedResources?: (projectPath: string) => Promise<void>;
+};
+
 type SessionRouteBridge = {
   lockSessionDeletion(projectPath: string, sessionId: string, filePath?: string): Promise<(() => void) | undefined>;
   lockSessionMutation(projectPath: string, sessionId: string, filePath?: string): Promise<(() => void) | undefined>;
@@ -367,17 +371,17 @@ type SessionRouteBridge = {
   renameSession(projectPath: string, sessionId: string, name: string, filePath?: string): Promise<SessionDetail | undefined>;
 };
 
-export async function registerSessionRoutes(app: FastifyInstance, registry: ProjectRegistry, bridge?: SessionRouteBridge) {
+export async function registerSessionRoutes(app: FastifyInstance, registry: ProjectRegistry, bridge?: SessionRouteBridge, options: SessionRouteOptions = {}) {
   app.get<{ Params: { projectId: string }; Querystring: { cursor?: string; limit?: string } }>('/api/projects/:projectId/sessions', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
       if (!request.query.cursor && !request.query.limit) {
         const sessions = await listSessions(project.id, project.path);
-        maybeCleanupOrphanedSessionResources(project.path, request.log);
+        await maybeCleanupOrphanedSessionResources(project.path, request.log, options.cleanupOrphanedResources);
         return { sessions };
       }
       const page = await listSessionPage(project.id, project.path, request.query);
-      maybeCleanupOrphanedSessionResources(project.path, request.log);
+      await maybeCleanupOrphanedSessionResources(project.path, request.log, options.cleanupOrphanedResources);
       return page;
     } catch (error) {
       return reply.code(404).send({ error: error instanceof Error ? error.message : 'Unknown project' });
@@ -516,15 +520,23 @@ export async function registerSessionRoutes(app: FastifyInstance, registry: Proj
   });
 }
 
-function maybeCleanupOrphanedSessionResources(projectPath: string, log: { warn: (...args: any[]) => void }) {
+async function maybeCleanupOrphanedSessionResources(
+  projectPath: string,
+  log: { warn: (...args: any[]) => void },
+  cleanup = cleanupOrphanedSessionResources,
+) {
   const now = Date.now();
   const lastCleanup = sessionResourceCleanupTimes.get(projectPath) ?? 0;
   if (now - lastCleanup < SESSION_UPLOAD_CLEANUP_INTERVAL_MS) return;
   sessionResourceCleanupTimes.set(projectPath, now);
-  void Promise.all([
+  await cleanup(projectPath).catch((error) => log.warn({ err: error }, 'Could not clean up orphaned session resources'));
+}
+
+async function cleanupOrphanedSessionResources(projectPath: string) {
+  await Promise.all([
     currentSessionUploadIds(projectPath).then((ids) => cleanupOrphanedSessionUploads(projectPath, ids)),
     currentSessionUuids(projectPath).then((uuids) => cleanupOrphanedSessionReviewThreads(projectPath, uuids)),
-  ]).catch((error) => log.warn({ err: error }, 'Could not clean up orphaned session resources'));
+  ]);
 }
 
 async function listSessionFiles(dir: string): Promise<SessionFileInfo[]> {

@@ -13,6 +13,7 @@ import { resolveSessionFile } from './sessions.js';
 import { registerTextSearchRoute } from './textSearch.js';
 import { projectUploadRoot, sessionUploadRoot } from './uploads.js';
 import { resolveWithin } from './util.js';
+import type { WorkspaceLifecycleCoordinator, WorkspaceLifecycleLease } from './workspaceLifecycle.js';
 
 const MAX_TEXT_BYTES = 10 * 1024 * 1024;
 const MAX_FILE_SAVE_BODY_BYTES = MAX_TEXT_BYTES * 6 + 1024;
@@ -67,7 +68,12 @@ const SANDBOXED_ASSET_CSP = "sandbox; default-src 'none'; base-uri 'none'; form-
 const TRUSTED_MV_PATHS = ['/usr/bin/mv', '/bin/mv'];
 const execFileAsync = promisify(execFile);
 
-export async function registerFileRoutes(app: FastifyInstance, registry: ProjectRegistry, bridge?: FileRouteBridge) {
+export async function registerFileRoutes(
+  app: FastifyInstance,
+  registry: ProjectRegistry,
+  bridge?: FileRouteBridge,
+  workspaceLifecycle?: WorkspaceLifecycleCoordinator,
+) {
   const fileWatchSessions = new Map<string, FileWatchSession>();
 
   app.addHook('onClose', async () => {
@@ -92,15 +98,24 @@ export async function registerFileRoutes(app: FastifyInstance, registry: Project
 
   app.get<{ Params: { projectId: string } }>('/ws/projects/:projectId/files', { websocket: true }, (connection: any, request) => {
     const socket: WebSocket = connection.socket ?? connection;
+    let workspaceLease: WorkspaceLifecycleLease | undefined;
     try {
+      const blockedReason = registry.blockReason?.(request.params.projectId);
+      if (blockedReason) throw new Error(blockedReason);
       const project = registry.get(request.params.projectId);
+      workspaceLease = workspaceLifecycle?.acquireActivity(project.path);
       let session = fileWatchSessions.get(project.id);
       if (!session) {
         session = createFileWatchSession(project.id, project.path);
         fileWatchSessions.set(project.id, session);
       }
       attachFileWatchSocket(fileWatchSessions, session, socket);
+      socket.on('close', () => workspaceLease?.release());
+      socket.on('error', () => {
+        try { socket.close(); } catch { /* Ignore close races. */ }
+      });
     } catch (error) {
+      workspaceLease?.release();
       sendFileWatchMessage(socket, { type: 'error', message: error instanceof Error ? error.message : 'Could not watch files' });
       socket.close();
     }

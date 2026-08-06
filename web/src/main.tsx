@@ -102,6 +102,8 @@ import {
   type AgentToolActivity,
 } from './liveActivity';
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
+import { workspaceDeleteIdentityChanged, workspaceDeleteRequiresManualRecovery } from './workspaceDeletion';
+import { queryKeyTargetsWorkspace, reconcileWorkspaceSockets, WorkspaceSocketRegistry, withSuspendedWorkspaceSockets, type WorkspaceSocketCleanup } from './workspaceSockets';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
 import { buildReviewFileTree, type ReviewFileTreeNode } from './reviewFileTree';
 import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, isTextPath, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
@@ -374,6 +376,7 @@ const WEBSOCKET_RECONNECT_MIN_DELAY_MS = 500;
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
 const WEBSOCKET_HEARTBEAT_TIMEOUT_MS = 10_000;
+const WEBSOCKET_CLOSE_TIMEOUT_MS = 1_000;
 const AGENT_REFRESH_TIMEOUT_MS = 10_000;
 const AGENT_SOCKET_EVENT_BATCH_BUDGET_MS = 8;
 const AGENT_SOCKET_EVENT_BATCH_MAX = 100;
@@ -845,12 +848,34 @@ function Shell() {
   const [lastWorkspaceSessions, setLastWorkspaceSessions] = createSignal(readLastWorkspaceSessions());
   const [knownWorkspacesByRootId, setKnownWorkspacesByRootId] = createSignal<Record<string, ProjectWorkspace[]>>({});
   const [workspaceNotificationStore, setWorkspaceNotificationStore] = createSignal<Record<string, WorkspaceNotificationState>>(readWorkspaceNotificationStore());
+  const workspaceSocketSuspensions = new Map<string, { value: () => boolean; set: (suspended: boolean) => void }>();
+  const workspaceSocketRegistry = new WorkspaceSocketRegistry();
+  const notificationSocketCleanups = new Map<string, WorkspaceSocketCleanup>();
   const [notificationToasts, setNotificationToasts] = createSignal<WorkspaceNotificationItem[]>([]);
   const [notificationPanelWorkspaceId, setNotificationPanelWorkspaceId] = createSignal<string>();
   const [browserNotificationsEnabled, setBrowserNotificationsEnabled] = createSignal(readBrowserNotificationsEnabled());
   const [notificationSoundEnabled, setNotificationSoundEnabled] = createSignal(readNotificationSoundEnabled());
   const [notificationSoundId, setNotificationSoundId] = createSignal<NotificationSoundId>(readNotificationSoundId());
   const [notificationSoundVolume, setNotificationSoundVolume] = createSignal(readNotificationSoundVolume());
+
+  function workspaceSocketsSuspended(workspaceId: string) {
+    let suspension = workspaceSocketSuspensions.get(workspaceId);
+    if (!suspension) {
+      const [value, set] = createSignal(false);
+      suspension = { value, set };
+      workspaceSocketSuspensions.set(workspaceId, suspension);
+    }
+    return suspension.value();
+  }
+
+  function setWorkspaceSocketsSuspended(workspaceId: string, suspended: boolean) {
+    workspaceSocketsSuspended(workspaceId);
+    workspaceSocketSuspensions.get(workspaceId)!.set(suspended);
+  }
+
+  function connectWorkspaceSocket(workspaceId: string, url: string, options: ReconnectingWebSocketOptions): WorkspaceSocketCleanup {
+    return workspaceSocketRegistry.track(workspaceId, connectReconnectingWebSocket(url, options));
+  }
   const [sessionSidebarOpen, setSessionSidebarOpen] = createSignal(localStorage.getItem(SESSION_SIDEBAR_OPEN_KEY) !== 'false');
   const [restoredOpenProjects, setRestoredOpenProjects] = createSignal(false);
   const [restoringOpenProjects, setRestoringOpenProjects] = createSignal(false);
@@ -1396,13 +1421,16 @@ function Shell() {
   }
 
   function forgetWorkspaceLastSession(workspaceId: string) {
+    let nextValue: Record<string, string> | undefined;
     setLastWorkspaceSessions((current) => {
       if (!(workspaceId in current)) return current;
-      const next = { ...current };
-      delete next[workspaceId];
-      writeLastWorkspaceSessions(next);
-      return next;
+      nextValue = { ...current };
+      delete nextValue[workspaceId];
+      return nextValue;
     });
+    if (nextValue) {
+      try { writeLastWorkspaceSessions(nextValue); } catch (error) { console.warn('Could not persist remembered workspace session cleanup', error); }
+    }
   }
 
   function forgetLastWorkspaceSessionId(id: string) {
@@ -1914,7 +1942,7 @@ function Shell() {
   createEffect(() => {
     const projectId = agentStreamProjectId();
     const currentRuntimeSessionId = runtimeSessionId();
-    if (!projectId) return;
+    if (!projectId || workspaceSocketsSuspended(projectId)) return;
     const project = { id: projectId };
     const connectionGeneration = ++agentConnectionGeneration;
     const refreshAgentQueries = () => {
@@ -2109,7 +2137,7 @@ function Shell() {
       pendingAgentSocketOffset = 0;
     };
 
-    const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/agent${currentRuntimeSessionId ? `?sessionId=${encodeURIComponent(currentRuntimeSessionId)}` : ''}`), {
+    const cleanup = connectWorkspaceSocket(project.id, appWebSocketUrl(`/ws/projects/${project.id}/agent${currentRuntimeSessionId ? `?sessionId=${encodeURIComponent(currentRuntimeSessionId)}` : ''}`), {
       heartbeat: true,
       onOpen: (send) => {
         if (connectionGeneration === agentConnectionGeneration) setAgentSocketSender(() => send);
@@ -2152,8 +2180,8 @@ function Shell() {
 
   createEffect(() => {
     const project = workspaceProject();
-    if (!project) return;
-    const cleanup = connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${project.id}/files`), {
+    if (!project || workspaceSocketsSuspended(project.id)) return;
+    const cleanup = connectWorkspaceSocket(project.id, appWebSocketUrl(`/ws/projects/${project.id}/files`), {
       heartbeat: true,
       onOpen: () => invalidateProjectFileCaches(project.id),
       onMessage: (event) => {
@@ -2169,21 +2197,26 @@ function Shell() {
   });
 
   createEffect(() => {
-    const ids = Object.keys(workspaceLookup()).sort();
-    if (!ids.length) return;
-    const cleanups = ids.map((workspaceId) => connectReconnectingWebSocket(appWebSocketUrl(`/ws/projects/${workspaceId}/notifications`), {
-      heartbeat: true,
-      onMessage: (event) => {
-        try {
-          const parsed = JSON.parse(event.data) as WorkspaceNotificationServerEvent;
-          if (parsed.type === 'error') return;
-          handleWorkspaceNotificationEvent(workspaceId, parsed);
-        } catch {
-          // Ignore malformed notification events.
-        }
-      },
-    }));
-    onCleanup(() => cleanups.forEach((cleanup) => cleanup()));
+    reconcileWorkspaceSockets(
+      notificationSocketCleanups,
+      Object.keys(workspaceLookup()).filter((workspaceId) => !workspaceSocketsSuspended(workspaceId)),
+      (workspaceId) => connectWorkspaceSocket(workspaceId, appWebSocketUrl(`/ws/projects/${workspaceId}/notifications`), {
+        heartbeat: true,
+        onMessage: (event) => {
+          try {
+            const parsed = JSON.parse(event.data) as WorkspaceNotificationServerEvent;
+            if (parsed.type === 'error') return;
+            handleWorkspaceNotificationEvent(workspaceId, parsed);
+          } catch {
+            // Ignore malformed notification events.
+          }
+        },
+      }),
+    );
+  });
+  onCleanup(() => {
+    for (const cleanup of notificationSocketCleanups.values()) void cleanup();
+    notificationSocketCleanups.clear();
   });
 
   createEffect(() => {
@@ -2597,16 +2630,100 @@ function Shell() {
     const project = activeProject();
     if (!project || workspace.local) return;
     if (workspace.id === workspaceProjectId() && requestFileWorkspaceLeave(() => void deleteWorkspace(workspace, options))) return;
-    await api(`/api/projects/${project.id}/workspaces/${workspace.id}${options?.force ? '?force=true' : ''}`, { method: 'DELETE' });
-    queryClient.removeQueries({ queryKey: ['sessions', workspace.id] });
-    queryClient.removeQueries({ queryKey: ['session', workspace.id] });
-    queryClient.removeQueries({ queryKey: ['settings', workspace.id] });
-    queryClient.removeQueries({ queryKey: ['settings-editor', workspace.id] });
-    queryClient.removeQueries({ queryKey: ['git-status', workspace.id] });
-    queryClient.removeQueries({ queryKey: ['git-file-diff', workspace.id] });
-    forgetWorkspaceLastSession(workspace.id);
-    await queryClient.invalidateQueries({ queryKey: ['workspaces', project.id] });
-    if (workspaceProjectId() === workspace.id) resetWorkspaceSelection(project.id);
+    const { workspaceIds, projectPaths, participantIds, scopeToken } = await api<{
+      workspaceIds: string[];
+      projectPaths: string[];
+      participantIds: string[];
+      scopeToken: string;
+    }>(`/api/projects/${project.id}/workspaces/${workspace.id}/deletion-scope`);
+    await withSuspendedWorkspaceSockets(
+      participantIds,
+      setWorkspaceSocketsSuspended,
+      (workspaceId) => workspaceSocketRegistry.close(workspaceId),
+      async () => {
+        const query = new URLSearchParams({ scope: scopeToken });
+        if (options?.force) query.set('force', 'true');
+        await api(`/api/projects/${project.id}/workspaces/${workspace.id}?${query}`, { method: 'DELETE' });
+        const affectedWorkspaceIds = new Set(workspaceIds);
+        const affectedProjectPaths = new Set(projectPaths);
+        const affectedRootProjectIds = new Set([project.id]);
+        const lookup = workspaceLookup();
+        const safely = (label: string, cleanup: () => void) => {
+          try { cleanup(); } catch (error) { console.warn(`Could not ${label} after workspace deletion`, error); }
+        };
+        for (const workspaceId of affectedWorkspaceIds) {
+          if (lookup[workspaceId]) affectedRootProjectIds.add(lookup[workspaceId].rootProject.id);
+        }
+        queryClient.removeQueries({ predicate: (query) => queryKeyTargetsWorkspace(query.queryKey, affectedWorkspaceIds) });
+        for (const workspaceId of affectedWorkspaceIds) {
+          safely('forget remembered workspace session', () => forgetWorkspaceLastSession(workspaceId));
+          safely('forget draft session', () => forgetDraftSessionId(workspaceId));
+          safely('forget custom UI session', () => forgetCustomUiSessionId(workspaceId));
+          setDraftSessionId(workspaceId, undefined);
+          abandonedPendingSessionIds.delete(workspaceId);
+          abandonedPendingSessionAbortIds.delete(workspaceId);
+          forgetAbandonedPendingSessionAbortIds(workspaceId);
+          for (const [retryKey, timer] of abandonedPendingSessionRetryTimers) {
+            if (!retryKey.startsWith(`${workspaceId}\0`)) continue;
+            window.clearTimeout(timer);
+            abandonedPendingSessionRetryTimers.delete(retryKey);
+          }
+          ignoredActiveStreamSessionIds.delete(workspaceId);
+        }
+        setNewComposerRevisions((current) => Object.fromEntries(Object.entries(current).filter(([workspaceId]) => !affectedWorkspaceIds.has(workspaceId))));
+        setKnownWorkspacesByRootId((current) => Object.fromEntries(
+          Object.entries(current).map(([rootProjectId, knownWorkspaces]) => [
+            rootProjectId,
+            knownWorkspaces.filter((knownWorkspace) => !affectedWorkspaceIds.has(knownWorkspace.id)),
+          ]),
+        ));
+        setWorkspaceNotificationStore((current) => {
+          const next = { ...current };
+          for (const workspaceId of affectedWorkspaceIds) delete next[workspaceId];
+          safely('persist workspace notification cleanup', () => writeWorkspaceNotificationStore(next));
+          return next;
+        });
+        setNotificationToasts((current) => current.filter((item) => !affectedWorkspaceIds.has(item.workspaceId)));
+        if (notificationPanelWorkspaceId() && affectedWorkspaceIds.has(notificationPanelWorkspaceId()!)) setNotificationPanelWorkspaceId(undefined);
+
+        const selectedProject = activeProject();
+        const activeProjectWasDeleted = Boolean(
+          (projectId() && affectedWorkspaceIds.has(projectId()!))
+          || (selectedProject && affectedProjectPaths.has(selectedProject.path)),
+        );
+        const nextProject = (projects.data?.projects ?? []).find((candidate) => (
+          !affectedWorkspaceIds.has(candidate.id) && !affectedProjectPaths.has(candidate.path)
+        ));
+        if (activeProjectWasDeleted) {
+          setPendingActiveWorkspacePath(undefined);
+          setActiveSession(undefined);
+          setProjectId(nextProject?.id);
+          safely('persist active project cleanup', () => writeActiveProjectPath(nextProject?.path));
+        }
+        for (const projectPath of affectedProjectPaths) safely('forget open project', () => forgetOpenProject(projectPath));
+        for (const rootProjectId of affectedRootProjectIds) {
+          queryClient.setQueryData<{ workspaces: ProjectWorkspace[] }>(['workspaces', rootProjectId], (current) => current ? {
+            ...current,
+            workspaces: current.workspaces.filter((knownWorkspace) => !affectedWorkspaceIds.has(knownWorkspace.id)),
+          } : current);
+        }
+        queryClient.setQueryData<{ projects: Project[] }>(['projects'], (current) => current ? {
+          ...current,
+          projects: current.projects.filter((knownProject) => (
+            !affectedWorkspaceIds.has(knownProject.id) && !affectedProjectPaths.has(knownProject.path)
+          )),
+        } : current);
+        if (workspaceProjectId() && affectedWorkspaceIds.has(workspaceProjectId()!)) {
+          const fallbackWorkspaceId = !affectedWorkspaceIds.has(project.id) ? project.id : nextProject?.id;
+          if (fallbackWorkspaceId) resetWorkspaceSelection(fallbackWorkspaceId);
+          else setWorkspaceProjectId(undefined);
+        }
+        await Promise.allSettled([
+          ...[...affectedRootProjectIds].map((rootProjectId) => queryClient.invalidateQueries({ queryKey: ['workspaces', rootProjectId] })),
+          queryClient.invalidateQueries({ queryKey: ['projects'] }),
+        ]);
+      },
+    );
   }
 
   function setSessionSidebar(open: boolean) {
@@ -4060,24 +4177,35 @@ function WorkspaceDeleteDialog(props: { workspace: ProjectWorkspace; busy?: bool
     staleTime: 5_000,
   }));
   const dirtyCount = createMemo(() => status.data?.status.files.length ?? 0);
-  const serverReportedDirty = createMemo(() => /uncommitted/i.test(props.error ?? ''));
-  const force = createMemo(() => Boolean(status.error || dirtyCount() || serverReportedDirty()));
+  const serverReportedLocalFiles = createMemo(() => /uncommitted changes|untracked files|ignored local files|hidden by git index flags/i.test(props.error ?? ''));
+  const serverReportedUnknownState = createMemo(() => /could not verify all workspace files/i.test(props.error ?? ''));
+  const serverReportedStale = createMemo(() => /git no longer recognizes this workspace/i.test(props.error ?? ''));
+  const serverReportedActive = createMemo(() => /workspace is in use|workspace is being deleted/i.test(props.error ?? ''));
+  const serverReportedIdentityChange = createMemo(() => workspaceDeleteIdentityChanged(props.error));
+  const serverReportedManualRecovery = createMemo(() => workspaceDeleteRequiresManualRecovery(props.error));
+  const force = createMemo(() => Boolean(status.error || dirtyCount() || serverReportedLocalFiles() || serverReportedUnknownState() || serverReportedStale()));
+  const destructive = createMemo(() => force() && !serverReportedActive());
   const description = createMemo(() => {
-    if (status.isLoading || status.isFetching) return `Checking "${props.workspace.name}" for uncommitted changes before deleting...`;
-    if (serverReportedDirty()) return `The server found uncommitted changes in "${props.workspace.name}". Deleting will force-remove the worktree and discard those local changes. pi-web will try to clean up the pi-web branch only when Git says it is already merged; otherwise committed work remains on the branch. Sessions are not deleted.`;
-    if (status.error) return `Could not verify the git status for "${props.workspace.name}". Deleting anyway will force-remove the worktree and discard local changes. pi-web will try to clean up the pi-web branch only when Git says it is already merged; otherwise committed work remains on the branch. Sessions are not deleted.`;
-    if (dirtyCount()) return `"${props.workspace.name}" has ${dirtyCount()} uncommitted ${dirtyCount() === 1 ? 'change' : 'changes'}. Deleting will force-remove the worktree and discard those local changes. pi-web will try to clean up the pi-web branch only when Git says it is already merged; otherwise committed work remains on the branch. Sessions are not deleted.`;
-    return `No uncommitted changes found in "${props.workspace.name}". This will remove the git worktree. pi-web will try to clean up the pi-web branch only when Git says it is already merged; otherwise committed work remains on the branch. Sessions are not deleted.`;
+    const sessionNotice = 'Sessions remain in storage but are not normally accessible after the workspace path is removed.';
+    if (status.isLoading || status.isFetching) return `Checking "${props.workspace.name}" for local changes before deleting...`;
+    if (serverReportedActive()) return `"${props.workspace.name}" is still in use. Stop its Pi sessions, commands, and terminals, then close and reopen this dialog. Nothing has been deleted.`;
+    if (serverReportedIdentityChange()) return `"${props.workspace.name}" changed while deletion was preparing. Close this dialog and refresh the workspace list before taking any further action. Nothing has been deleted.`;
+    if (serverReportedManualRecovery()) return `Pi Web cannot safely delete "${props.workspace.name}" in its current Git state. Unlock or repair/prune the worktree manually, then close and reopen this dialog. Nothing has been deleted.`;
+    if (serverReportedStale()) return `Git no longer recognizes "${props.workspace.name}" as a worktree. Force deletion will proceed only if Pi Web can verify its managed Git metadata, and will permanently remove every file in that stale directory. ${sessionNotice}`;
+    if (serverReportedLocalFiles()) return `The server found uncommitted changes, untracked files, ignored local files such as .env files or local databases, or tracked files hidden by Git index flags in "${props.workspace.name}". Permanently deleting will discard all local changes. Pi Web only removes the pi-web branch when Git says it is already merged; otherwise committed work remains on the branch. ${sessionNotice}`;
+    if (serverReportedUnknownState() || status.error) return `Pi Web could not verify every file in "${props.workspace.name}". Permanently deleting anyway can discard staged, unstaged, untracked, and ignored files. Pi Web only removes the pi-web branch when Git says it is already merged; otherwise committed work remains on the branch. ${sessionNotice}`;
+    if (dirtyCount()) return `"${props.workspace.name}" has ${dirtyCount()} visible uncommitted ${dirtyCount() === 1 ? 'change' : 'changes'}. Permanently deleting will also discard any untracked or ignored local files. Pi Web only removes the pi-web branch when Git says it is already merged; otherwise committed work remains on the branch. ${sessionNotice}`;
+    return `No visible Git changes were found in "${props.workspace.name}". The server will also check the entire worktree for untracked and ignored local files before removing it. If anything is found, deletion will stop without discarding it. ${sessionNotice}`;
   });
 
   return (
     <ConfirmDialog
-      title="Delete workspace?"
+      title={destructive() ? 'Permanently delete workspace files?' : 'Delete workspace?'}
       description={description()}
-      confirmLabel={status.error ? 'Delete anyway' : dirtyCount() || serverReportedDirty() ? 'Discard and delete' : 'Delete workspace'}
+      confirmLabel={destructive() ? 'Permanently delete files' : 'Delete workspace'}
       busyLabel="Deleting..."
       busy={props.busy}
-      confirmDisabled={status.isLoading || status.isFetching}
+      confirmDisabled={status.isLoading || status.isFetching || serverReportedActive() || serverReportedManualRecovery()}
       error={props.error}
       onCancel={props.onCancel}
       onConfirm={() => props.onConfirm(force())}
@@ -15179,6 +15307,13 @@ function forgetAbandonedPendingSessionAbortId(projectId: string, sessionId: stri
   writeAbandonedPendingSessionAbortIds(stored);
 }
 
+function forgetAbandonedPendingSessionAbortIds(projectId: string) {
+  const stored = readAbandonedPendingSessionAbortIds();
+  if (!(projectId in stored)) return;
+  delete stored[projectId];
+  writeAbandonedPendingSessionAbortIds(stored);
+}
+
 function writeActiveSessionId(sessionId?: string) {
   const url = new URL(location.href);
   if (sessionId) url.searchParams.set(SESSION_QUERY_KEY, sessionId);
@@ -15320,6 +15455,7 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
   let heartbeatTimeout: number | undefined;
   let reconnectAttempt = 0;
   let disposed = false;
+  let disposePromise: Promise<void> | undefined;
 
   const clearReconnectTimer = () => {
     if (reconnectTimer === undefined) return;
@@ -15392,7 +15528,10 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
     }
     socket = current;
     current.addEventListener('open', () => {
-      if (disposed || socket !== current) return;
+      if (disposed || socket !== current) {
+        closeSocket(current);
+        return;
+      }
       reconnectAttempt = 0;
       options.onOpen?.((message) => {
         if (disposed || socket !== current || current.readyState !== WebSocket.OPEN) return false;
@@ -15422,12 +15561,29 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
 
   connect();
   return () => {
+    if (disposePromise) return disposePromise;
     disposed = true;
     clearReconnectTimer();
     clearHeartbeatTimers();
     const current = socket;
     socket = undefined;
-    if (current) closeSocket(current);
+    disposePromise = new Promise<void>((resolve) => {
+      if (!current || current.readyState === WebSocket.CLOSED) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        resolve();
+      };
+      const timer = window.setTimeout(finish, WEBSOCKET_CLOSE_TIMEOUT_MS);
+      current.addEventListener('close', finish, { once: true });
+      closeSocket(current);
+    });
+    return disposePromise;
   };
 }
 

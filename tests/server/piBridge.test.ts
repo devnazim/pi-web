@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import { PiBridge } from '../../src/server/piBridge.js';
 import { createSessionFile, listSessions, sessionManagerForSession } from '../../src/server/sessions.js';
 import { sessionIdFromPath } from '../../src/server/util.js';
+import { WorkspaceLifecycleCoordinator } from '../../src/server/workspaceLifecycle.js';
 
 test('binds browser extension UI in RPC mode', async () => {
   const bridge = new PiBridge();
@@ -845,8 +848,8 @@ test('recovery of a stale session does not evict its replacement', async () => {
   const sessionId = 'replacement-session';
   const oldSession = { dispose: () => undefined };
   const replacementSession = {};
-  const oldEntry = { promise: Promise.resolve(oldSession), expiresAt: Date.now() + 60_000 };
-  const replacementEntry = { promise: Promise.resolve(replacementSession), expiresAt: Date.now() + 60_000 };
+  const oldEntry = { projectPath, promise: Promise.resolve(oldSession), expiresAt: Date.now() + 60_000 };
+  const replacementEntry = { projectPath, promise: Promise.resolve(replacementSession), expiresAt: Date.now() + 60_000 };
   const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
   let replacementUiSettled = false;
   (bridge as any).runtimeSessionEntries.set(oldSession, oldEntry);
@@ -890,8 +893,8 @@ test('stale operation finalization preserves replacement UI and status', async (
   const projectPath = process.cwd();
   const sessionId = 'stale-wrapper-session';
   const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
-  const oldEntry = { promise: Promise.resolve(oldSession), expiresAt: Date.now() + 60_000 };
-  const replacementEntry = { promise: Promise.resolve(replacementSession), expiresAt: Date.now() + 60_000 };
+  const oldEntry = { projectPath, promise: Promise.resolve(oldSession), expiresAt: Date.now() + 60_000 };
+  const replacementEntry = { projectPath, promise: Promise.resolve(replacementSession), expiresAt: Date.now() + 60_000 };
   let replacementUiSettled = false;
   (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
   (bridge as any).getSession = async () => oldSession;
@@ -1472,8 +1475,9 @@ test('session mutation leases block deletion without reporting agent activity', 
   await bridge.dispose();
 });
 
-test('bounds session creation and disposes a late runtime', async () => {
-  const bridge = new PiBridge({ sessionCreateTimeoutMs: 5 });
+test('bounds session creation, retains workspace activity, and disposes a late runtime', async () => {
+  const workspaceLifecycle = new WorkspaceLifecycleCoordinator();
+  const bridge = new PiBridge({ sessionCreateTimeoutMs: 5, workspaceLifecycle });
   let finishCreation: ((value: unknown) => void) | undefined;
   let disposed = 0;
   (bridge as any).loadSdk = async () => ({
@@ -1483,10 +1487,351 @@ test('bounds session creation and disposes a late runtime', async () => {
 
   await assert.rejects((bridge as any).getSession(process.cwd()), /initialization timed out/i);
   assert.equal((bridge as any).runtimeSessions.size, 0);
+  assert.throws(() => workspaceLifecycle.acquireDeletion(process.cwd()), { message: /workspace is in use/i });
 
   finishCreation?.({ session: { dispose: () => { disposed += 1; } } });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(disposed, 1);
+  workspaceLifecycle.acquireDeletion(process.cwd()).release();
+});
+
+test('timer eviction holds workspace activity until SDK disposal settles', async () => {
+  const workspaceLifecycle = new WorkspaceLifecycleCoordinator();
+  const bridge = new PiBridge({ workspaceLifecycle });
+  let markDisposalStarted: () => void = () => undefined;
+  let finishDisposal: () => void = () => undefined;
+  const disposalStarted = new Promise<void>((resolve) => { markDisposalStarted = resolve; });
+  const disposalGate = new Promise<void>((resolve) => { finishDisposal = resolve; });
+  const projectPath = process.cwd();
+  const key = (bridge as any).runtimeSessionCacheKey(projectPath, 'eviction');
+  const cached = {
+    projectPath,
+    promise: Promise.resolve({
+      dispose: async () => {
+        markDisposalStarted();
+        await disposalGate;
+      },
+    }),
+    expiresAt: 0,
+  };
+  (bridge as any).runtimeSessions.set(key, cached);
+
+  const eviction = (bridge as any).evictCachedSession((bridge as any).runtimeSessions, key, cached);
+  await disposalStarted;
+  assert.throws(() => workspaceLifecycle.acquireDeletion(projectPath), { message: /workspace is in use/i });
+  finishDisposal();
+  await eviction;
+  workspaceLifecycle.acquireDeletion(projectPath).release();
+  await bridge.dispose();
+});
+
+test('project disposal uses exact cached project identities for colon-containing paths', async () => {
+  const bridge = new PiBridge();
+  const projectPath = path.join(tmpdir(), 'pi-web-project-prefix');
+  const collidingPath = `${projectPath}:other`;
+  let projectDisposals = 0;
+  let collidingDisposals = 0;
+  const projectKey = (bridge as any).runtimeSessionCacheKey(projectPath, 'session');
+  const collidingKey = (bridge as any).runtimeSessionCacheKey(collidingPath, 'session');
+  (bridge as any).runtimeSessions.set(projectKey, {
+    projectPath,
+    promise: Promise.resolve({ dispose: () => { projectDisposals += 1; } }),
+    expiresAt: Number.POSITIVE_INFINITY,
+  });
+  (bridge as any).runtimeSessions.set(collidingKey, {
+    projectPath: collidingPath,
+    promise: Promise.resolve({ dispose: () => { collidingDisposals += 1; } }),
+    expiresAt: Number.POSITIVE_INFINITY,
+  });
+
+  await bridge.disposeProject(projectPath);
+  assert.equal(projectDisposals, 1);
+  assert.equal(collidingDisposals, 0);
+  assert.equal((bridge as any).runtimeSessions.has(collidingKey), true);
+
+  await bridge.disposeProject(collidingPath);
+  assert.equal(collidingDisposals, 1);
+  await bridge.dispose();
+});
+
+test('worktree disposal includes descendant projects but not path-prefix siblings', async () => {
+  const bridge = new PiBridge();
+  const worktreePath = path.join(tmpdir(), 'pi-web-worktree-tree');
+  const childA = path.join(worktreePath, 'packages', 'a');
+  const childB = path.join(worktreePath, 'packages', 'b');
+  const outside = `${worktreePath}-other`;
+  const disposed: string[] = [];
+  for (const projectPath of [childA, childB, outside]) {
+    const key = (bridge as any).runtimeSessionCacheKey(projectPath, 'session');
+    (bridge as any).runtimeSessions.set(key, {
+      projectPath,
+      promise: Promise.resolve({ dispose: () => { disposed.push(projectPath); } }),
+      expiresAt: Number.POSITIVE_INFINITY,
+    });
+  }
+
+  await bridge.disposeProjectTree(worktreePath);
+  assert.deepEqual(disposed.sort(), [childA, childB].sort());
+  assert.equal((bridge as any).runtimeSessions.size, 1);
+  await bridge.disposeProject(outside);
+  await bridge.dispose();
+});
+
+test('workspace-scope disposal includes lexical descendants that resolve outside the worktree', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-runtime-scope-alias-'));
+  const worktreePath = path.join(root, 'worktree');
+  const outsidePath = path.join(root, 'outside');
+  const aliasPath = path.join(worktreePath, 'alias');
+  await mkdir(worktreePath);
+  await mkdir(outsidePath);
+  await symlink(outsidePath, aliasPath, 'dir');
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const bridge = new PiBridge();
+  let disposed = 0;
+  const key = (bridge as any).runtimeSessionCacheKey(aliasPath, 'session');
+  (bridge as any).setCachedSession(
+    (bridge as any).runtimeSessions,
+    aliasPath,
+    key,
+    Promise.resolve({ dispose: () => { disposed += 1; } }),
+  );
+
+  await bridge.disposeWorkspaceScope(worktreePath, [aliasPath]);
+  assert.equal(disposed, 1);
+  assert.equal((bridge as any).runtimeSessions.size, 0);
+  await bridge.dispose();
+});
+
+test('workspace-scope disposal retains lexical identity after an outside alias retarget', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-runtime-scope-retarget-'));
+  const worktreePath = path.join(root, 'worktree');
+  const outsideA = path.join(root, 'outside-a');
+  const outsideB = path.join(root, 'outside-b');
+  const aliasPath = path.join(worktreePath, 'alias');
+  await mkdir(worktreePath);
+  await mkdir(outsideA);
+  await mkdir(outsideB);
+  await symlink(outsideA, aliasPath, 'dir');
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const bridge = new PiBridge();
+  let disposed = 0;
+  const key = (bridge as any).runtimeSessionCacheKey(aliasPath, 'session');
+  (bridge as any).setCachedSession(
+    (bridge as any).runtimeSessions,
+    aliasPath,
+    key,
+    Promise.resolve({ dispose: () => { disposed += 1; } }),
+  );
+  await unlink(aliasPath);
+  await symlink(outsideB, aliasPath, 'dir');
+
+  await bridge.disposeWorkspaceScope(worktreePath, [aliasPath]);
+  assert.equal(disposed, 1);
+  assert.equal((bridge as any).runtimeSessions.size, 0);
+  await bridge.dispose();
+});
+
+test('worktree disposal retains canonical identities after a project symlink is retargeted', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-runtime-alias-'));
+  const worktreePath = path.join(root, 'worktree');
+  const outsidePath = path.join(root, 'outside');
+  const aliasPath = path.join(root, 'alias');
+  await mkdir(path.join(worktreePath, 'packages/a'), { recursive: true });
+  await mkdir(path.join(worktreePath, 'packages/b'), { recursive: true });
+  await mkdir(outsidePath);
+  await symlink(worktreePath, aliasPath, 'dir');
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const bridge = new PiBridge();
+  let cachedDisposals = 0;
+  let failedDisposals = 0;
+  const cachedProjectPath = path.join(aliasPath, 'packages/a');
+  const cachedKey = (bridge as any).runtimeSessionCacheKey(cachedProjectPath, 'cached');
+  (bridge as any).setCachedSession(
+    (bridge as any).runtimeSessions,
+    cachedProjectPath,
+    cachedKey,
+    Promise.resolve({ dispose: () => { cachedDisposals += 1; } }),
+  );
+  (bridge as any).rememberFailedProjectDisposal(path.join(aliasPath, 'packages/b'), {
+    dispose: () => { failedDisposals += 1; },
+  });
+
+  await unlink(aliasPath);
+  await symlink(outsidePath, aliasPath, 'dir');
+  await bridge.disposeProjectTree(worktreePath);
+  assert.equal(cachedDisposals, 1);
+  assert.equal(failedDisposals, 1);
+  assert.equal((bridge as any).runtimeSessions.size, 0);
+  await bridge.dispose();
+});
+
+test('failed asynchronous disposal keeps its captured project identity after a symlink retarget', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-runtime-failed-alias-'));
+  const worktreePath = path.join(root, 'worktree');
+  const outsidePath = path.join(root, 'outside');
+  const aliasPath = path.join(root, 'alias');
+  await mkdir(path.join(worktreePath, 'project'), { recursive: true });
+  await mkdir(outsidePath);
+  await symlink(worktreePath, aliasPath, 'dir');
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const bridge = new PiBridge();
+  const projectPath = path.join(aliasPath, 'project');
+  const key = (bridge as any).runtimeSessionCacheKey(projectPath, 'failed');
+  let disposalAttempts = 0;
+  let markDisposalStarted: () => void = () => undefined;
+  let rejectDisposal: () => void = () => undefined;
+  const disposalStarted = new Promise<void>((resolve) => { markDisposalStarted = resolve; });
+  const disposalGate = new Promise<void>((_resolve, reject) => { rejectDisposal = () => reject(new Error('delayed disposal failed')); });
+  const session = {
+    dispose: async () => {
+      disposalAttempts += 1;
+      if (disposalAttempts === 1) {
+        markDisposalStarted();
+        await disposalGate;
+      }
+    },
+  };
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, key, Promise.resolve(session));
+  const cached = (bridge as any).runtimeSessions.get(key);
+  const disposal = (bridge as any).disposeCachedSessionEntry((bridge as any).runtimeSessions, key, cached);
+  await disposalStarted;
+
+  await unlink(aliasPath);
+  await symlink(outsidePath, aliasPath, 'dir');
+  (bridge as any).runtimeSessions.set(key, {
+    projectPath: outsidePath,
+    projectKey: outsidePath,
+    promise: Promise.resolve({ dispose: () => undefined }),
+    expiresAt: Number.POSITIVE_INFINITY,
+  });
+  rejectDisposal();
+  await assert.rejects(disposal, /delayed disposal failed/i);
+
+  await bridge.disposeProjectTree(worktreePath);
+  assert.equal(disposalAttempts, 2);
+  (bridge as any).runtimeSessions.clear();
+  await bridge.dispose();
+});
+
+test('session disposal waits for every cache alias cleanup before reporting a failure', async () => {
+  const workspaceLifecycle = new WorkspaceLifecycleCoordinator();
+  const bridge = new PiBridge({ workspaceLifecycle });
+  const projectPath = process.cwd();
+  const sessionId = 'alias-disposal';
+  const filePath = path.join(tmpdir(), 'alias-disposal.jsonl');
+  let firstDisposalFails = true;
+  let markSecondStarted: () => void = () => undefined;
+  let finishSecond: () => void = () => undefined;
+  const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
+  const secondGate = new Promise<void>((resolve) => { finishSecond = resolve; });
+  const firstKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  const secondKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionIdFromPath(filePath));
+  (bridge as any).setCachedSession(
+    (bridge as any).runtimeSessions,
+    projectPath,
+    firstKey,
+    Promise.resolve({ dispose: () => { if (firstDisposalFails) throw new Error('first alias disposal failed'); } }),
+  );
+  (bridge as any).setCachedSession(
+    (bridge as any).runtimeSessions,
+    projectPath,
+    secondKey,
+    Promise.resolve({
+      getSessionFile: () => filePath,
+      dispose: async () => {
+        markSecondStarted();
+        await secondGate;
+      },
+    }),
+  );
+
+  const requestLease = workspaceLifecycle.acquireActivity(projectPath);
+  let disposalSettled = false;
+  const disposal = bridge.disposeSession(projectPath, sessionId, filePath).finally(() => {
+    disposalSettled = true;
+    requestLease.release();
+  });
+  await secondStarted;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(disposalSettled, false);
+  assert.throws(() => workspaceLifecycle.acquireDeletion(projectPath), { message: /workspace is in use/i });
+  finishSecond();
+  await assert.rejects(disposal, /first alias disposal failed/i);
+
+  firstDisposalFails = false;
+  const deletion = workspaceLifecycle.acquireDeletion(projectPath);
+  await bridge.disposeProject(projectPath);
+  deletion.release();
+  await bridge.dispose();
+});
+
+test('project disposal waits for every started cleanup before reporting a failure', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  let firstDisposalFails = true;
+  let markSecondStarted: () => void = () => undefined;
+  let finishSecond: () => void = () => undefined;
+  const secondStarted = new Promise<void>((resolve) => { markSecondStarted = resolve; });
+  const secondGate = new Promise<void>((resolve) => { finishSecond = resolve; });
+  const firstKey = (bridge as any).runtimeSessionCacheKey(projectPath, 'first');
+  const secondKey = (bridge as any).runtimeSessionCacheKey(projectPath, 'second');
+  (bridge as any).runtimeSessions.set(firstKey, {
+    projectPath,
+    promise: Promise.resolve({ dispose: () => { if (firstDisposalFails) throw new Error('first disposal failed'); } }),
+    expiresAt: Number.POSITIVE_INFINITY,
+  });
+  (bridge as any).runtimeSessions.set(secondKey, {
+    projectPath,
+    promise: Promise.resolve({ dispose: async () => { markSecondStarted(); await secondGate; } }),
+    expiresAt: Number.POSITIVE_INFINITY,
+  });
+
+  let disposalSettled = false;
+  const disposal = bridge.disposeProject(projectPath).finally(() => { disposalSettled = true; });
+  await secondStarted;
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(disposalSettled, false);
+  finishSecond();
+  await assert.rejects(disposal, /first disposal failed/i);
+  assert.equal((bridge as any).runtimeSessions.has(firstKey), true);
+  assert.equal((bridge as any).runtimeSessions.has(secondKey), false);
+
+  firstDisposalFails = false;
+  await bridge.disposeProject(projectPath);
+  await bridge.dispose();
+});
+
+test('failed project disposal restores the runtime cache and keeps deletion retries failing safely', async () => {
+  const workspaceLifecycle = new WorkspaceLifecycleCoordinator();
+  const bridge = new PiBridge({ workspaceLifecycle });
+  let disposalFails = true;
+  const session = { dispose: () => { if (disposalFails) throw new Error('dispose failed'); } };
+  (bridge as any).loadSdk = async () => ({
+    SessionManager: { create: () => ({ getSessionFile: () => undefined, appendSessionInfo: () => undefined }) },
+    createAgentSession: async () => ({ session }),
+  });
+  await (bridge as any).getSession(process.cwd());
+
+  const firstDeletion = workspaceLifecycle.acquireDeletion(process.cwd());
+  await assert.rejects(bridge.disposeProject(process.cwd()), /dispose failed/i);
+  firstDeletion.release();
+  assert.equal((bridge as any).runtimeSessions.size, 1);
+
+  const secondDeletion = workspaceLifecycle.acquireDeletion(process.cwd());
+  await assert.rejects(bridge.disposeProject(process.cwd()), /dispose failed/i);
+  secondDeletion.release();
+  assert.equal((bridge as any).runtimeSessions.size, 1);
+
+  disposalFails = false;
+  const finalDeletion = workspaceLifecycle.acquireDeletion(process.cwd());
+  await bridge.disposeProject(process.cwd());
+  finalDeletion.release();
+  assert.equal((bridge as any).runtimeSessions.size, 0);
+  await bridge.dispose();
 });
 
 test('rejected manual compaction recovers its cached runtime once', async () => {

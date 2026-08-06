@@ -14,12 +14,13 @@ import { applyPendingSessionInfo, projectSessionDir, resolveSessionFile, session
 import type { AgentEvent } from './types.js';
 import { resolveWithin, sessionIdFromPath } from './util.js';
 import { WebExtensionTerminal, type WebExtensionTerminalWriter } from './webExtensionTerminal.js';
+import { workspaceLifecycleKey, type WorkspaceLifecycleCoordinator, type WorkspaceLifecycleLease } from './workspaceLifecycle.js';
 
 type WebSocket = {
   readyState: number;
   send(data: string): void;
   close?(): void;
-  on(event: 'close' | 'message', listener: (...args: any[]) => void): void;
+  on(event: 'close' | 'error' | 'message', listener: (...args: any[]) => void): void;
 };
 
 type TreeSummaryOptions = { mode?: 'none' | 'summary' | 'custom'; instructions?: string; replace?: boolean };
@@ -161,7 +162,7 @@ type AgentStatus = {
   statuses: Array<{ key: string; text: string }>;
 };
 
-type CachedSession = { promise: Promise<unknown>; expiresAt: number; timer?: NodeJS.Timeout };
+type CachedSession = { projectPath: string; projectKey: string; projectLexicalKey: string; promise: Promise<unknown>; expiresAt: number; timer?: NodeJS.Timeout };
 type RuntimeSessionLock = { release: () => void; wasActive: boolean };
 type RuntimeOperation = { session?: object; recover: (message: string) => boolean };
 type RuntimeWatchOptions = {
@@ -188,6 +189,7 @@ type PiBridgeOptions = {
   runtimeNoProgressTimeoutMs?: number;
   abortGraceMs?: number;
   sessionCreateTimeoutMs?: number;
+  workspaceLifecycle?: WorkspaceLifecycleCoordinator;
 };
 
 class AgentRuntimeRecoveryError extends Error {
@@ -253,6 +255,7 @@ export class PiBridge {
   private readonly runtimeReadLeaseWaiters = new Map<string, Set<() => void>>();
   private readonly runtimeReadTasks = new Set<Promise<unknown>>();
   private readonly deferredRuntimeDisposals = new Set<Promise<void>>();
+  private readonly failedProjectDisposals = new Map<string, { projectPath: string; projectKey: string; projectLexicalKey: string; sessions: Set<unknown> }>();
   private readonly abortingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessionFiles = new Set<string>();
@@ -262,6 +265,7 @@ export class PiBridge {
   private readonly runtimeNoProgressTimeoutMs: number;
   private readonly abortGraceMs: number;
   private readonly sessionCreateTimeoutMs: number;
+  private readonly workspaceLifecycle?: WorkspaceLifecycleCoordinator;
   private closing = false;
   private disposePromise?: Promise<void>;
 
@@ -274,6 +278,7 @@ export class PiBridge {
       ?? (Number.isFinite(configuredNoProgressTimeout) && configuredNoProgressTimeout > 0 ? configuredNoProgressTimeout : RUNTIME_NO_PROGRESS_TIMEOUT_MS);
     this.abortGraceMs = options.abortGraceMs ?? ABORT_GRACE_MS;
     this.sessionCreateTimeoutMs = options.sessionCreateTimeoutMs ?? SESSION_CREATE_TIMEOUT_MS;
+    this.workspaceLifecycle = options.workspaceLifecycle;
   }
 
   async loadSdk(): Promise<typeof import('@earendil-works/pi-coding-agent')> {
@@ -321,8 +326,9 @@ export class PiBridge {
     return this.disposePromise;
   }
 
-  subscribe(key: string, socket: WebSocket) {
+  subscribe(key: string, socket: WebSocket, onClose?: () => void) {
     if (this.closing) {
+      onClose?.();
       try { socket.close?.(); } catch { /* Ignore shutdown races. */ }
       return;
     }
@@ -336,11 +342,13 @@ export class PiBridge {
       set.delete(socket);
       if (!set.size && this.sockets.get(key) === set) this.sockets.delete(key);
       for (const pending of this.pendingExtensionCustomUi.values()) this.releaseExtensionCustomUiController(pending, socket);
+      onClose?.();
     });
   }
 
-  subscribeNotifications(projectId: string, socket: WebSocket) {
+  subscribeNotifications(projectId: string, socket: WebSocket, onClose?: () => void) {
     if (this.closing) {
+      onClose?.();
       try { socket.close?.(); } catch { /* Ignore shutdown races. */ }
       return;
     }
@@ -350,6 +358,7 @@ export class PiBridge {
     socket.on('close', () => {
       set.delete(socket);
       if (!set.size && this.notificationSockets.get(projectId) === set) this.notificationSockets.delete(projectId);
+      onClose?.();
     });
   }
 
@@ -407,7 +416,7 @@ export class PiBridge {
     if (!filePath) return false;
     const targetPath = path.resolve(filePath);
     for (const [key, cached] of this.runtimeSessions) {
-      if (keys.has(key) || !this.isRuntimeSessionCacheKeyForProject(projectPath, key)) continue;
+      if (keys.has(key) || !this.isCachedSessionForProject(projectPath, cached)) continue;
       const session = await cached.promise.catch(() => undefined);
       if (this.cachedSessionFile(session) !== targetPath) continue;
       if (this.activeRuntimeSessions.has(key) || (includeLeases && this.leasedRuntimeSessions.has(key)) || this.cachedSessionInUse(session)) return true;
@@ -457,12 +466,63 @@ export class PiBridge {
     if (filePath) {
       const targetPath = path.resolve(filePath);
       for (const [key, cached] of this.runtimeSessions) {
-        if (keys.has(key) || !this.isRuntimeSessionCacheKeyForProject(projectPath, key)) continue;
+        if (keys.has(key) || !this.isCachedSessionForProject(projectPath, cached)) continue;
         const session = await cached.promise.catch(() => undefined);
         if (this.cachedSessionFile(session) === targetPath) entries.push([key, cached]);
       }
     }
-    await Promise.all(entries.map(([key, cached]) => this.disposeCachedSessionEntry(this.runtimeSessions, key, cached)));
+    const settled = await Promise.allSettled(entries.map(([key, cached]) => this.disposeCachedSessionEntry(this.runtimeSessions, key, cached)));
+    const disposalError = settled.find((result) => result.status === 'rejected')?.reason;
+    if (disposalError) throw disposalError;
+  }
+
+  async disposeProject(projectPath: string) {
+    await this.disposeProjects(projectPath, false);
+  }
+
+  async disposeProjectTree(worktreePath: string) {
+    await this.disposeProjects(worktreePath, true);
+  }
+
+  async disposeWorkspaceScope(worktreePath: string, projectPaths: string[]) {
+    const rootKey = workspaceLifecycleKey(worktreePath);
+    const rootLexicalKey = lexicalProjectKey(worktreePath);
+    const projectKeys = new Set(projectPaths.map((projectPath) => workspaceLifecycleKey(projectPath)));
+    const projectLexicalKeys = new Set(projectPaths.map(lexicalProjectKey));
+    await this.disposeMatchingProjects((projectKey, projectLexicalKey) => (
+      this.projectIdentityMatches(rootKey, projectKey, true)
+      || this.projectIdentityMatches(rootLexicalKey, projectLexicalKey, true)
+      || projectKeys.has(projectKey)
+      || projectLexicalKeys.has(projectLexicalKey)
+    ));
+  }
+
+  private async disposeProjects(projectPath: string, includeDescendants: boolean) {
+    const scopeKey = workspaceLifecycleKey(projectPath);
+    await this.disposeMatchingProjects((projectKey) => this.projectIdentityMatches(scopeKey, projectKey, includeDescendants));
+  }
+
+  private async disposeMatchingProjects(matches: (projectKey: string, projectLexicalKey: string) => boolean) {
+    const entries = [...this.runtimeSessions.entries()].filter(([, cached]) => matches(
+      cached.projectKey ?? workspaceLifecycleKey(cached.projectPath),
+      cached.projectLexicalKey ?? lexicalProjectKey(cached.projectPath),
+    ));
+    const settled = await Promise.allSettled(entries.map(([key, cached]) => this.disposeCachedSessionEntry(this.runtimeSessions, key, cached)));
+    let disposalError = settled.find((result) => result.status === 'rejected')?.reason;
+
+    for (const [failedKey, failed] of [...this.failedProjectDisposals]) {
+      if (!matches(failed.projectKey, failed.projectLexicalKey)) continue;
+      for (const session of [...failed.sessions]) {
+        try {
+          await this.disposeCachedSession(session);
+          failed.sessions.delete(session);
+        } catch (error) {
+          disposalError ??= error;
+        }
+      }
+      if (!failed.sessions.size) this.failedProjectDisposals.delete(failedKey);
+    }
+    if (disposalError) throw disposalError;
   }
 
   async renameSession(projectPath: string, sessionId: string, name: string, filePath?: string) {
@@ -1469,7 +1529,7 @@ export class PiBridge {
     if (cached && this.runtimeSessions.get(cacheKey) === cached) {
       this.runtimeSessions.delete(cacheKey);
       if (cached.timer) clearTimeout(cached.timer);
-      void cached.promise.then((session) => this.deferRuntimeSessionDisposal(cacheKey, session)).catch(() => undefined);
+      void cached.promise.then((session) => this.deferRuntimeSessionDisposal(projectPath, cacheKey, session, cached.projectKey, cached.projectLexicalKey)).catch(() => undefined);
     }
     return true;
   }
@@ -1491,14 +1551,20 @@ export class PiBridge {
       if (cached.timer) clearTimeout(cached.timer);
     }
     for (const [key, entry] of this.runtimeSessions) {
-      if (!this.isRuntimeSessionCacheKeyForProject(projectPath, key)) continue;
+      if (!this.isCachedSessionForProject(projectPath, entry)) continue;
       void entry.promise.then((cachedSession) => {
         if (cachedSession !== session || this.runtimeSessions.get(key) !== entry) return;
         this.runtimeSessions.delete(key);
         if (entry.timer) clearTimeout(entry.timer);
       }).catch(() => undefined);
     }
-    this.deferRuntimeSessionDisposal(cacheKey, session);
+    this.deferRuntimeSessionDisposal(
+      projectPath,
+      cacheKey,
+      session,
+      originatingEntry?.projectKey ?? cached?.projectKey ?? workspaceLifecycleKey(projectPath),
+      originatingEntry?.projectLexicalKey ?? cached?.projectLexicalKey ?? lexicalProjectKey(projectPath),
+    );
     return report;
   }
 
@@ -2459,7 +2525,7 @@ export class PiBridge {
   }
 
   private runtimeSessionCacheKey(projectPath: string, sessionId?: string) {
-    return `${projectPath}:${projectSessionDir(projectPath)}:${sessionId ?? 'new'}`;
+    return `${workspaceLifecycleKey(projectPath)}:${projectSessionDir(projectPath)}:${sessionId ?? 'new'}`;
   }
 
   private runtimeSessionCacheKeys(projectPath: string, sessionId: string, filePath?: string) {
@@ -2468,8 +2534,14 @@ export class PiBridge {
     return keys;
   }
 
-  private isRuntimeSessionCacheKeyForProject(projectPath: string, key: string) {
-    return key.startsWith(`${projectPath}:${projectSessionDir(projectPath)}:`);
+  private isCachedSessionForProject(projectPath: string, cached: CachedSession) {
+    return this.projectIdentityMatches(workspaceLifecycleKey(projectPath), cached.projectKey ?? workspaceLifecycleKey(cached.projectPath), false);
+  }
+
+  private projectIdentityMatches(scopeKey: string, projectKey: string, includeDescendants: boolean) {
+    if (!includeDescendants) return projectKey === scopeKey;
+    const relative = path.relative(scopeKey, projectKey);
+    return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
   }
 
   private sessionDeletionLocked(projectPath: string, sessionId: string, filePath?: string) {
@@ -2487,7 +2559,7 @@ export class PiBridge {
     if (!filePath) return undefined;
     const targetPath = path.resolve(filePath);
     for (const [key, cached] of this.runtimeSessions) {
-      if (keys.has(key) || !this.isRuntimeSessionCacheKeyForProject(projectPath, key)) continue;
+      if (keys.has(key) || !this.isCachedSessionForProject(projectPath, cached)) continue;
       if (this.cachedSessionFile(await cached.promise.catch(() => undefined)) === targetPath) return cached;
     }
     return undefined;
@@ -2534,7 +2606,14 @@ export class PiBridge {
       && this.runtimeSessions.get(this.runtimeSessionCacheKey(projectPath, sessionId)) === entry;
   }
 
-  private deferRuntimeSessionDisposal(cacheKey: string, session: unknown) {
+  private deferRuntimeSessionDisposal(
+    projectPath: string,
+    cacheKey: string,
+    session: unknown,
+    projectKey = workspaceLifecycleKey(projectPath),
+    projectLexicalKey = lexicalProjectKey(projectPath),
+  ) {
+    const workspaceLease = this.workspaceLifecycle?.acquireActivity(projectPath);
     const disposal = (async () => {
       if (this.runtimeReadLeases.has(cacheKey)) {
         await new Promise<void>((resolve) => {
@@ -2547,9 +2626,29 @@ export class PiBridge {
           }
         });
       }
-      await this.disposeCachedSession(session).catch(() => this.disposeCachedSession(session));
-    })().catch(() => undefined).finally(() => this.deferredRuntimeDisposals.delete(disposal));
+      try {
+        await this.disposeCachedSession(session).catch(() => this.disposeCachedSession(session));
+      } catch {
+        this.rememberFailedProjectDisposal(projectPath, session, projectKey, projectLexicalKey);
+      }
+    })().finally(() => {
+      workspaceLease?.release();
+      this.deferredRuntimeDisposals.delete(disposal);
+    });
     this.deferredRuntimeDisposals.add(disposal);
+  }
+
+  private rememberFailedProjectDisposal(
+    projectPath: string,
+    session: unknown,
+    projectKey = workspaceLifecycleKey(projectPath),
+    projectLexicalKey = lexicalProjectKey(projectPath),
+  ) {
+    if (!session || typeof session !== 'object') return;
+    const failedKey = `${projectKey}\0${projectLexicalKey}`;
+    const failed = this.failedProjectDisposals.get(failedKey) ?? { projectPath, projectKey, projectLexicalKey, sessions: new Set<unknown>() };
+    failed.sessions.add(session);
+    this.failedProjectDisposals.set(failedKey, failed);
   }
 
   private async lockRuntimeSession(projectPath: string, sessionId: string, filePath?: string, countAsActivity = true, blockOperations = false) {
@@ -2557,47 +2656,55 @@ export class PiBridge {
   }
 
   private async lockRuntimeSessionWithState(projectPath: string, sessionId: string, filePath?: string, countAsActivity = true, blockOperations = false): Promise<RuntimeSessionLock | undefined> {
-    let resolvedFilePath = filePath;
-    if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
-    if (!resolvedFilePath) {
-      try {
-        resolvedFilePath = await resolveSessionFile(sessionId, projectPath);
-      } catch {
-        // The base session-id key is sufficient while a pending runtime has no resolvable file.
-        // Do not await its initialization here: recovery must see this lease before that promise settles.
-        resolvedFilePath = undefined;
+    const workspaceLease = this.workspaceLifecycle?.acquireActivity(projectPath);
+    let leaseTransferred = false;
+    try {
+      let resolvedFilePath = filePath;
+      if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
+      if (!resolvedFilePath) {
+        try {
+          resolvedFilePath = await resolveSessionFile(sessionId, projectPath);
+        } catch {
+          // The base session-id key is sufficient while a pending runtime has no resolvable file.
+          // Do not await its initialization here: recovery must see this lease before that promise settles.
+          resolvedFilePath = undefined;
+        }
       }
-    }
-    if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
+      if (this.sessionDeletionLocked(projectPath, sessionId, resolvedFilePath)) return undefined;
 
-    const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, resolvedFilePath);
-    const wasActive = [...keys].some((key) => this.activeRuntimeSessions.has(key) || this.operationBlockingRuntimeSessions.has(key));
-    for (const key of keys) {
-      this.leasedRuntimeSessions.set(key, (this.leasedRuntimeSessions.get(key) ?? 0) + 1);
-      if (countAsActivity) this.activeRuntimeSessions.set(key, (this.activeRuntimeSessions.get(key) ?? 0) + 1);
-      if (blockOperations) this.operationBlockingRuntimeSessions.set(key, (this.operationBlockingRuntimeSessions.get(key) ?? 0) + 1);
-    }
-    let active = true;
-    const release = () => {
-      if (!active) return;
-      active = false;
+      const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, resolvedFilePath);
+      const wasActive = [...keys].some((key) => this.activeRuntimeSessions.has(key) || this.operationBlockingRuntimeSessions.has(key));
       for (const key of keys) {
-        const leaseCount = this.leasedRuntimeSessions.get(key) ?? 0;
-        if (leaseCount <= 1) this.leasedRuntimeSessions.delete(key);
-        else this.leasedRuntimeSessions.set(key, leaseCount - 1);
-        if (countAsActivity) {
-          const activeCount = this.activeRuntimeSessions.get(key) ?? 0;
-          if (activeCount <= 1) this.activeRuntimeSessions.delete(key);
-          else this.activeRuntimeSessions.set(key, activeCount - 1);
-        }
-        if (blockOperations) {
-          const blockingCount = this.operationBlockingRuntimeSessions.get(key) ?? 0;
-          if (blockingCount <= 1) this.operationBlockingRuntimeSessions.delete(key);
-          else this.operationBlockingRuntimeSessions.set(key, blockingCount - 1);
-        }
+        this.leasedRuntimeSessions.set(key, (this.leasedRuntimeSessions.get(key) ?? 0) + 1);
+        if (countAsActivity) this.activeRuntimeSessions.set(key, (this.activeRuntimeSessions.get(key) ?? 0) + 1);
+        if (blockOperations) this.operationBlockingRuntimeSessions.set(key, (this.operationBlockingRuntimeSessions.get(key) ?? 0) + 1);
       }
-    };
-    return { release, wasActive };
+      let active = true;
+      const release = () => {
+        if (!active) return;
+        active = false;
+        for (const key of keys) {
+          const leaseCount = this.leasedRuntimeSessions.get(key) ?? 0;
+          if (leaseCount <= 1) this.leasedRuntimeSessions.delete(key);
+          else this.leasedRuntimeSessions.set(key, leaseCount - 1);
+          if (countAsActivity) {
+            const activeCount = this.activeRuntimeSessions.get(key) ?? 0;
+            if (activeCount <= 1) this.activeRuntimeSessions.delete(key);
+            else this.activeRuntimeSessions.set(key, activeCount - 1);
+          }
+          if (blockOperations) {
+            const blockingCount = this.operationBlockingRuntimeSessions.get(key) ?? 0;
+            if (blockingCount <= 1) this.operationBlockingRuntimeSessions.delete(key);
+            else this.operationBlockingRuntimeSessions.set(key, blockingCount - 1);
+          }
+        }
+        workspaceLease?.release();
+      };
+      leaseTransferred = true;
+      return { release, wasActive };
+    } finally {
+      if (!leaseTransferred) workspaceLease?.release();
+    }
   }
 
   private async markSessionActiveWithState(projectPath: string, sessionId?: string): Promise<RuntimeSessionLock> {
@@ -2625,8 +2732,14 @@ export class PiBridge {
     return cached.promise;
   }
 
-  private setCachedSession(cache: Map<string, CachedSession>, key: string, promise: Promise<unknown>) {
-    const cached: CachedSession = { promise, expiresAt: Date.now() + SESSION_CACHE_TTL_MS };
+  private setCachedSession(cache: Map<string, CachedSession>, projectPath: string, key: string, promise: Promise<unknown>) {
+    const cached: CachedSession = {
+      projectPath,
+      projectKey: workspaceLifecycleKey(projectPath),
+      projectLexicalKey: lexicalProjectKey(projectPath),
+      promise,
+      expiresAt: Date.now() + SESSION_CACHE_TTL_MS,
+    };
     cache.set(key, cached);
     this.scheduleCachedSessionEviction(cache, key, cached);
     return promise;
@@ -2651,7 +2764,16 @@ export class PiBridge {
     cache.delete(key);
     if (cached.timer) clearTimeout(cached.timer);
     const session = await cached.promise.catch(() => undefined);
-    await this.disposeCachedSession(session);
+    try {
+      await this.disposeCachedSession(session);
+    } catch (error) {
+      if (!cache.has(key)) {
+        cached.expiresAt = Date.now() + SESSION_CACHE_BUSY_RETRY_MS;
+        cache.set(key, cached);
+        this.scheduleCachedSessionEviction(cache, key, cached);
+      } else this.rememberFailedProjectDisposal(cached.projectPath, session, cached.projectKey, cached.projectLexicalKey);
+      throw error;
+    }
   }
 
   private async evictCachedSession(cache: Map<string, CachedSession>, key: string, cached: CachedSession) {
@@ -2680,8 +2802,28 @@ export class PiBridge {
       return;
     }
 
+    let workspaceLease;
+    try {
+      workspaceLease = this.workspaceLifecycle?.acquireActivity(cached.projectPath);
+    } catch {
+      cached.expiresAt = Date.now() + SESSION_CACHE_BUSY_RETRY_MS;
+      this.scheduleCachedSessionEviction(cache, key, cached);
+      return;
+    }
+
     cache.delete(key);
-    await this.disposeCachedSession(session);
+    try {
+      await this.disposeCachedSession(session);
+    } catch (error) {
+      if (!cache.has(key)) {
+        cached.expiresAt = Date.now() + SESSION_CACHE_BUSY_RETRY_MS;
+        cache.set(key, cached);
+        this.scheduleCachedSessionEviction(cache, key, cached);
+      } else this.rememberFailedProjectDisposal(cached.projectPath, session, cached.projectKey, cached.projectLexicalKey);
+      throw error;
+    } finally {
+      workspaceLease?.release();
+    }
   }
 
   private cachedSessionFile(session: unknown) {
@@ -2748,9 +2890,12 @@ export class PiBridge {
     }
   }
 
-  private createSessionPromise(factory: () => Promise<unknown>) {
+  private createSessionPromise(projectPath: string, factory: () => Promise<unknown>) {
+    const projectKey = workspaceLifecycleKey(projectPath);
+    const projectLexicalKey = lexicalProjectKey(projectPath);
+    const workspaceLease = this.workspaceLifecycle?.acquireActivity(projectPath);
     const task = Promise.resolve().then(factory);
-    if (this.sessionCreateTimeoutMs <= 0) return task;
+    if (this.sessionCreateTimeoutMs <= 0) return task.finally(() => workspaceLease?.release());
     let timedOut = false;
     let timer: NodeJS.Timeout | undefined;
     return new Promise<unknown>((resolve, reject) => {
@@ -2759,15 +2904,23 @@ export class PiBridge {
         reject(new Error('Agent session initialization timed out. Retry to start a fresh runtime.'));
       }, this.sessionCreateTimeoutMs);
       timer.unref();
-      void task.then((session) => {
+      void task.then(async (session) => {
         if (timer) clearTimeout(timer);
         if (timedOut) {
-          void this.disposeCachedSession(session).catch(() => undefined);
+          try {
+            await this.disposeCachedSession(session);
+          } catch {
+            this.rememberFailedProjectDisposal(projectPath, session, projectKey, projectLexicalKey);
+          } finally {
+            workspaceLease?.release();
+          }
           return;
         }
+        workspaceLease?.release();
         resolve(session);
       }, (error) => {
         if (timer) clearTimeout(timer);
+        workspaceLease?.release();
         if (!timedOut) reject(error);
       });
     });
@@ -2790,7 +2943,7 @@ export class PiBridge {
       return session;
     }
 
-    const sessionPromise = this.createSessionPromise(async () => {
+    const sessionPromise = this.createSessionPromise(projectPath, async () => {
       const sdk = await this.loadSdk();
       if (!sdk.createAgentSession) throw new Error('No supported pi SDK session factory found');
 
@@ -2818,7 +2971,7 @@ export class PiBridge {
       const result = await sdk.createAgentSession({ cwd: projectPath, sessionManager, settingsManager, resourceLoader });
       return result.session ?? result;
     });
-    this.setCachedSession(this.runtimeSessions, cacheKey, sessionPromise);
+    this.setCachedSession(this.runtimeSessions, projectPath, cacheKey, sessionPromise);
     try {
       const session = await sessionPromise;
       const cached = this.runtimeSessions.get(cacheKey);
@@ -2831,29 +2984,56 @@ export class PiBridge {
   }
 }
 
-export async function registerPiRoutes(app: FastifyInstance, registry: ProjectRegistry, bridge: PiBridge) {
+export async function registerPiRoutes(
+  app: FastifyInstance,
+  registry: ProjectRegistry,
+  bridge: PiBridge,
+  workspaceLifecycle?: WorkspaceLifecycleCoordinator,
+) {
   app.get('/ws/projects/:projectId/agent', { websocket: true }, (connection: any, request: any) => {
     const socket: WebSocket = connection.socket ?? connection;
-    const key = streamKey(request.params.projectId, request.query.sessionId);
-    bridge.subscribe(key, socket);
-    socket.on('message', (data: { toString(): string }) => {
-      try {
-        const message = JSON.parse(data.toString()) as ExtensionCustomUiClientMessage;
-        if (message.type === 'ping') sendWebSocketJson(socket, { type: 'pong' });
-        else bridge.handleExtensionCustomUiMessage(key, socket, message);
-      } catch {
-        sendWebSocketJson(socket, { type: 'error', message: 'Invalid websocket message' });
-      }
-    });
+    let workspaceLease: WorkspaceLifecycleLease | undefined;
+    try {
+      const blockedReason = registry.blockReason?.(request.params.projectId);
+      if (blockedReason) throw new Error(blockedReason);
+      const project = registry.get(request.params.projectId);
+      workspaceLease = workspaceLifecycle?.acquireActivity(project.path);
+      socket.on('error', () => {
+        try { socket.close?.(); } catch { /* Ignore close races. */ }
+      });
+      const key = streamKey(project.id, request.query.sessionId);
+      bridge.subscribe(key, socket, () => workspaceLease?.release());
+      socket.on('message', (data: { toString(): string }) => {
+        try {
+          const message = JSON.parse(data.toString()) as ExtensionCustomUiClientMessage;
+          if (message.type === 'ping') sendWebSocketJson(socket, { type: 'pong' });
+          else bridge.handleExtensionCustomUiMessage(key, socket, message);
+        } catch {
+          sendWebSocketJson(socket, { type: 'error', message: 'Invalid websocket message' });
+        }
+      });
+    } catch (error) {
+      workspaceLease?.release();
+      sendWebSocketJson(socket, { type: 'error', message: error instanceof Error ? error.message : 'Unknown project' });
+      socket.close?.();
+    }
   });
 
   app.get('/ws/projects/:projectId/notifications', { websocket: true }, (connection: any, request: any) => {
     const socket: WebSocket = connection.socket ?? connection;
+    let workspaceLease: WorkspaceLifecycleLease | undefined;
     try {
+      const blockedReason = registry.blockReason?.(request.params.projectId);
+      if (blockedReason) throw new Error(blockedReason);
       const project = registry.get(request.params.projectId);
-      bridge.subscribeNotifications(project.id, socket);
-    } catch {
-      sendWebSocketJson(socket, { type: 'error', message: 'Unknown project' });
+      workspaceLease = workspaceLifecycle?.acquireActivity(project.path);
+      socket.on('error', () => {
+        try { socket.close?.(); } catch { /* Ignore close races. */ }
+      });
+      bridge.subscribeNotifications(project.id, socket, () => workspaceLease?.release());
+    } catch (error) {
+      workspaceLease?.release();
+      sendWebSocketJson(socket, { type: 'error', message: error instanceof Error ? error.message : 'Unknown project' });
       return socket.close?.();
     }
     socket.on('message', (data: { toString(): string }) => {
@@ -3051,6 +3231,11 @@ function sendWebSocketJson(socket: WebSocket, message: Record<string, unknown>) 
   } catch {
     // Ignore write races with websocket close.
   }
+}
+
+function lexicalProjectKey(projectPath: string) {
+  const resolved = path.resolve(projectPath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
 function streamKey(projectId: string, sessionId?: string) {
