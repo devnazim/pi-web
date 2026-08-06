@@ -2,6 +2,7 @@ import { SquareTerminal, X } from 'lucide-solid';
 import { createEffect, createMemo, createSignal, For, onCleanup } from 'solid-js';
 import type { Terminal as XTermTerminal } from '@xterm/xterm';
 import { appWebSocketUrl } from './appUrl';
+import { terminalCopyAction } from './terminalShortcuts';
 import { isTerminalGeneratedReply, terminalQueriesExpectingReplies, terminalReplyMatchesQuery } from './terminalReplay';
 import './terminal-font.css';
 
@@ -646,12 +647,15 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
 function handleTerminalKeyEvent(event: KeyboardEvent, terminal: XTermTerminal) {
   if (event.type !== 'keydown') return true;
   const key = event.key.toLowerCase();
-  const isMac = navigator.platform.toLowerCase().includes('mac');
-  const shortcutModifier = isMac ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey;
+  const hasSelection = terminal.hasSelection();
+  const copyAction = terminalCopyAction(event, hasSelection, navigator.platform.toLowerCase().includes('mac'));
 
-  if (shortcutModifier && !event.altKey && key === 'c') {
+  if (copyAction) {
     event.preventDefault();
-    if (terminal.hasSelection()) void copyTerminalSelection(terminal.getSelection());
+    if (hasSelection) {
+      void copyTerminalSelection(terminal.getSelection());
+      if (copyAction === 'copy-and-clear') terminal.clearSelection();
+    }
     return false;
   }
 

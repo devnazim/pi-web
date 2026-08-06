@@ -7157,6 +7157,9 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
       next.set(submittedDraftKey, { submission: false, steering: false, ...submissions.get(submittedDraftKey), [submissionKind]: true });
       return next;
     });
+    setFileMention(undefined);
+    setSlashCommandMention(undefined);
+    setCommandArgumentMention(undefined);
     try {
     stopVoiceRecognition(true);
     const submissionTargetStillActive = () => props.sessionNavigationRevision === submittedNavigationRevision && props.project.id === projectId && props.sessionId === routeSessionId && activeComposerDraftKey === submittedDraftKey;
