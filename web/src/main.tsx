@@ -113,7 +113,7 @@ import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
 import MermaidDiagram from './MermaidDiagram';
-import { writeClipboardText } from './clipboard';
+import { COMPOSER_UPLOAD_ACCEPT, handleComposerFilePaste, writeClipboardText } from './clipboard';
 import { isCompleteMermaidFence, isMermaidCodeFence } from './mermaidRenderer';
 import 'monaco-editor/min/vs/editor/editor.main.css';
 import './styles.css';
@@ -6481,6 +6481,14 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     }
   }
 
+  function handleComposerPaste(event: ClipboardEvent) {
+    handleComposerFilePaste(event, {
+      busy: attachBusy(),
+      onFiles: (files) => void attach(files),
+      onError: showAttachErrorToast,
+    });
+  }
+
   createEffect(() => {
     const selection = props.treeSelection;
     stopVoiceRecognition(true);
@@ -7711,12 +7719,13 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
                 if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) updateFileMention(event.currentTarget);
               }}
               onKeyDown={handleComposerKeyDown}
+              onPaste={handleComposerPaste}
             />
           </div>
           <AgentStatusBar status={agentStatus.data?.status} loading={agentStatus.isLoading || agentStatus.isFetching} error={agentStatus.error} mobileOpen={mobileStatusOpen()} />
           <div class="composer-toolbar">
             <div class="composer-toolbar-leading">
-              <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files" aria-disabled={attachBusy()}><Plus class="size-4" /><input class="hidden" type="file" multiple disabled={attachBusy()} accept="image/*,video/*,.txt,.md,.pdf,.json,.jsonc,application/json" onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files); }} /></label>
+              <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files" aria-disabled={attachBusy()}><Plus class="size-4" /><input class="hidden" type="file" multiple disabled={attachBusy()} accept={COMPOSER_UPLOAD_ACCEPT} onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files); }} /></label>
               <button class={`ghost h-8 w-8 px-0 md:hidden ${mobileStatusOpen() ? 'bg-muted text-foreground' : ''}`} type="button" title={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-label={mobileStatusOpen() ? 'Hide status info' : 'Show status info'} aria-expanded={mobileStatusOpen()} onClick={() => setMobileStatusOpen((open) => !open)}><Activity class="size-4" /></button>
             </div>
             <div class="composer-toolbar-controls">
