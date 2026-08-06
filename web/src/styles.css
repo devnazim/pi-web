@@ -1074,6 +1074,10 @@ body {
     @apply bg-accent text-accent-foreground ring-1 ring-ring/50;
   }
 
+  .tree-row-focused {
+    @apply ring-1 ring-inset ring-ring/70;
+  }
+
   .tree-indent {
     @apply flex min-h-8 shrink-0 self-stretch;
   }

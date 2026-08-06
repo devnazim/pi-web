@@ -1,4 +1,5 @@
 import { QueryClient, QueryClientProvider, createInfiniteQuery, createQuery } from '@tanstack/solid-query';
+import { createVirtualizer, defaultRangeExtractor, type Range as VirtualRange } from '@tanstack/solid-virtual';
 import {
   Activity,
   AlignJustify,
@@ -128,7 +129,7 @@ type SessionSummary = { id: string; title: string; updatedAt: string; entryCount
 type SessionListResponse = { sessions: SessionSummary[]; nextCursor?: string; total?: number };
 type SessionEntry = { type: string; id: string; parentId: string | null; timestamp?: string; role?: string; content?: unknown; text?: string; message?: { role?: string; content?: unknown;[key: string]: unknown };[key: string]: unknown };
 type SessionTreeNode = { entry: SessionEntry; children: SessionTreeNode[]; label?: string; labelTimestamp?: string };
-type TreeViewNode = Omit<SessionTreeNode, 'children'> & { id: string; children: TreeViewNode[]; display: string; roleClass: string; searchText: string; isSettingsEntry: boolean; isEmptyAssistant: boolean };
+type TreeViewNode = Omit<SessionTreeNode, 'children'> & { id: string; children: TreeViewNode[]; isSettingsEntry: boolean; isEmptyAssistant: boolean };
 type SessionDetail = { sessionId: string; path: string; entries: SessionEntry[]; leafId: string | null; name?: string };
 type SessionTreeView = SessionDetail & { tree: TreeViewNode[] };
 type GitFile = { path: string; oldPath?: string; status: string; staged: boolean; unstaged: boolean; additions?: number; deletions?: number; stagedAdditions?: number; stagedDeletions?: number; unstagedAdditions?: number; unstagedDeletions?: number };
@@ -271,7 +272,7 @@ type MarkdownToken = Token & {
 };
 type MonacoApi = typeof import('monaco-editor');
 type CatppuccinPalette = { base: string; mantle: string; surface0: string; overlay0: string; text: string; subtext0: string; blue: string; lavender: string; sapphire: string; teal: string; green: string; yellow: string; peach: string; red: string; mauve: string; pink: string };
-type FlatTreeNode = { node: TreeViewNode; indent: number; showConnector: boolean; isLast: boolean; gutters: Array<{ position: number; show: boolean }>; isVirtualRootChild: boolean };
+type FlatTreeNode = { node: TreeViewNode; indent: number; level: number; positionInSet: number; setSize: number; showConnector: boolean; isLast: boolean; gutters: Array<{ position: number; show: boolean }>; isVirtualRootChild: boolean };
 type TreeFilterMode = 'default' | 'no-tools' | 'user-only' | 'labeled-only' | 'all';
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 type ChatToolOutputMode = 'compact' | 'expanded' | 'hidden';
@@ -372,6 +373,9 @@ const TRANSCRIPT_INITIAL_RENDER_COUNT = 160;
 const TRANSCRIPT_SEARCH_RENDER_COUNT = 160;
 const TRANSCRIPT_PREPEND_COUNT = 100;
 const TRANSCRIPT_PREPEND_SCROLL_THRESHOLD_PX = 240;
+const TREE_ROW_HEIGHT_PX = 32;
+const TREE_RENDER_OVERSCAN = 12;
+const TREE_SEARCH_DEBOUNCE_MS = 150;
 const WEBSOCKET_RECONNECT_MIN_DELAY_MS = 500;
 const WEBSOCKET_RECONNECT_MAX_DELAY_MS = 10_000;
 const WEBSOCKET_HEARTBEAT_INTERVAL_MS = 25_000;
@@ -8469,13 +8473,19 @@ function monacoLanguage(filePath: string) {
 }
 
 function SessionTreePanel(props: { project: Project; sessionId: string; selectedId?: string; resizing: boolean; onSelect: (selection?: TreeSelection) => void; onResizeStart: (event: PointerEvent) => void; onResizeKeyDown: (event: KeyboardEvent) => void; onResizeReset: () => void; onClose: () => void }) {
+  let treeScrollerRef: HTMLDivElement | undefined;
+  let positionedSessionKey: string | undefined;
+  let openingPositionFinalized = false;
+  let positionTreeFrame: number | undefined;
+  const treeSearchTextByEntryId = new Map<string, { entry: SessionEntry; text: string }>();
   const [search, setSearch] = createSignal('');
+  const [deferredSearch, setDeferredSearch] = createSignal('');
+  const [focusedTreeEntryId, setFocusedTreeEntryId] = createSignal<string>();
   const [filterMode, setFilterMode] = createSignal<TreeFilterMode>('default');
   const session = createQuery(() => ({
     queryKey: ['session', props.project.id, props.sessionId],
     queryFn: ({ signal }) => api<SessionDetail>(`/api/projects/${props.project.id}/session?sessionId=${encodeURIComponent(props.sessionId)}`, { signal }),
     select: sessionTreeViewFromDetail,
-    reconcile: 'id',
     staleTime: SESSION_DETAIL_CACHE_STALE_TIME_MS,
   }));
   const activePathIds = createMemo(() => new Set(session.data ? branchForEntry(session.data.entries, session.data.leafId).map((entry) => entry.id) : []));
@@ -8487,11 +8497,161 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
   const [summarizingId, setSummarizingId] = createSignal<string>();
   const [summaryError, setSummaryError] = createSignal('');
   const flatNodes = createMemo(() => flattenSessionTree(session.data?.tree ?? [], collapsedIds()));
-  const filteredNodes = createMemo(() => filterTreeNodes(flatNodes(), search(), filterMode(), session.data?.leafId ?? null));
+  const filteredNodes = createMemo(() => filterTreeNodes(flatNodes(), deferredSearch(), filterMode(), session.data?.leafId ?? null, cachedTreeEntrySearchText));
+  const focusedTreeIndex = createMemo(() => filteredNodes().findIndex((flatNode) => flatNode.node.entry.id === focusedTreeEntryId()));
+  const treeVirtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() { return filteredNodes().length; },
+    getScrollElement: () => treeScrollerRef ?? null,
+    estimateSize: () => TREE_ROW_HEIGHT_PX,
+    overscan: TREE_RENDER_OVERSCAN,
+    getItemKey: (index) => filteredNodes()[index]?.node.id ?? index,
+    get rangeExtractor() {
+      const focusedIndex = focusedTreeIndex();
+      return (range: VirtualRange) => {
+        const indexes = defaultRangeExtractor(range);
+        if (focusedIndex === -1 || indexes.includes(focusedIndex)) return indexes;
+        return [...indexes, focusedIndex].sort((a, b) => a - b);
+      };
+    },
+  });
+  const focusedTreeNodeDomId = createMemo(() => {
+    const entryId = focusedTreeEntryId();
+    if (!entryId || !treeVirtualizer.getVirtualItems().some((virtualRow) => filteredNodes()[virtualRow.index]?.node.entry.id === entryId)) return undefined;
+    return `session-tree-node-${entryId}`;
+  });
+
+  createEffect(() => {
+    const value = search();
+    if (!value) {
+      setDeferredSearch('');
+      return;
+    }
+    const timeout = window.setTimeout(() => setDeferredSearch(value), TREE_SEARCH_DEBOUNCE_MS);
+    onCleanup(() => window.clearTimeout(timeout));
+  });
+
+  createEffect(() => {
+    const nodes = filteredNodes();
+    const sessionKey = `${props.project.id}\u0000${props.sessionId}`;
+    const detail = session.data;
+    if (positionedSessionKey !== sessionKey) {
+      positionedSessionKey = sessionKey;
+      openingPositionFinalized = false;
+      treeSearchTextByEntryId.clear();
+    }
+    if (!detail || openingPositionFinalized || !nodes.length) return;
+
+    const visibleIndexById = new Map(nodes.map((flatNode, index) => [flatNode.node.entry.id, index]));
+    const entriesById = new Map(detail.entries.map((entry) => [entry.id, entry]));
+    const visited = new Set<string>();
+    let targetId = props.selectedId ?? detail.leafId ?? undefined;
+    while (targetId && !visibleIndexById.has(targetId) && !visited.has(targetId)) {
+      visited.add(targetId);
+      targetId = entriesById.get(targetId)?.parentId ?? undefined;
+    }
+    const targetIndex = targetId === undefined ? nodes.length - 1 : visibleIndexById.get(targetId) ?? nodes.length - 1;
+    setFocusedTreeEntryId(nodes[targetIndex].node.entry.id);
+    if (positionTreeFrame !== undefined) cancelAnimationFrame(positionTreeFrame);
+    positionTreeFrame = requestAnimationFrame(() => {
+      positionTreeFrame = undefined;
+      if (`${props.project.id}\u0000${props.sessionId}` === sessionKey) treeVirtualizer.scrollToIndex(targetIndex, { align: 'end' });
+    });
+    if (!session.isFetching) openingPositionFinalized = true;
+  });
+
+  createEffect(() => {
+    const nodes = filteredNodes();
+    const focusedId = focusedTreeEntryId();
+    if (!focusedId || !nodes.length || nodes.some((flatNode) => flatNode.node.entry.id === focusedId)) return;
+    const firstRenderedIndex = treeVirtualizer.getVirtualItems()[0]?.index ?? 0;
+    setFocusedTreeEntryId(nodes[Math.min(firstRenderedIndex, nodes.length - 1)].node.entry.id);
+  });
+
+  onCleanup(() => {
+    if (positionTreeFrame !== undefined) cancelAnimationFrame(positionTreeFrame);
+  });
+
+  function cachedTreeEntrySearchText(entry: SessionEntry) {
+    const cached = treeSearchTextByEntryId.get(entry.id);
+    if (cached?.entry === entry) return cached.text;
+    const text = entryText(entry);
+    const searchText = [entryRole(entry), text, treeEntryDisplay(entry, text)].filter(Boolean).join(' ').toLowerCase();
+    treeSearchTextByEntryId.set(entry.id, { entry, text: searchText });
+    return searchText;
+  }
 
   function continueFrom(entry: SessionEntry) {
     setNodeMenu(undefined);
     props.onSelect(treeSelectionForEntry(entry, 'none'));
+  }
+
+  function handleTreeKeyDown(event: KeyboardEvent) {
+    if (event.target !== event.currentTarget) return;
+    const nodes = filteredNodes();
+    if (!nodes.length) return;
+    const currentIndex = Math.max(0, focusedTreeIndex());
+    const current = nodes[currentIndex];
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      continueFrom(current.node.entry);
+      return;
+    }
+    if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+      event.preventDefault();
+      const rect = document.getElementById(`session-tree-node-${current.node.entry.id}`)?.getBoundingClientRect();
+      showNodeMenu(current, rect?.left ?? 0, rect?.bottom ?? 0);
+      return;
+    }
+
+    const pageSize = Math.max(1, Math.floor((treeScrollerRef?.clientHeight ?? TREE_ROW_HEIGHT_PX) / TREE_ROW_HEIGHT_PX) - 1);
+    let targetIndex: number | undefined;
+    if (event.key === 'ArrowDown') targetIndex = currentIndex + 1;
+    else if (event.key === 'ArrowUp') targetIndex = currentIndex - 1;
+    else if (event.key === 'PageDown') targetIndex = currentIndex + pageSize;
+    else if (event.key === 'PageUp') targetIndex = currentIndex - pageSize;
+    else if (event.key === 'Home') targetIndex = 0;
+    else if (event.key === 'End') targetIndex = nodes.length - 1;
+    else if (event.key === 'ArrowRight') {
+      if (!current.node.children.length) return;
+      event.preventDefault();
+      if (collapsedIds().has(current.node.entry.id)) {
+        toggleCollapsed(current.node.entry);
+        return;
+      }
+      const next = nodes[currentIndex + 1];
+      const visibleIds = new Set(nodes.map((flatNode) => flatNode.node.entry.id));
+      const entriesById = new Map((session.data?.entries ?? []).map((entry) => [entry.id, entry]));
+      const visited = new Set<string>();
+      let parentId = next?.node.entry.parentId ?? undefined;
+      while (parentId && !visibleIds.has(parentId) && !visited.has(parentId)) {
+        visited.add(parentId);
+        parentId = entriesById.get(parentId)?.parentId ?? undefined;
+      }
+      if (parentId === current.node.entry.id) targetIndex = currentIndex + 1;
+      else return;
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      if (current.node.children.length && !collapsedIds().has(current.node.entry.id)) {
+        toggleCollapsed(current.node.entry);
+        return;
+      }
+      const visibleIndexById = new Map(nodes.map((flatNode, index) => [flatNode.node.entry.id, index]));
+      const entriesById = new Map((session.data?.entries ?? []).map((entry) => [entry.id, entry]));
+      const visited = new Set<string>();
+      let parentId = current.node.entry.parentId ?? undefined;
+      while (parentId && !visibleIndexById.has(parentId) && !visited.has(parentId)) {
+        visited.add(parentId);
+        parentId = entriesById.get(parentId)?.parentId ?? undefined;
+      }
+      if (!parentId) return;
+      targetIndex = visibleIndexById.get(parentId);
+    } else return;
+
+    if (targetIndex === undefined) return;
+    event.preventDefault();
+    const nextIndex = Math.max(0, Math.min(targetIndex, nodes.length - 1));
+    setFocusedTreeEntryId(nodes[nextIndex].node.entry.id);
+    treeVirtualizer.scrollToIndex(nextIndex, { align: 'auto' });
   }
 
   function toggleCollapsed(entry: SessionEntry) {
@@ -8506,13 +8666,18 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
   function openNodeMenu(flatNode: FlatTreeNode, event: MouseEvent) {
     event.preventDefault();
     event.stopPropagation();
+    showNodeMenu(flatNode, event.clientX, event.clientY);
+  }
+
+  function showNodeMenu(flatNode: FlatTreeNode, x: number, y: number) {
+    setFocusedTreeEntryId(flatNode.node.entry.id);
     setNodeMenu({
       entry: flatNode.node.entry,
       label: flatNode.node.label,
       hasChildren: flatNode.node.children.length > 0,
       collapsed: collapsedIds().has(flatNode.node.entry.id),
-      x: event.clientX,
-      y: event.clientY,
+      x,
+      y,
     });
   }
 
@@ -8533,7 +8698,13 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
 
   function copyEntryId(entry: SessionEntry) {
     setNodeMenu(undefined);
+    queueMicrotask(() => treeScrollerRef?.focus());
     void copyText(entry.id).catch((error) => console.error('Could not copy entry ID', error));
+  }
+
+  function dismissNodeMenu(restoreFocus = true) {
+    setNodeMenu(undefined);
+    if (restoreFocus) queueMicrotask(() => treeScrollerRef?.focus());
   }
 
   function confirmSummary(entry: SessionEntry) {
@@ -8596,45 +8767,69 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
           <UiSelect compact class="w-44 shrink-0" value={filterMode()} onChange={(value) => setFilterMode(value as TreeFilterMode)} options={TREE_FILTER_OPTIONS} ariaLabel="Tree filter" />
           <span class="text-xs text-muted-foreground">{filteredNodes().length}</span>
         </div>
-        <div class="session-tree-list">
+        <div
+          ref={treeScrollerRef}
+          class="session-tree-list outline-none focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50"
+          role="tree"
+          tabIndex={0}
+          aria-label="Session tree entries"
+          aria-activedescendant={focusedTreeNodeDomId()}
+          onKeyDown={handleTreeKeyDown}
+        >
           <Show when={!session.isLoading} fallback={<div class="p-2 text-muted-foreground">Loading tree...</div>}>
             <Show when={!session.error} fallback={<div class="p-2 text-destructive">{session.error instanceof Error ? session.error.message : 'Could not load tree'}</div>}>
               <Show when={filteredNodes().length} fallback={<div class="p-2 text-muted-foreground">No entries found</div>}>
-                <For each={filteredNodes()}>
-                  {(flatNode) => {
-                    const entry = () => flatNode.node.entry;
-                    const hasChildren = () => flatNode.node.children.length > 0;
-                    const collapsed = () => collapsedIds().has(entry().id);
-                    const isActiveLeaf = () => !props.selectedId && session.data?.leafId === entry().id;
-                    const isSelected = () => props.selectedId === entry().id;
-                    return (
-                      <div
-                        class={`tree-row group ${activePathIds().has(entry().id) ? 'tree-row-path' : ''} ${isActiveLeaf() ? 'tree-row-leaf' : ''} ${isSelected() ? 'tree-row-selected' : ''}`}
-                        role="button"
-                        tabIndex={0}
-                        title="Select this entry"
-                        onClick={() => continueFrom(entry())}
-                        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') continueFrom(entry()); }}
-                        onContextMenu={(event) => openNodeMenu(flatNode, event)}
-                      >
-                        <TreeIndent flatNode={flatNode} multipleRoots={(session.data?.tree.length ?? 0) > 1} />
-                        <button
-                          class={`tree-fold ${hasChildren() ? '' : 'tree-fold-empty'}`}
-                          title={hasChildren() ? (collapsed() ? 'Expand' : 'Collapse') : undefined}
-                          onClick={(event) => { event.stopPropagation(); if (hasChildren()) toggleCollapsed(entry()); }}
-                        >
-                          <Show when={hasChildren()} fallback={<span />}>{collapsed() ? <ChevronRight class="size-4" /> : <ChevronDown class="size-4" />}</Show>
-                        </button>
-                        <span class="tree-entry-icon"><TreeEntryIcon entry={entry()} /></span>
-                        <Show when={flatNode.node.label}><span class="tree-label">{flatNode.node.label}</span></Show>
-                        <span class={`tree-entry-text ${flatNode.node.roleClass}`}>{flatNode.node.display}</span>
-                        <div class="ml-auto flex shrink-0 items-center gap-1">
-                          <button class="tree-row-menu-button" title="Tree options" onClick={(event) => openNodeMenu(flatNode, event)}><Ellipsis class="size-4" /></button>
-                        </div>
-                      </div>
-                    );
-                  }}
-                </For>
+                <div class="relative w-full" style={{ height: `${treeVirtualizer.getTotalSize()}px` }}>
+                  <For each={treeVirtualizer.getVirtualItems()}>
+                    {(virtualRow) => (
+                      <Show when={filteredNodes()[virtualRow.index]}>
+                        {(flatNode) => {
+                          const entry = () => flatNode().node.entry;
+                          const hasChildren = () => flatNode().node.children.length > 0;
+                          const collapsed = () => collapsedIds().has(entry().id);
+                          const isActiveLeaf = () => !props.selectedId && session.data?.leafId === entry().id;
+                          const isSelected = () => props.selectedId === entry().id;
+                          return (
+                            <div
+                              id={`session-tree-node-${entry().id}`}
+                              class={`tree-row group absolute left-0 top-0 ${activePathIds().has(entry().id) ? 'tree-row-path' : ''} ${isActiveLeaf() ? 'tree-row-leaf' : ''} ${isSelected() ? 'tree-row-selected' : ''} ${focusedTreeEntryId() === entry().id ? 'tree-row-focused' : ''}`}
+                              style={{ transform: `translateY(${virtualRow.start}px)` }}
+                              role="treeitem"
+                              tabIndex={-1}
+                              aria-level={flatNode().level}
+                              aria-posinset={flatNode().positionInSet}
+                              aria-setsize={flatNode().setSize}
+                              aria-expanded={hasChildren() ? !collapsed() : undefined}
+                              aria-selected={isSelected() || isActiveLeaf()}
+                              title="Select this entry"
+                              onPointerDown={(event) => { if (event.button === 0) event.preventDefault(); }}
+                              onClick={() => { setFocusedTreeEntryId(entry().id); treeScrollerRef?.focus(); continueFrom(entry()); }}
+                              onContextMenu={(event) => openNodeMenu(flatNode(), event)}
+                            >
+                              <TreeIndent flatNode={flatNode()} multipleRoots={(session.data?.tree.length ?? 0) > 1} />
+                              <button
+                                class={`tree-fold ${hasChildren() ? '' : 'tree-fold-empty'}`}
+                                title={hasChildren() ? (collapsed() ? 'Expand' : 'Collapse') : undefined}
+                                disabled={!hasChildren()}
+                                tabIndex={-1}
+                                onPointerDown={(event) => { if (event.button === 0) event.preventDefault(); }}
+                                onClick={(event) => { event.stopPropagation(); if (hasChildren()) toggleCollapsed(entry()); setFocusedTreeEntryId(entry().id); treeScrollerRef?.focus(); }}
+                              >
+                                <Show when={hasChildren()} fallback={<span />}>{collapsed() ? <ChevronRight class="size-4" /> : <ChevronDown class="size-4" />}</Show>
+                              </button>
+                              <span class="tree-entry-icon"><TreeEntryIcon entry={entry()} /></span>
+                              <Show when={flatNode().node.label}><span class="tree-label">{flatNode().node.label}</span></Show>
+                              <span class={`tree-entry-text ${entryRoleClass(entry())}`}>{treeEntryDisplay(entry())}</span>
+                              <div class="ml-auto flex shrink-0 items-center gap-1">
+                                <button class="tree-row-menu-button" title="Tree options" tabIndex={-1} onPointerDown={(event) => { if (event.button === 0) event.preventDefault(); }} onClick={(event) => openNodeMenu(flatNode(), event)}><Ellipsis class="size-4" /></button>
+                              </div>
+                            </div>
+                          );
+                        }}
+                      </Show>
+                    )}
+                  </For>
+                </div>
               </Show>
             </Show>
           </Show>
@@ -8646,11 +8841,11 @@ function SessionTreePanel(props: { project: Project; sessionId: string; selected
             menu={menu()}
             onSummarize={confirmSummary}
             onSummarizeWithPrompt={promptForSummary}
-            onToggleFold={(entry) => { setNodeMenu(undefined); toggleCollapsed(entry); }}
+            onToggleFold={(entry) => { setNodeMenu(undefined); toggleCollapsed(entry); queueMicrotask(() => treeScrollerRef?.focus()); }}
             onSetLabel={(entry, label) => setEntryLabel(entry, label)}
-            onClearLabel={(entry) => updateEntryLabel(entry.id, undefined).then(() => setNodeMenu(undefined))}
+            onClearLabel={(entry) => { dismissNodeMenu(); void updateEntryLabel(entry.id, undefined).catch((error) => console.error('Could not clear entry label', error)); }}
             onCopyEntryId={copyEntryId}
-            onDismiss={() => setNodeMenu(undefined)}
+            onDismiss={dismissNodeMenu}
           />
         )}
       </Show>
@@ -8727,12 +8922,16 @@ function TreeNodeMenu(props: {
   onSetLabel: (entry: SessionEntry, label?: string) => void;
   onClearLabel: (entry: SessionEntry) => void;
   onCopyEntryId: (entry: SessionEntry) => void;
-  onDismiss: () => void;
+  onDismiss: (restoreFocus?: boolean) => void;
 }) {
+  let menuRef: HTMLDivElement | undefined;
+
+  onMount(() => menuRef?.querySelector<HTMLButtonElement>('button')?.focus());
+
   createEffect(() => {
-    const dismiss = () => props.onDismiss();
+    const dismiss = () => props.onDismiss(false);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') props.onDismiss();
+      if (event.key === 'Escape') props.onDismiss(true);
     };
     window.addEventListener('mousedown', dismiss);
     window.addEventListener('keydown', onKeyDown);
@@ -8749,7 +8948,7 @@ function TreeNodeMenu(props: {
   const top = Math.max(margin, Math.min(props.menu.y, window.innerHeight - menuHeight - margin));
 
   return (
-    <div class="project-menu tree-node-menu" style={{ left: `${left}px`, top: `${top}px` }} onMouseDown={(event) => event.stopPropagation()}>
+    <div ref={menuRef} class="project-menu tree-node-menu" style={{ left: `${left}px`, top: `${top}px` }} onMouseDown={(event) => event.stopPropagation()}>
       <button class="project-menu-item" onClick={() => props.onSummarize(props.menu.entry)}>Summarize branch</button>
       <button class="project-menu-item" onClick={() => props.onSummarizeWithPrompt(props.menu.entry)}>Summarize branch with prompt...</button>
       <div class="project-menu-divider" />
@@ -8867,6 +9066,7 @@ async function copyText(text: string) {
     // Fall back to a temporary textarea below.
   }
 
+  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
   const textarea = document.createElement('textarea');
   textarea.value = text;
   textarea.setAttribute('readonly', '');
@@ -8880,6 +9080,7 @@ async function copyText(text: string) {
     if (!document.execCommand('copy')) throw new Error('Copy command was rejected');
   } finally {
     document.body.removeChild(textarea);
+    if (activeElement?.isConnected) activeElement.focus();
   }
 }
 
@@ -13934,14 +14135,10 @@ function treeViewNodesFromSessionNodes(roots: SessionTreeNode[], containsActive:
   const viewByNode = new Map<SessionTreeNode, TreeViewNode>();
   for (let i = allNodes.length - 1; i >= 0; i -= 1) {
     const node = allNodes[i];
-    const display = treeEntryDisplay(node.entry);
     viewByNode.set(node, {
       ...node,
       id: node.entry.id,
       children: orderTreeNodesByActivePath(node.children, containsActive).flatMap((child) => viewByNode.get(child) ?? []),
-      display,
-      roleClass: entryRoleClass(node.entry),
-      searchText: [node.label, entryRole(node.entry), entryText(node.entry), display].filter(Boolean).join(' ').toLowerCase(),
       isSettingsEntry: ['label', 'custom', 'model_change', 'thinking_level_change', 'session_info'].includes(node.entry.type),
       isEmptyAssistant: node.entry.type === 'message'
         && node.entry.message?.role === 'assistant'
@@ -13957,17 +14154,29 @@ function treeViewNodesFromSessionNodes(roots: SessionTreeNode[], containsActive:
 function flattenSessionTree(roots: TreeViewNode[], collapsedIds: Set<string>): FlatTreeNode[] {
   const result: FlatTreeNode[] = [];
   const multipleRoots = roots.length > 1;
-  const stack: Array<[TreeViewNode, number, boolean, boolean, boolean, Array<{ position: number; show: boolean }>, boolean]> = [];
+  const stack: Array<FlatTreeNode & { justBranched: boolean }> = [];
   for (let i = roots.length - 1; i >= 0; i -= 1) {
-    stack.push([roots[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, i === roots.length - 1, [], multipleRoots]);
+    stack.push({
+      node: roots[i],
+      indent: multipleRoots ? 1 : 0,
+      level: 1,
+      positionInSet: i + 1,
+      setSize: roots.length,
+      justBranched: multipleRoots,
+      showConnector: multipleRoots,
+      isLast: i === roots.length - 1,
+      gutters: [],
+      isVirtualRootChild: multipleRoots,
+    });
   }
 
   const visited = new Set<TreeViewNode>();
   while (stack.length) {
-    const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop()!;
+    const { justBranched, ...flatNode } = stack.pop()!;
+    const { node, indent, showConnector, isLast, gutters, isVirtualRootChild, level } = flatNode;
     if (visited.has(node)) continue;
     visited.add(node);
-    result.push({ node, indent, showConnector, isLast, gutters, isVirtualRootChild });
+    result.push(flatNode);
 
     if (collapsedIds.has(node.entry.id)) continue;
 
@@ -13978,7 +14187,18 @@ function flattenSessionTree(roots: TreeViewNode[], collapsedIds: Set<string>): F
     const childGutters = showConnector && !isVirtualRootChild ? [...gutters, { position: Math.max(0, displayIndent - 1), show: !isLast }] : gutters;
 
     for (let i = children.length - 1; i >= 0; i -= 1) {
-      stack.push([children[i], childIndent, multipleChildren, multipleChildren, i === children.length - 1, childGutters, false]);
+      stack.push({
+        node: children[i],
+        indent: childIndent,
+        level: level + 1,
+        positionInSet: i + 1,
+        setSize: children.length,
+        justBranched: multipleChildren,
+        showConnector: multipleChildren,
+        isLast: i === children.length - 1,
+        gutters: childGutters,
+        isVirtualRootChild: false,
+      });
     }
   }
   return result;
@@ -14016,7 +14236,7 @@ function sessionEntryTimestampMs(entry: SessionEntry) {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
-function filterTreeNodes(nodes: FlatTreeNode[], search: string, filterMode: TreeFilterMode, leafId: string | null) {
+function filterTreeNodes(nodes: FlatTreeNode[], search: string, filterMode: TreeFilterMode, leafId: string | null, searchTextForEntry: (entry: SessionEntry) => string) {
   const tokens = search.toLowerCase().split(/\s+/).filter(Boolean);
   return nodes.filter((flatNode) => {
     const entry = flatNode.node.entry;
@@ -14029,7 +14249,9 @@ function filterTreeNodes(nodes: FlatTreeNode[], search: string, filterMode: Tree
       || (filterMode === 'user-only' && entry.type === 'message' && entry.message?.role === 'user')
       || (filterMode === 'labeled-only' && flatNode.node.label !== undefined);
     if (!passesFilter) return false;
-    return !tokens.length || tokens.every((token) => flatNode.node.searchText.includes(token));
+    if (!tokens.length) return true;
+    const searchText = [flatNode.node.label?.toLowerCase(), searchTextForEntry(entry)].filter(Boolean).join(' ');
+    return tokens.every((token) => searchText.includes(token));
   });
 }
 
@@ -14068,8 +14290,8 @@ function treeEntryIcon(entry: SessionEntry): LucideIcon {
   return FileText;
 }
 
-function treeEntryDisplay(entry: SessionEntry) {
-  const text = entryText(entry).replace(/[\n\t]/g, ' ').trim();
+function treeEntryDisplay(entry: SessionEntry, entryContent = entryText(entry)) {
+  const text = entryContent.replace(/[\n\t]/g, ' ').trim();
   if (entry.type === 'message') return `${entry.message?.role ?? 'message'}: ${text || fallbackEntryText(entry)}`;
   if (entry.type === 'custom_message') return `[${entry.customType}]: ${text}`;
   if (entry.type === 'compaction') return `[compaction: ${Math.round(Number(entry.tokensBefore ?? 0) / 1000)}k tokens]`;
@@ -14094,7 +14316,21 @@ function entryRoleClass(entry: SessionEntry) {
 }
 
 function hasTextContent(content: unknown) {
-  return contentText(content).trim().length > 0;
+  if (typeof content === 'string') return content.trim().length > 0;
+  if (Array.isArray(content)) return content.some((part) => {
+    if (typeof part === 'string') return part.trim().length > 0;
+    if (part && typeof part === 'object') {
+      const record = part as Record<string, unknown>;
+      if (typeof record.text === 'string') return record.text.trim().length > 0;
+      if (typeof record.thinking === 'string') return false;
+      if (typeof record.name === 'string' || typeof record.type === 'string') return true;
+    }
+    const serialized = JSON.stringify(part);
+    return Boolean(serialized?.trim());
+  });
+  if (!content) return false;
+  const serialized = JSON.stringify(content);
+  return Boolean(serialized?.trim());
 }
 
 function richTextParts(text: string): RichTextPart[] {
