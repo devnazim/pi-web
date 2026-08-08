@@ -20,6 +20,10 @@ const FONT_FAMILY = '"Pi GeistMono Nerd Font Mono", "GeistMono Nerd Font Mono", 
 const FONT_MEASURE_FAMILY = 'Pi GeistMono Nerd Font Mono';
 const FONT_SIZE = 14;
 const LINE_HEIGHT = 1.25;
+const MIN_COLS = 20;
+const MIN_ROWS = 4;
+const MAX_COLS = 500;
+const MAX_ROWS = 200;
 let runtimePromise: Promise<TerminalRuntime> | undefined;
 
 export default function ExtensionCustomUiTerminal(props: {
@@ -49,11 +53,14 @@ export default function ExtensionCustomUiTerminal(props: {
     if (!terminal || !fit || !host?.isConnected) return;
     try {
       fit.fit();
+      const cols = Math.max(MIN_COLS, Math.min(MAX_COLS, terminal.cols));
+      const rows = Math.max(MIN_ROWS, Math.min(MAX_ROWS, terminal.rows));
+      if (terminal.cols !== cols || terminal.rows !== rows) terminal.resize(cols, rows);
       if (forceRefresh && terminal.rows > 0) {
         terminal.clearTextureAtlas();
         terminal.refresh(0, terminal.rows - 1);
       }
-      if (epoch !== undefined) send({ type: 'agent:ui-custom-resize', epoch, cols: terminal.cols, rows: terminal.rows });
+      if (epoch !== undefined) send({ type: 'agent:ui-custom-resize', epoch, cols, rows });
     } catch {
       // Layout can disappear while the surrounding custom UI is closing.
     }

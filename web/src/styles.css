@@ -1511,11 +1511,12 @@ body {
   .extension-custom-ui-terminal {
     height: min(45vh, 25rem);
     height: min(45dvh, 25rem);
-    @apply bg-white p-2 dark:bg-[#141414];
+    @apply bg-white dark:bg-[#141414];
   }
 
   .extension-custom-ui-terminal .xterm {
     height: 100%;
+    padding: 0.5rem;
   }
 
   .extension-ui-dock {
@@ -3013,7 +3014,7 @@ body {
   }
 
   .terminal-host {
-    @apply min-h-0 min-w-0 overflow-hidden bg-background px-2 pt-2 pb-0 text-sm outline-none;
+    @apply min-h-0 min-w-0 overflow-hidden bg-background text-sm outline-none;
     width: 100%;
     max-width: 100%;
     font-family: var(--font-terminal);
@@ -3021,7 +3022,7 @@ body {
   }
 
   .terminal-host .xterm {
-    @apply h-full min-h-0 min-w-0 max-w-full;
+    @apply h-full min-h-0 min-w-0 max-w-full px-2 pt-2;
     padding-bottom: 0.875rem;
     font-family: var(--font-terminal);
     font-feature-settings: 'liga' 0, 'calt' 0;

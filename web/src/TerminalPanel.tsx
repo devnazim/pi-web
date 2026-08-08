@@ -8,8 +8,8 @@ import './terminal-font.css';
 
 type TerminalProject = { id: string; path: string };
 type ResolvedThemeMode = 'light' | 'dark';
-type TerminalStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
-type TerminalServerMessage = { type?: string; data?: string; dataOffset?: number; replay?: boolean; responseQuery?: string; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
+type TerminalStatus = 'connecting' | 'restoring' | 'connected' | 'disconnected' | 'error';
+type TerminalServerMessage = { type?: string; data?: string; dataOffset?: number; replay?: boolean; responseQuery?: string; cols?: number; rows?: number; resizeId?: number; hydrated?: boolean; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
 type TerminalRuntime = { Terminal: typeof import('@xterm/xterm').Terminal; FitAddon: typeof import('@xterm/addon-fit').FitAddon };
 type Disposable = { dispose(): void };
 type TerminalModifier = 'ctrl' | 'alt' | 'shift';
@@ -61,10 +61,16 @@ const TERMINAL_HEARTBEAT_MS = 30_000;
 const TERMINAL_HEARTBEAT_TIMEOUT_MS = 30_000;
 const TERMINAL_RESIZE_SEND_DELAY_MS = 80;
 const TERMINAL_RESIZE_SETTLE_DELAY_MS = 180;
+const MIN_TERMINAL_COLS = 20;
+const MIN_TERMINAL_ROWS = 5;
+const MAX_TERMINAL_COLS = 500;
+const MAX_TERMINAL_ROWS = 200;
 const TERMINAL_RECONNECT_BASE_DELAY_MS = 750;
 const TERMINAL_RECONNECT_MAX_DELAY_MS = 8_000;
 const TERMINAL_RECONNECT_STABLE_MS = 10_000;
 const TERMINAL_REPLACED_CLOSE_CODE = 4001;
+const TERMINAL_STALE_CONNECTION_CLOSE_CODE = 4002;
+const TERMINAL_PROTOCOL = '2';
 const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
   '`': '~',
   '1': '!',
@@ -90,6 +96,8 @@ const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
 };
 let terminalRuntimePromise: Promise<TerminalRuntime> | undefined;
 let terminalPrimaryClipboardText = '';
+let terminalConnectionGeneration = 0;
+const terminalClientId = globalThis.crypto?.randomUUID?.() ?? `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
 export default function TerminalPanel(props: { project: TerminalProject; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onClose: () => void }) {
   let terminalElement: HTMLDivElement | undefined;
@@ -98,6 +106,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
   let sendInputRef: ((data: string) => void) | undefined;
   let mobileShortcutPointer: { id: number; x: number; y: number; moved: boolean } | undefined;
   let autoReconnectAttempts = 0;
+  let pendingProjectId = props.project.id;
+  let pendingGeneratedInput = '';
+  let pendingInput = '';
+  let pendingMetadata: { cwd?: string; title?: string } = {};
   const [status, setStatus] = createSignal<TerminalStatus>('connecting');
   const [shellName, setShellName] = createSignal('terminal');
   const [cwd, setCwd] = createSignal(props.project.path);
@@ -108,6 +120,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
   const statusText = createMemo(() => {
     if (status() === 'connected') return 'Connected';
     if (status() === 'connecting') return 'Connecting';
+    if (status() === 'restoring') return 'Restoring';
     if (status() === 'error') return 'Error';
     return 'Disconnected';
   });
@@ -143,14 +156,14 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     focusTerminal();
   };
   const clearTerminal = () => {
-    const activeTerminal = terminal;
-    activeTerminal?.write('', () => {
-      if (terminal === activeTerminal) activeTerminal.clear();
-    });
+    if (status() !== 'connected') return;
     sendTerminalClientMessage(terminalSocket, { type: 'clear' });
+    focusTerminal();
   };
   const reconnectTerminal = () => {
+    if (status() === 'connecting' || status() === 'restoring') return;
     autoReconnectAttempts = 0;
+    setStatus('connecting');
     setReconnectKey((key) => key + 1);
   };
   const startMobileShortcutPointer = (event: PointerEvent) => {
@@ -189,6 +202,12 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     const projectPath = props.project.path;
     reconnectKey();
     if (!terminalElement) return;
+    if (pendingProjectId !== projectId) {
+      pendingProjectId = projectId;
+      pendingGeneratedInput = '';
+      pendingInput = '';
+      pendingMetadata = {};
+    }
 
     let disposed = false;
     let xterm: XTermTerminal | undefined;
@@ -208,9 +227,8 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let heartbeatTimer: number | undefined;
     let heartbeatTimeoutTimer: number | undefined;
     let resumeHeartbeat: (() => void) | undefined;
-    let pendingInput = '';
-    let pendingMetadata: { cwd?: string; title?: string } = {};
     let terminalExited = false;
+    let serverReady = false;
     let replaySideEffectSuppression = 0;
     const expectedReplayReplies: { query: string }[] = [];
     let resizeTerminal: ((immediate?: boolean, forceRefresh?: boolean) => void) | undefined;
@@ -250,8 +268,8 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         terminal = xterm;
 
         const sendTerminalMetadata = (metadata: { cwd?: string; title?: string }) => {
-          if (sendTerminalClientMessage(socket, { type: 'metadata', ...metadata })) return;
-          if (!socket || socket.readyState === WebSocket.CONNECTING) pendingMetadata = { ...pendingMetadata, ...metadata };
+          if (status() === 'connected' && sendTerminalClientMessage(socket, { type: 'metadata', ...metadata })) return;
+          pendingMetadata = { ...pendingMetadata, ...metadata };
         };
         const updateTerminalTitle = (value: string) => {
           const title = normalizeTerminalMetadata(value);
@@ -267,31 +285,76 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         };
         const sendTerminalInput = (data: string) => {
           props.onFilesystemActivity?.();
-          if (sendTerminalClientMessage(socket, { type: 'input', data })) return;
-          if (socket?.readyState === WebSocket.CONNECTING) pendingInput = trimTerminalQueuedInput(pendingInput + data);
+          if (status() === 'connected' && sendTerminalClientMessage(socket, { type: 'input', data })) return;
+          pendingInput = trimTerminalQueuedInput(pendingInput + data);
         };
-        const writeTerminalData = (data: string, replay = false, dataOffset?: number, responseQuery?: string) => {
-          if (!xterm) return;
-          if (!replay) {
-            xterm.write(data, () => {
-              if (Number.isSafeInteger(dataOffset)) sendTerminalClientMessage(socket, { type: 'ack', dataOffset });
-            });
-            return;
-          }
-          // Historical queries stay inert, except a query that was incomplete when this client attached.
-          const expectedReplies = responseQuery
-            ? terminalQueriesExpectingReplies(responseQuery).map((query) => ({ query }))
-            : [];
-          expectedReplayReplies.push(...expectedReplies);
-          replaySideEffectSuppression += 1;
-          xterm.write(data, () => {
-            replaySideEffectSuppression = Math.max(0, replaySideEffectSuppression - 1);
-            for (const expectedReply of expectedReplies) {
-              const index = expectedReplayReplies.indexOf(expectedReply);
-              if (index >= 0) expectedReplayReplies.splice(index, 1);
+        const sendTerminalGeneratedInput = (data: string) => {
+          if (status() === 'connected' && sendTerminalClientMessage(socket, { type: 'input', data })) return;
+          pendingGeneratedInput = trimTerminalQueuedInput(pendingGeneratedInput + data);
+        };
+        let deferredAckOffset = 0;
+        let lastHydrationProgressAt = 0;
+        let rendererOperations = Promise.resolve();
+        const enqueueRendererOperation = (operation: () => void | Promise<void>) => {
+          rendererOperations = rendererOperations.then(async () => {
+            if (disposed || terminal !== xterm || terminalSocket !== socket || !xterm) return;
+            await operation();
+          }).catch(() => undefined);
+          return rendererOperations;
+        };
+        const writeTerminalData = (data: string, replay = false, dataOffset?: number, responseQuery?: string, cols?: number, rows?: number) => {
+          void enqueueRendererOperation(() => new Promise<void>((resolve) => {
+            if (!xterm) {
+              resolve();
+              return;
             }
-            if (Number.isSafeInteger(dataOffset)) sendTerminalClientMessage(socket, { type: 'ack', dataOffset });
-          });
+            if (replay && Number.isSafeInteger(cols) && Number.isSafeInteger(rows)) {
+              const replayCols = Math.max(MIN_TERMINAL_COLS, Math.min(MAX_TERMINAL_COLS, cols!));
+              const replayRows = Math.max(MIN_TERMINAL_ROWS, Math.min(MAX_TERMINAL_ROWS, rows!));
+              if (xterm.cols !== replayCols || xterm.rows !== replayRows) xterm.resize(replayCols, replayRows);
+            }
+            // Historical queries stay inert, except a query that was incomplete when this client attached.
+            const expectedReplies = replay && responseQuery
+              ? terminalQueriesExpectingReplies(responseQuery).map((query) => ({ query }))
+              : [];
+            expectedReplayReplies.push(...expectedReplies);
+            if (replay) {
+              replaySideEffectSuppression += 1;
+              const now = Date.now();
+              if (status() === 'restoring' && now - lastHydrationProgressAt >= 2_000 && sendTerminalClientMessage(socket, { type: 'hydrate-progress' })) lastHydrationProgressAt = now;
+            }
+            xterm.write(data, () => {
+              if (replay) {
+                replaySideEffectSuppression = Math.max(0, replaySideEffectSuppression - 1);
+                const now = Date.now();
+                if (status() === 'restoring' && now - lastHydrationProgressAt >= 2_000 && sendTerminalClientMessage(socket, { type: 'hydrate-progress' })) lastHydrationProgressAt = now;
+              }
+              for (const expectedReply of expectedReplies) {
+                const index = expectedReplayReplies.indexOf(expectedReply);
+                if (index >= 0) expectedReplayReplies.splice(index, 1);
+              }
+              if (Number.isSafeInteger(dataOffset)) {
+                if (status() === 'connected') sendTerminalClientMessage(socket, { type: 'ack', dataOffset });
+                else deferredAckOffset = Math.max(deferredAckOffset, dataOffset!);
+              }
+              resolve();
+            });
+          }));
+        };
+        const writeTerminalLine = (data: string) => {
+          void enqueueRendererOperation(() => new Promise<void>((resolve) => xterm?.writeln(data, resolve)));
+        };
+        const clearTerminalDisplay = () => {
+          void enqueueRendererOperation(() => new Promise<void>((resolve) => {
+            if (!xterm) {
+              resolve();
+              return;
+            }
+            xterm.write('', () => {
+              xterm?.clear();
+              resolve();
+            });
+          }));
         };
         sendInputRef = sendTerminalInput;
         titleDisposable = xterm.onTitleChange(updateTerminalTitle);
@@ -314,27 +377,48 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         });
         xterm.attachCustomKeyEventHandler((event) => handleTerminalKeyEvent(event, xterm!));
 
-        let lastSentCols = 0;
-        let lastSentRows = 0;
+        let lastConfirmedCols = xterm.cols;
+        let lastConfirmedRows = xterm.rows;
         let lastResizeSentAt = 0;
-        const sendTerminalResize = (cols: number, rows: number, immediate = false) => {
+        let nextResizeId = 0;
+        let restoreSnapshotComplete = false;
+        let resizeInFlight: { id: number; hydration: boolean; forceRefresh: boolean } | undefined;
+        let pendingResize: { cols: number; rows: number; forceRefresh: boolean } | undefined;
+        const refreshTerminal = () => {
+          if (!xterm || xterm.rows <= 0) return;
+          xterm.clearTextureAtlas();
+          xterm.refresh(0, xterm.rows - 1);
+        };
+        const sendPendingResize = (immediate = false) => {
+          if (!socket || socket.readyState !== WebSocket.OPEN || resizeInFlight || !pendingResize) return;
+          const hydration = status() === 'restoring';
+          if ((hydration && !restoreSnapshotComplete) || (!hydration && status() !== 'connected')) return;
+          if (!hydration && pendingResize.cols === lastConfirmedCols && pendingResize.rows === lastConfirmedRows) {
+            const forceRefresh = pendingResize.forceRefresh;
+            pendingResize = undefined;
+            if (forceRefresh) void enqueueRendererOperation(refreshTerminal);
+            return;
+          }
           if (resizeMessageTimer !== undefined) {
+            if (!immediate) return;
             window.clearTimeout(resizeMessageTimer);
             resizeMessageTimer = undefined;
           }
-          if (!socket || socket.readyState !== WebSocket.OPEN || (cols === lastSentCols && rows === lastSentRows)) return;
 
           const sendResize = () => {
             resizeMessageTimer = undefined;
-            if (sendTerminalClientMessage(socket, { type: 'resize', cols, rows })) {
-              lastSentCols = cols;
-              lastSentRows = rows;
+            if (!pendingResize || resizeInFlight || !socket || socket.readyState !== WebSocket.OPEN) return;
+            const resize = pendingResize;
+            const resizeId = ++nextResizeId;
+            if (sendTerminalClientMessage(socket, { type: hydration ? 'hydrate' : 'resize', resizeId, cols: resize.cols, rows: resize.rows })) {
+              pendingResize = undefined;
+              resizeInFlight = { id: resizeId, hydration, forceRefresh: resize.forceRefresh };
               lastResizeSentAt = Date.now();
             }
           };
 
-          const delay = Math.max(0, TERMINAL_RESIZE_SEND_DELAY_MS - (Date.now() - lastResizeSentAt));
-          if (immediate || delay === 0) sendResize();
+          const delay = hydration || immediate ? 0 : Math.max(0, TERMINAL_RESIZE_SEND_DELAY_MS - (Date.now() - lastResizeSentAt));
+          if (delay === 0) sendResize();
           else resizeMessageTimer = window.setTimeout(sendResize, delay);
         };
         resizeTerminal = (immediate = false, forceRefresh = false) => {
@@ -342,14 +426,21 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           const bounds = terminalElement.getBoundingClientRect();
           if (bounds.width <= 0 || bounds.height <= 0) return;
           try {
-            fitAddon.fit();
-            if (forceRefresh && xterm.rows > 0) {
-              xterm.clearTextureAtlas();
-              xterm.refresh(0, xterm.rows - 1);
+            const proposed = fitAddon.proposeDimensions();
+            if (!proposed) return;
+            const cols = Math.max(MIN_TERMINAL_COLS, Math.min(MAX_TERMINAL_COLS, proposed.cols));
+            const rows = Math.max(MIN_TERMINAL_ROWS, Math.min(MAX_TERMINAL_ROWS, proposed.rows));
+            if (!socket) {
+              if (xterm.cols !== cols || xterm.rows !== rows) xterm.resize(cols, rows);
+              lastConfirmedCols = cols;
+              lastConfirmedRows = rows;
+              if (forceRefresh) refreshTerminal();
+              return;
             }
-            sendTerminalResize(xterm.cols, xterm.rows, immediate);
+            pendingResize = { cols, rows, forceRefresh: forceRefresh || pendingResize?.forceRefresh === true };
+            sendPendingResize(immediate);
           } catch {
-            // Fit can throw while fonts/layout are still settling.
+            // Measurement can fail while fonts/layout are still settling.
           }
         };
         scheduleResizeTerminal = () => {
@@ -374,9 +465,16 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           .catch(() => undefined);
 
         resizeTerminal();
-        lastSentCols = xterm.cols;
-        lastSentRows = xterm.rows;
-        const params = new URLSearchParams({ projectPath, cols: String(xterm.cols), rows: String(xterm.rows), terminalId: 'main' });
+        const connectionGeneration = ++terminalConnectionGeneration;
+        const params = new URLSearchParams({
+          projectPath,
+          cols: String(xterm.cols),
+          rows: String(xterm.rows),
+          terminalId: 'main',
+          protocol: TERMINAL_PROTOCOL,
+          clientId: terminalClientId,
+          generation: String(connectionGeneration),
+        });
         const clearHeartbeatTimeout = () => {
           if (heartbeatTimeoutTimer === undefined) return;
           window.clearTimeout(heartbeatTimeoutTimer);
@@ -434,6 +532,12 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             const expectedReplyIndex = expectedReplayReplies.findIndex(({ query }) => terminalReplyMatchesQuery(query, data));
             if (expectedReplyIndex < 0) return;
             expectedReplayReplies.splice(expectedReplyIndex, 1);
+            sendTerminalGeneratedInput(data);
+            return;
+          }
+          if (status() === 'restoring' && isTerminalGeneratedReply(data)) {
+            sendTerminalGeneratedInput(data);
+            return;
           }
           const modifiers = { ctrl: ctrlSticky(), alt: altSticky(), shift: shiftSticky() };
           const modifiedData = terminalModifiedInputSequence(data, modifiers);
@@ -447,20 +551,20 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         });
 
         socket.addEventListener('open', () => {
-          if (terminalSocket !== socket || !resizeTerminal || !xterm) return;
-          setStatus('connected');
-          // Reassert the PTY size for every connection, even when the grid did not change.
-          lastSentCols = 0;
-          lastSentRows = 0;
-          resizeTerminal(true, true);
-          if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
-          if (pendingInput) {
-            sendTerminalClientMessage(socket, { type: 'input', data: pendingInput });
-            pendingInput = '';
-          }
+          if (terminalSocket !== socket) return;
           startTerminalHeartbeat();
-          xterm.focus();
         });
+        const requestTerminalHydration = () => {
+          if (!serverReady || status() !== 'restoring') return;
+          void enqueueRendererOperation(() => {
+            if (!xterm || status() !== 'restoring') return;
+            restoreSnapshotComplete = true;
+            resizeTerminal?.(true, true);
+            pendingResize ??= { cols: xterm.cols, rows: xterm.rows, forceRefresh: true };
+            sendPendingResize(true);
+          });
+        };
+
         socket.addEventListener('message', (event) => {
           if (terminalSocket !== socket || !xterm) return;
           let message: TerminalServerMessage;
@@ -475,13 +579,41 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           }
 
           if (message.type === 'ready') {
-            if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
-            reconnectAttemptResetTimer = window.setTimeout(() => {
-              reconnectAttemptResetTimer = undefined;
-              if (!disposed && terminalSocket === socket) autoReconnectAttempts = 0;
-            }, TERMINAL_RECONNECT_STABLE_MS);
+            serverReady = true;
+            setStatus('restoring');
             setShellName(normalizeTerminalMetadata(message.title ?? '') || message.shellName || message.shell || 'terminal');
             setCwd(normalizeTerminalMetadata(message.cwd ?? '') || projectPath);
+          } else if (message.type === 'replay-complete') {
+            requestTerminalHydration();
+          } else if (message.type === 'resized' && Number.isSafeInteger(message.resizeId) && Number.isSafeInteger(message.cols) && Number.isSafeInteger(message.rows)) {
+            const request = resizeInFlight;
+            if (!request || request.id !== message.resizeId) return;
+            const acceptedCols = Math.max(MIN_TERMINAL_COLS, Math.min(MAX_TERMINAL_COLS, message.cols!));
+            const acceptedRows = Math.max(MIN_TERMINAL_ROWS, Math.min(MAX_TERMINAL_ROWS, message.rows!));
+            void enqueueRendererOperation(() => {
+              if (!xterm) return;
+              if (xterm.cols !== acceptedCols || xterm.rows !== acceptedRows) xterm.resize(acceptedCols, acceptedRows);
+              if (request.forceRefresh) refreshTerminal();
+            }).then(() => {
+              if (disposed || terminalExited || terminalSocket !== socket || terminal !== xterm || resizeInFlight !== request) return;
+              lastConfirmedCols = acceptedCols;
+              lastConfirmedRows = acceptedRows;
+              resizeInFlight = undefined;
+              if (request.hydration && message.hydrated === true && status() === 'restoring') {
+                setStatus('connected');
+                if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
+                reconnectAttemptResetTimer = window.setTimeout(() => {
+                  reconnectAttemptResetTimer = undefined;
+                  if (!disposed && terminalSocket === socket) autoReconnectAttempts = 0;
+                }, TERMINAL_RECONNECT_STABLE_MS);
+                if (deferredAckOffset > 0 && sendTerminalClientMessage(socket, { type: 'ack', dataOffset: deferredAckOffset })) deferredAckOffset = 0;
+                if (pendingGeneratedInput && sendTerminalClientMessage(socket, { type: 'input', data: pendingGeneratedInput })) pendingGeneratedInput = '';
+                if (pendingInput && sendTerminalClientMessage(socket, { type: 'input', data: pendingInput })) pendingInput = '';
+                if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
+                xterm?.focus();
+              }
+              sendPendingResize(true);
+            });
           } else if (message.type === 'metadata') {
             const title = normalizeTerminalMetadata(message.title ?? '');
             const nextCwd = normalizeTerminalMetadata(message.cwd ?? '');
@@ -489,24 +621,24 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             if (nextCwd) setCwd(nextCwd);
           } else if (message.type === 'data' && typeof message.data === 'string') {
             props.onFilesystemActivity?.();
-            writeTerminalData(message.data, message.replay === true, message.dataOffset, message.responseQuery);
+            writeTerminalData(message.data, message.replay === true, message.dataOffset, message.responseQuery, message.cols, message.rows);
           } else if (message.type === 'error') {
+            serverReady = false;
             setStatus('error');
-            xterm.writeln(`\r\n\x1b[31m${message.message ?? 'Terminal error'}\x1b[0m`);
+            writeTerminalLine(`\r\n\x1b[31m${message.message ?? 'Terminal error'}\x1b[0m`);
           } else if (message.type === 'clear') {
-            const activeTerminal = xterm;
-            activeTerminal.write('', () => {
-              if (xterm === activeTerminal) activeTerminal.clear();
-            });
+            clearTerminalDisplay();
           } else if (message.type === 'exit') {
             terminalExited = true;
+            serverReady = false;
             props.onFilesystemActivity?.();
             setStatus('disconnected');
-            xterm.writeln(`\r\n\x1b[2mTerminal exited${typeof message.exitCode === 'number' ? ` with code ${message.exitCode}` : ''}.\x1b[0m`);
+            writeTerminalLine(`\r\n\x1b[2mTerminal exited${typeof message.exitCode === 'number' ? ` with code ${message.exitCode}` : ''}.\x1b[0m`);
           }
         });
         socket.addEventListener('close', (event) => {
           if (terminalSocket !== socket) return;
+          serverReady = false;
           clearHeartbeatTimers();
           if (resizeMessageTimer !== undefined) {
             window.clearTimeout(resizeMessageTimer);
@@ -519,20 +651,23 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           setStatus(status() === 'error' ? 'error' : 'disconnected');
           if (disposed || terminalExited) return;
           if (event.code === TERMINAL_REPLACED_CLOSE_CODE) {
-            xterm?.writeln('\r\n\x1b[2mTerminal opened in another window. Reconnect to take control.\x1b[0m');
+            writeTerminalLine('\r\n\x1b[2mTerminal opened in another window. Reconnect to take control.\x1b[0m');
             return;
           }
+          if (event.code === TERMINAL_STALE_CONNECTION_CLOSE_CODE) return;
 
           const delay = Math.min(TERMINAL_RECONNECT_MAX_DELAY_MS, TERMINAL_RECONNECT_BASE_DELAY_MS * (2 ** Math.min(autoReconnectAttempts, 5)));
           autoReconnectAttempts += 1;
           reconnectTimer = window.setTimeout(() => {
             reconnectTimer = undefined;
             if (disposed || terminalExited || terminalSocket !== socket) return;
+            setStatus('connecting');
             setReconnectKey((key) => key + 1);
           }, delay + Math.round(delay * 0.2 * Math.random()));
         });
         socket.addEventListener('error', () => {
           if (terminalSocket !== socket) return;
+          serverReady = false;
           setStatus('error');
           closeTerminalSocket();
         });
@@ -596,9 +731,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             <button
               class="ghost h-7 px-2 text-xs"
               type="button"
+              disabled={status() !== 'connected'}
               onClick={clearTerminal}
             >Clear</button>
-            <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={reconnectTerminal}>Reconnect</button>
+            <button class="button-secondary h-7 px-2 text-xs" type="button" disabled={status() === 'connecting' || status() === 'restoring'} onClick={reconnectTerminal}>Reconnect</button>
             <button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClose}><X class="size-4" /></button>
           </div>
         </div>
@@ -612,8 +748,8 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           </div>
           <div class="terminal-toolbar-row">
             <span class={`terminal-status ${statusClass()}`}>{statusText()}</span>
-            <button class="ghost h-7 px-2 text-xs" type="button" onClick={clearTerminal}>Clear</button>
-            <button class="button-secondary h-7 px-2 text-xs" type="button" onClick={reconnectTerminal}>Reconnect</button>
+            <button class="ghost h-7 px-2 text-xs" type="button" disabled={status() !== 'connected'} onClick={clearTerminal}>Clear</button>
+            <button class="button-secondary h-7 px-2 text-xs" type="button" disabled={status() === 'connecting' || status() === 'restoring'} onClick={reconnectTerminal}>Reconnect</button>
           </div>
           <div class="terminal-toolbar-row terminal-mobile-keys">
             <button class={`ghost terminal-mobile-key ${ctrlSticky() ? 'terminal-key-active' : ''}`} type="button" tabIndex={-1} title="Ctrl modifier" aria-label="Ctrl modifier" onPointerDown={startMobileShortcutPointer} onPointerMove={moveMobileShortcutPointer} onPointerCancel={cancelMobileShortcutPointer} onPointerUp={(event) => finishMobileShortcutPointer(event, () => toggleMobileModifier('ctrl'))}>ctrl</button>

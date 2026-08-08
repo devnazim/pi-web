@@ -1,6 +1,35 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createTerminalReplaySanitizerState, sanitizeTerminalReplayChunk, trimTerminalReplay } from '../../src/server/terminalReplay.ts';
+import { appendTerminalReplayData, createTerminalReplaySanitizerState, recordTerminalReplayResize, sanitizeTerminalReplayChunk, trimTerminalReplay, trimTerminalReplayEntries } from '../../src/server/terminalReplay.ts';
+
+test('terminal replay records data under ordered resize boundaries', () => {
+  const entries = [{ cols: 80, rows: 24, data: '' }];
+  appendTerminalReplayData(entries, 'before\n', 1024, 10);
+  recordTerminalReplayResize(entries, 100, 30, 1024, 10);
+  appendTerminalReplayData(entries, 'after\n', 1024, 10);
+
+  assert.deepEqual(entries, [
+    { cols: 80, rows: 24, data: 'before\n' },
+    { cols: 100, rows: 30, data: 'after\n' },
+  ]);
+});
+
+test('terminal replay coalesces empty resizes and bounds entry count and data', () => {
+  const entries = [{ cols: 80, rows: 24, data: '' }];
+  recordTerminalReplayResize(entries, 90, 25, 12, 3);
+  recordTerminalReplayResize(entries, 100, 30, 12, 3);
+  assert.deepEqual(entries, [{ cols: 100, rows: 30, data: '' }]);
+
+  for (let index = 0; index < 5; index += 1) {
+    appendTerminalReplayData(entries, `line-${index}\n`, 12, 3);
+    recordTerminalReplayResize(entries, 101 + index, 31, 12, 3);
+  }
+  trimTerminalReplayEntries(entries, 12, 3);
+
+  assert.ok(entries.length <= 3);
+  assert.ok(entries.reduce((total, entry) => total + entry.data.length, 0) <= 12);
+  assert.deepEqual({ cols: entries.at(-1)?.cols, rows: entries.at(-1)?.rows }, { cols: 105, rows: 31 });
+});
 
 test('terminal replay removes device queries and replies without changing display sequences', () => {
   const replay = sanitizeTerminalReplayChunk(createTerminalReplaySanitizerState(), [

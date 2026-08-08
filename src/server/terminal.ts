@@ -5,18 +5,23 @@ import { basename } from 'node:path';
 import * as pty from 'node-pty';
 import { clearProjectFileCaches } from './files.js';
 import type { ProjectRegistry } from './projects.js';
-import { createTerminalReplaySanitizerState, sanitizeTerminalReplayChunk, terminalReplaySanitizerIsGround, trimTerminalReplay, type TerminalReplaySanitizerState } from './terminalReplay.js';
+import { appendTerminalReplayData, createTerminalReplaySanitizerState, recordTerminalReplayResize, sanitizeTerminalReplayChunk, terminalReplaySanitizerIsGround, type TerminalReplayEntry, type TerminalReplaySanitizerState } from './terminalReplay.js';
 import { resolveWithin } from './util.js';
 import { WorkspaceLifecycleConflictError, type WorkspaceLifecycleCoordinator, type WorkspaceLifecycleLease } from './workspaceLifecycle.js';
 
 const MAX_COMMAND_LENGTH = 4000;
 const MAX_TERMINAL_INPUT_LENGTH = 64 * 1024;
 const MAX_TERMINAL_REPLAY_LENGTH = 1024 * 1024;
+const MAX_TERMINAL_REPLAY_ENTRIES = 2048;
 const MAX_TERMINAL_PENDING_DATA_LENGTH = 128 * 1024;
 const MAX_TERMINAL_METADATA_LENGTH = 2048;
 const TERMINAL_FLOW_CONTROL_HIGH_WATERMARK = 100_000;
 const TERMINAL_FLOW_CONTROL_LOW_WATERMARK = 5_000;
 const TERMINAL_REPLACED_CLOSE_CODE = 4001;
+const TERMINAL_STALE_CONNECTION_CLOSE_CODE = 4002;
+const TERMINAL_HYDRATION_TIMEOUT_CLOSE_CODE = 4003;
+const TERMINAL_HYDRATION_TIMEOUT_MS = 30_000;
+const MAX_TERMINAL_CLIENT_IDENTITIES = 64;
 const TERMINAL_IDLE_TTL_MS = 30 * 60_000;
 const DEFAULT_TERMINAL_ID = 'default';
 const DEFAULT_TERMINAL_COLS = 80;
@@ -41,12 +46,15 @@ type TerminalClientMessage = {
   data?: unknown;
   cols?: unknown;
   rows?: unknown;
+  resizeId?: unknown;
   dataOffset?: unknown;
   cwd?: unknown;
   title?: unknown;
 };
 
-type TerminalOutputSegment = { data: string; replay: boolean; responseQuery?: string };
+type TerminalOutputSegment = { data: string; replay: boolean; responseQuery?: string; cols?: number; rows?: number };
+
+type TerminalConnectionIdentity = { clientId: string; generation: number };
 
 type TerminalSession = {
   key: string;
@@ -58,7 +66,9 @@ type TerminalSession = {
   title?: string;
   terminal: pty.IPty;
   sockets: Set<WebSocket>;
-  replay: string;
+  controller?: { socket: WebSocket; identity?: TerminalConnectionIdentity; hydrated: boolean; hydrationTimer?: NodeJS.Timeout };
+  clientGenerations: Map<string, number>;
+  replay: TerminalReplayEntry[];
   replaySanitizerState: TerminalReplaySanitizerState;
   pendingOutput: TerminalOutputSegment[];
   pendingDataLength: number;
@@ -151,7 +161,7 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
     }
   });
 
-  app.get<{ Params: { projectId: string }; Querystring: { projectPath?: string; cwd?: string; cols?: string; rows?: string; terminalId?: string } }>('/ws/projects/:projectId/terminal', { websocket: true }, (connection: any, request) => {
+  app.get<{ Params: { projectId: string }; Querystring: { projectPath?: string; cwd?: string; cols?: string; rows?: string; terminalId?: string; protocol?: string; clientId?: string; generation?: string } }>('/ws/projects/:projectId/terminal', { websocket: true }, (connection: any, request) => {
     const socket: WebSocket = connection.socket ?? connection;
     if (closing || options.isClosing?.()) {
       sendTerminalMessage(socket, { type: 'error', message: 'pi-web is shutting down.' });
@@ -175,6 +185,9 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
       const key = terminalSessionKey(project.id, cwd, terminalId);
       const cols = terminalDimension(request.query.cols, DEFAULT_TERMINAL_COLS, MIN_TERMINAL_COLS, MAX_TERMINAL_COLS);
       const rows = terminalDimension(request.query.rows, DEFAULT_TERMINAL_ROWS, MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS);
+      const identity = request.query.protocol === '2'
+        ? terminalConnectionIdentity(request.query.clientId, request.query.generation)
+        : undefined;
       let session = terminalSessions.get(key);
       if (!session) {
         session = createTerminalSession(terminalSessions, key, terminalId, project.id, cwd, shell, cols, rows);
@@ -185,7 +198,7 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
         projectLease = undefined;
         terminalSessions.set(key, session);
       }
-      attachTerminalSocket(terminalSessions, session, socket, cols, rows);
+      attachTerminalSocket(terminalSessions, session, socket, cols, rows, identity);
     } catch (error) {
       registrationLease?.release();
       projectLease?.release();
@@ -223,7 +236,8 @@ function createTerminalSession(sessions: Map<string, TerminalSession>, key: stri
     shellName: basename(shell),
     terminal,
     sockets: new Set(),
-    replay: '',
+    clientGenerations: new Map(),
+    replay: [{ cols, rows, data: '' }],
     replaySanitizerState: createTerminalReplaySanitizerState(),
     pendingOutput: [],
     pendingDataLength: 0,
@@ -245,17 +259,51 @@ function createTerminalSession(sessions: Map<string, TerminalSession>, key: stri
   return session;
 }
 
-function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: TerminalSession, socket: WebSocket, cols: number, rows: number) {
+function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: TerminalSession, socket: WebSocket, cols: number, rows: number, identity?: TerminalConnectionIdentity) {
+  if (identity) {
+    const latestGeneration = session.clientGenerations.get(identity.clientId);
+    if (latestGeneration !== undefined && identity.generation <= latestGeneration) {
+      socket.close(TERMINAL_STALE_CONNECTION_CLOSE_CODE, 'Stale terminal connection');
+      return;
+    }
+    if (latestGeneration === undefined && session.clientGenerations.size >= MAX_TERMINAL_CLIENT_IDENTITIES) {
+      const activeClientId = session.controller?.identity?.clientId;
+      for (const clientId of session.clientGenerations.keys()) {
+        if (clientId === activeClientId) continue;
+        session.clientGenerations.delete(clientId);
+        break;
+      }
+    }
+    session.clientGenerations.delete(identity.clientId);
+    session.clientGenerations.set(identity.clientId, identity.generation);
+  }
+
   clearTerminalIdleTimer(session);
   flushTerminalData(session);
-  for (const existingSocket of session.sockets) existingSocket.close(TERMINAL_REPLACED_CLOSE_CODE, 'Terminal opened in another window');
+  const sameClient = identity && session.controller?.identity?.clientId === identity.clientId;
+  if (session.controller?.hydrationTimer) clearTimeout(session.controller.hydrationTimer);
+  for (const existingSocket of session.sockets) {
+    existingSocket.close(
+      sameClient ? TERMINAL_STALE_CONNECTION_CLOSE_CODE : TERMINAL_REPLACED_CLOSE_CODE,
+      sameClient ? 'Terminal superseded by a newer connection' : 'Terminal opened in another window',
+    );
+  }
   session.sockets.clear();
   session.sockets.add(socket);
+  const controller = { socket, identity, hydrated: !identity, hydrationTimer: undefined as NodeJS.Timeout | undefined };
+  session.controller = controller;
   resetTerminalFlowControl(session, socket);
   session.replayCatchup = !terminalReplaySanitizerIsGround(session.replaySanitizerState);
-  resizeTerminalSession(session, cols, rows);
-  sendTerminalMessage(socket, { type: 'ready', cwd: session.cwd, title: session.title, shell: session.shell, shellName: session.shellName, terminalId: session.id, persistent: true });
-  if (session.replay) sendTerminalMessage(socket, { type: 'data', data: session.replay, replay: true });
+  if (!identity) resizeTerminalSession(session, cols, rows);
+  sendTerminalMessage(socket, { type: 'ready', cwd: session.cwd, title: session.title, shell: session.shell, shellName: session.shellName, terminalId: session.id, cols: session.cols, rows: session.rows, persistent: true });
+  if (identity) {
+    for (const entry of session.replay) sendTerminalMessage(socket, { type: 'data', data: entry.data, cols: entry.cols, rows: entry.rows, replay: true });
+  } else {
+    const replay = session.replay.map(({ data }) => data).join('');
+    if (replay) sendTerminalMessage(socket, { type: 'data', data: replay, replay: true });
+  }
+  sendTerminalMessage(socket, { type: 'replay-complete' });
+  if (identity) scheduleTerminalHydrationTimeout(session, controller);
 
   socket.on('message', (data: { toString(): string }) => {
     if (session.disposed || !session.sockets.has(socket)) return;
@@ -266,6 +314,40 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
       sendTerminalMessage(socket, { type: 'error', message: 'Invalid terminal message' });
       return;
     }
+
+    if (message.type === 'ping') {
+      sendTerminalMessage(socket, { type: 'pong' });
+      return;
+    }
+
+    const activeController = session.controller?.socket === socket ? session.controller : undefined;
+    if (message.type === 'hydrate-progress') {
+      if (activeController?.identity && !activeController.hydrated) scheduleTerminalHydrationTimeout(session, activeController);
+      return;
+    }
+    if (message.type === 'hydrate') {
+      if (!activeController?.identity || activeController.hydrated) return;
+      resizeTerminalSession(
+        session,
+        terminalDimension(message.cols, DEFAULT_TERMINAL_COLS, MIN_TERMINAL_COLS, MAX_TERMINAL_COLS),
+        terminalDimension(message.rows, DEFAULT_TERMINAL_ROWS, MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS),
+      );
+      activeController.hydrated = true;
+      if (activeController.hydrationTimer) {
+        clearTimeout(activeController.hydrationTimer);
+        activeController.hydrationTimer = undefined;
+      }
+      sendTerminalMessage(socket, {
+        type: 'resized',
+        cols: session.cols,
+        rows: session.rows,
+        hydrated: true,
+        ...(typeof message.resizeId === 'number' && Number.isSafeInteger(message.resizeId) ? { resizeId: message.resizeId } : {}),
+      });
+      return;
+    }
+
+    if (!activeController?.hydrated) return;
 
     if (message.type === 'input') {
       if (typeof message.data !== 'string') return;
@@ -284,6 +366,12 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
         terminalDimension(message.cols, DEFAULT_TERMINAL_COLS, MIN_TERMINAL_COLS, MAX_TERMINAL_COLS),
         terminalDimension(message.rows, DEFAULT_TERMINAL_ROWS, MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS),
       );
+      sendTerminalMessage(socket, {
+        type: 'resized',
+        cols: session.cols,
+        rows: session.rows,
+        ...(typeof message.resizeId === 'number' && Number.isSafeInteger(message.resizeId) ? { resizeId: message.resizeId } : {}),
+      });
       return;
     }
 
@@ -298,24 +386,33 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
     if (message.type === 'clear') {
       // Flush first so clearing history cannot cut the live VT stream mid-sequence.
       flushTerminalData(session);
-      session.replay = '';
+      session.replay = [{ cols: session.cols, rows: session.rows, data: '' }];
       broadcastTerminalMessage(session, { type: 'clear' });
       return;
     }
 
     if (message.type === 'metadata') {
       updateTerminalMetadata(session, message);
-      return;
     }
-
-    if (message.type === 'ping') sendTerminalMessage(socket, { type: 'pong' });
   });
 
   socket.on('close', () => {
     session.sockets.delete(socket);
+    if (session.controller?.socket === socket) {
+      if (session.controller.hydrationTimer) clearTimeout(session.controller.hydrationTimer);
+      session.controller = undefined;
+    }
     if (session.flowControlSocket === socket) resetTerminalFlowControl(session, undefined);
     if (!session.disposed && !session.sockets.size) scheduleTerminalIdleCleanup(sessions, session);
   });
+}
+
+function scheduleTerminalHydrationTimeout(session: TerminalSession, controller: NonNullable<TerminalSession['controller']>) {
+  if (controller.hydrationTimer) clearTimeout(controller.hydrationTimer);
+  controller.hydrationTimer = setTimeout(() => {
+    if (session.controller === controller && !controller.hydrated) controller.socket.close(TERMINAL_HYDRATION_TIMEOUT_CLOSE_CODE, 'Terminal hydration timed out');
+  }, TERMINAL_HYDRATION_TIMEOUT_MS);
+  controller.hydrationTimer.unref();
 }
 
 function queueTerminalData(session: TerminalSession, data: string) {
@@ -323,7 +420,7 @@ function queueTerminalData(session: TerminalSession, data: string) {
   const replayCatchup = session.replayCatchup;
   const replay = sanitizeTerminalReplayChunk(session.replaySanitizerState, data);
   session.replaySanitizerState = replay.state;
-  session.replay = trimTerminalReplay(session.replay + replay.data, MAX_TERMINAL_REPLAY_LENGTH);
+  appendTerminalReplayData(session.replay, replay.data, MAX_TERMINAL_REPLAY_LENGTH, MAX_TERMINAL_REPLAY_ENTRIES);
   session.pendingDataLength += data.length;
 
   if (!replayCatchup) {
@@ -352,8 +449,9 @@ function queueTerminalData(session: TerminalSession, data: string) {
 function queueTerminalOutput(session: TerminalSession, data: string, replay: boolean, responseQuery?: string) {
   if (!data) return;
   const previous = session.pendingOutput.at(-1);
-  if (!responseQuery && !previous?.responseQuery && previous?.replay === replay) previous.data += data;
-  else session.pendingOutput.push({ data, replay, ...(responseQuery ? { responseQuery } : {}) });
+  const dimensions = replay ? { cols: session.cols, rows: session.rows } : {};
+  if (!responseQuery && !previous?.responseQuery && previous?.replay === replay && (!replay || (previous.cols === session.cols && previous.rows === session.rows))) previous.data += data;
+  else session.pendingOutput.push({ data, replay, ...dimensions, ...(responseQuery ? { responseQuery } : {}) });
 }
 
 function flushTerminalData(session: TerminalSession) {
@@ -369,7 +467,7 @@ function flushTerminalData(session: TerminalSession) {
 
   for (const segment of output) {
     const dataOffset = session.sentDataOffset + segment.data.length;
-    if (!broadcastTerminalMessage(session, { type: 'data', data: segment.data, dataOffset, replay: segment.replay || undefined, responseQuery: segment.responseQuery })) continue;
+    if (!broadcastTerminalMessage(session, { type: 'data', data: segment.data, dataOffset, replay: segment.replay || undefined, responseQuery: segment.responseQuery, cols: segment.cols, rows: segment.rows })) continue;
     session.sentDataOffset = dataOffset;
   }
 
@@ -398,12 +496,15 @@ function updateTerminalMetadata(session: TerminalSession, message: TerminalClien
   if (update.cwd || update.title) broadcastTerminalMessage(session, { type: 'metadata', ...update });
 }
 
-function resizeTerminalSession(session: TerminalSession, cols: number, rows: number) {
+export function resizeTerminalSession(session: TerminalSession, cols: number, rows: number) {
   if (session.disposed) return;
+  flushTerminalData(session);
+  if (session.cols === cols && session.rows === rows) return;
   try {
     session.terminal.resize(cols, rows);
     session.cols = cols;
     session.rows = rows;
+    recordTerminalReplayResize(session.replay, cols, rows, MAX_TERMINAL_REPLAY_LENGTH, MAX_TERMINAL_REPLAY_ENTRIES);
   } catch {
     broadcastTerminalMessage(session, { type: 'error', message: 'Could not resize terminal' });
   }
@@ -458,12 +559,15 @@ function disposeTerminalSession(sessions: Map<string, TerminalSession>, session:
   }
   session.pendingOutput = [];
   session.pendingDataLength = 0;
+  session.replay = [];
   session.replaySanitizerState = createTerminalReplaySanitizerState();
   session.replayCatchup = false;
   session.dataDisposable?.dispose();
   session.exitDisposable?.dispose();
   session.dataDisposable = undefined;
   session.exitDisposable = undefined;
+  if (session.controller?.hydrationTimer) clearTimeout(session.controller.hydrationTimer);
+  session.controller = undefined;
   sessions.delete(session.key);
   session.workspaceLease?.release();
   session.workspaceLease = undefined;
@@ -580,6 +684,14 @@ function normalizeTerminalId(value: unknown) {
   if (typeof value !== 'string') return DEFAULT_TERMINAL_ID;
   const normalized = value.trim().replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 80);
   return normalized || DEFAULT_TERMINAL_ID;
+}
+
+function terminalConnectionIdentity(clientId: unknown, generation: unknown): TerminalConnectionIdentity {
+  if (typeof clientId !== 'string' || !/^[a-zA-Z0-9_.-]{1,100}$/.test(clientId)) throw new Error('Invalid terminal client ID');
+  if (typeof generation !== 'string' || !/^[1-9]\d*$/.test(generation)) throw new Error('Invalid terminal connection generation');
+  const parsedGeneration = Number(generation);
+  if (!Number.isSafeInteger(parsedGeneration)) throw new Error('Invalid terminal connection generation');
+  return { clientId, generation: parsedGeneration };
 }
 
 function terminalSessionKey(projectId: string, cwd: string, terminalId: string) {

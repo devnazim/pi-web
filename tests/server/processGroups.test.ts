@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { test } from 'node:test';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
-import { processGroupExists, registerTerminalRoutes, signalProcessGroup } from '../../src/server/terminal.js';
+import { processGroupExists, registerTerminalRoutes, resizeTerminalSession, signalProcessGroup } from '../../src/server/terminal.js';
 
 async function waitUntil(check: () => boolean, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
@@ -135,6 +135,72 @@ test('pauses PTY output until the browser acknowledges rendered data', { skip: p
   }
 });
 
+test('flushes pending output before acknowledging an unchanged terminal size', () => {
+  const messages: Array<{ type?: string; data?: string }> = [];
+  let resizeCalls = 0;
+  const socket = {
+    readyState: 1,
+    send: (data: string) => messages.push(JSON.parse(data) as { type?: string; data?: string }),
+    close: () => undefined,
+    on: () => undefined,
+  };
+  const session = {
+    projectId: 'project-1',
+    terminal: { resize: () => { resizeCalls += 1; } },
+    sockets: new Set([socket]),
+    pendingOutput: [{ data: 'pending', replay: false }],
+    pendingDataLength: 7,
+    cols: 80,
+    rows: 24,
+    flowControlSocket: socket,
+    sentDataOffset: 0,
+    acknowledgedDataOffset: 0,
+  } as never;
+
+  resizeTerminalSession(session, 80, 24);
+
+  assert.equal(resizeCalls, 0);
+  assert.equal(messages[0]?.type, 'data');
+  assert.equal(messages[0]?.data, 'pending');
+});
+
+test('clamps terminal dimensions and reports the accepted grid', async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const socket = new WebSocket(`${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal?cols=2&rows=1`);
+  const messages: Array<{ type?: string; cols?: number; rows?: number; resizeId?: number }> = [];
+  socket.addEventListener('message', (event) => {
+    messages.push(JSON.parse(String(event.data)) as { type?: string; cols?: number; rows?: number; resizeId?: number });
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socket.addEventListener('open', () => resolve(), { once: true });
+      socket.addEventListener('error', () => reject(new Error('Terminal WebSocket failed')), { once: true });
+    });
+    assert.equal(await waitUntil(() => messages.some(({ type }) => type === 'ready'), 1_000), true);
+    const ready = messages.find(({ type }) => type === 'ready');
+    assert.equal(ready?.cols, 20);
+    assert.equal(ready?.rows, 5);
+
+    socket.send(JSON.stringify({ type: 'resize', cols: 1_000, rows: 1_000, resizeId: 7 }));
+    assert.equal(await waitUntil(() => messages.some(({ type, resizeId }) => type === 'resized' && resizeId === 7), 1_000), true);
+    assert.deepEqual(messages.find(({ type, resizeId }) => type === 'resized' && resizeId === 7), {
+      type: 'resized',
+      cols: 500,
+      rows: 200,
+      resizeId: 7,
+    });
+  } finally {
+    socket.close();
+    await app.close();
+  }
+});
+
 test('a reconnect separates a carried query from a new live query', { skip: process.platform === 'win32' }, async () => {
   const app = Fastify();
   await app.register(websocket);
@@ -186,6 +252,82 @@ test('a reconnect separates a carried query from a new live query', { skip: proc
   }
 });
 
+test('protocol 2 replays output with its resize boundaries and hydrates before accepting input', { skip: process.platform === 'win32' }, async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const baseUrl = `${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal?protocol=2&clientId=replay-client&cols=80&rows=24`;
+  const firstSocket = new WebSocket(`${baseUrl}&generation=1`);
+  const firstMessages: Array<{ type?: string; data?: string; cols?: number; rows?: number; resizeId?: number; hydrated?: boolean }> = [];
+  firstSocket.addEventListener('message', (event) => {
+    firstMessages.push(JSON.parse(String(event.data)) as { type?: string; data?: string; cols?: number; rows?: number; resizeId?: number; hydrated?: boolean });
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      firstSocket.addEventListener('open', () => resolve(), { once: true });
+      firstSocket.addEventListener('error', () => reject(new Error('First terminal WebSocket failed')), { once: true });
+    });
+    assert.equal(await waitUntil(() => firstMessages.some(({ type }) => type === 'replay-complete'), 1_000), true);
+
+    firstSocket.send(JSON.stringify({ type: 'input', data: "printf 'IGNORED_BEFORE_HYDRATE\\n'\n" }));
+    firstSocket.send(JSON.stringify({ type: 'hydrate', resizeId: 1, cols: 80, rows: 24 }));
+    assert.equal(await waitUntil(() => firstMessages.some(({ type, resizeId, hydrated }) => type === 'resized' && resizeId === 1 && hydrated), 1_000), true);
+
+    firstSocket.send(JSON.stringify({ type: 'input', data: "printf 'BEFORE_RESIZE\\n'\n" }));
+    assert.equal(await waitUntil(() => firstMessages.some(({ type, data }) => type === 'data' && data?.includes('BEFORE_RESIZE')), 2_000), true);
+    firstSocket.send(JSON.stringify({ type: 'resize', resizeId: 2, cols: 100, rows: 30 }));
+    assert.equal(await waitUntil(() => firstMessages.some(({ type, resizeId }) => type === 'resized' && resizeId === 2), 1_000), true);
+    firstSocket.send(JSON.stringify({ type: 'input', data: "printf 'AFTER_RESIZE\\n'\n" }));
+    assert.equal(await waitUntil(() => firstMessages.some(({ type, data }) => type === 'data' && data?.includes('AFTER_RESIZE')), 2_000), true);
+
+    const secondSocket = new WebSocket(`${baseUrl}&cols=120&rows=40&generation=2`);
+    const secondMessages: Array<{ type?: string; data?: string; cols?: number; rows?: number; resizeId?: number; hydrated?: boolean; replay?: boolean }> = [];
+    secondSocket.addEventListener('message', (event) => {
+      secondMessages.push(JSON.parse(String(event.data)) as { type?: string; data?: string; cols?: number; rows?: number; resizeId?: number; hydrated?: boolean; replay?: boolean });
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        secondSocket.addEventListener('open', () => resolve(), { once: true });
+        secondSocket.addEventListener('error', () => reject(new Error('Second terminal WebSocket failed')), { once: true });
+      });
+      assert.equal(await waitUntil(() => secondMessages.some(({ type }) => type === 'replay-complete'), 1_000), true);
+      const ready = secondMessages.find(({ type }) => type === 'ready');
+      assert.deepEqual({ cols: ready?.cols, rows: ready?.rows }, { cols: 100, rows: 30 });
+
+      const replayEntries = secondMessages.filter(({ type, replay }) => type === 'data' && replay === true);
+      const beforeIndex = replayEntries.findIndex(({ data, cols, rows }) => cols === 80 && rows === 24 && data?.includes('BEFORE_RESIZE'));
+      const afterIndex = replayEntries.findIndex(({ data, cols, rows }) => cols === 100 && rows === 30 && data?.includes('AFTER_RESIZE'));
+      assert.ok(beforeIndex >= 0, JSON.stringify(replayEntries));
+      assert.ok(afterIndex > beforeIndex, JSON.stringify(replayEntries));
+
+      secondSocket.send(JSON.stringify({ type: 'input', data: "printf 'IGNORED_SECOND_HYDRATE\\n'\n" }));
+      secondSocket.send(JSON.stringify({ type: 'hydrate', resizeId: 3, cols: 120, rows: 40 }));
+      assert.equal(await waitUntil(() => secondMessages.some(({ type, resizeId, hydrated }) => type === 'resized' && resizeId === 3 && hydrated), 1_000), true);
+      assert.deepEqual(secondMessages.find(({ type, resizeId }) => type === 'resized' && resizeId === 3), {
+        type: 'resized',
+        cols: 120,
+        rows: 40,
+        hydrated: true,
+        resizeId: 3,
+      });
+
+      secondSocket.send(JSON.stringify({ type: 'input', data: "printf 'AFTER_HYDRATE\\n'\n" }));
+      assert.equal(await waitUntil(() => secondMessages.some(({ type, data }) => type === 'data' && data?.includes('AFTER_HYDRATE')), 2_000), true);
+      assert.equal(secondMessages.some(({ data }) => data?.includes('IGNORED_SECOND_HYDRATE')), false);
+      assert.equal(secondMessages.some(({ data }) => data?.includes('IGNORED_BEFORE_HYDRATE')), false);
+    } finally {
+      secondSocket.close();
+    }
+  } finally {
+    firstSocket.close();
+    await app.close();
+  }
+});
+
 test('a new terminal connection replaces the previous browser controller', async () => {
   const app = Fastify();
   await app.register(websocket);
@@ -212,6 +354,88 @@ test('a new terminal connection replaces the previous browser controller', async
   } finally {
     firstSocket.close();
     secondSocket.close();
+    await app.close();
+  }
+});
+
+test('rejects stale terminal connection generations without replacing the active controller', async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const baseUrl = `${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal?protocol=2&clientId=client-a`;
+  const activeSocket = new WebSocket(`${baseUrl}&generation=2`);
+  let activeClosed = false;
+  let activePong = false;
+  activeSocket.addEventListener('close', () => { activeClosed = true; });
+  activeSocket.addEventListener('message', (event) => {
+    const message = JSON.parse(String(event.data)) as { type?: string };
+    if (message.type === 'pong') activePong = true;
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      activeSocket.addEventListener('open', () => resolve(), { once: true });
+      activeSocket.addEventListener('error', () => reject(new Error('Active terminal WebSocket failed')), { once: true });
+    });
+
+    for (const generation of [1, 2]) {
+      const staleSocket = new WebSocket(`${baseUrl}&generation=${generation}`);
+      const closeCode = await new Promise<number>((resolve, reject) => {
+        staleSocket.addEventListener('close', (event) => resolve(event.code), { once: true });
+        staleSocket.addEventListener('error', () => reject(new Error('Stale terminal WebSocket failed before close')), { once: true });
+      });
+      assert.equal(closeCode, 4002);
+      assert.equal(activeClosed, false);
+    }
+
+    activeSocket.send(JSON.stringify({ type: 'ping' }));
+    assert.equal(await waitUntil(() => activePong, 1_000), true);
+
+    const newerSocket = new WebSocket(`${baseUrl}&generation=3`);
+    const activeCloseCode = new Promise<number>((resolve) => activeSocket.addEventListener('close', (event) => resolve(event.code), { once: true }));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        newerSocket.addEventListener('open', () => resolve(), { once: true });
+        newerSocket.addEventListener('error', () => reject(new Error('Newer terminal WebSocket failed')), { once: true });
+      });
+      assert.equal(await activeCloseCode, 4002);
+    } finally {
+      newerSocket.close();
+    }
+  } finally {
+    activeSocket.close();
+    await app.close();
+  }
+});
+
+test('rotates inactive terminal client generations without locking out new controllers', async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const baseUrl = `${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal?protocol=2&generation=1`;
+
+  try {
+    for (let index = 0; index < 70; index += 1) {
+      const socket = new WebSocket(`${baseUrl}&clientId=client-${index}`);
+      await new Promise<void>((resolve, reject) => {
+        socket.addEventListener('message', (event) => {
+          const message = JSON.parse(String(event.data)) as { type?: string };
+          if (message.type === 'ready') resolve();
+        });
+        socket.addEventListener('close', (event) => reject(new Error(`Terminal client ${index} closed before ready with code ${event.code}`)), { once: true });
+        socket.addEventListener('error', () => reject(new Error(`Terminal client ${index} failed before ready`)), { once: true });
+      });
+      const closed = new Promise<void>((resolve) => socket.addEventListener('close', () => resolve(), { once: true }));
+      socket.close();
+      await closed;
+    }
+  } finally {
     await app.close();
   }
 });

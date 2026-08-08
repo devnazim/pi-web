@@ -29,6 +29,8 @@ export type SanitizedTerminalReplayChunk = {
   };
 };
 
+export type TerminalReplayEntry = { cols: number; rows: number; data: string };
+
 export function createTerminalReplaySanitizerState(): TerminalReplaySanitizerState {
   return {
     mode: 'ground',
@@ -63,6 +65,48 @@ export function trimTerminalReplay(value: string, maxLength: number) {
 
   if (safeStart > 0 && isLowSurrogate(value.charCodeAt(safeStart)) && isHighSurrogate(value.charCodeAt(safeStart - 1))) safeStart += 1;
   return value.slice(safeStart);
+}
+
+export function appendTerminalReplayData(entries: TerminalReplayEntry[], data: string, maxDataLength: number, maxEntries: number) {
+  if (!data || !entries.length) return;
+  entries[entries.length - 1].data += data;
+  trimTerminalReplayEntries(entries, maxDataLength, maxEntries);
+}
+
+export function recordTerminalReplayResize(entries: TerminalReplayEntry[], cols: number, rows: number, maxDataLength: number, maxEntries: number) {
+  const last = entries.at(-1);
+  if (!last) {
+    entries.push({ cols, rows, data: '' });
+  } else if (last.cols === cols && last.rows === rows) {
+    return;
+  } else if (!last.data) {
+    last.cols = cols;
+    last.rows = rows;
+  } else {
+    entries.push({ cols, rows, data: '' });
+  }
+  trimTerminalReplayEntries(entries, maxDataLength, maxEntries);
+}
+
+export function trimTerminalReplayEntries(entries: TerminalReplayEntry[], maxDataLength: number, maxEntries: number) {
+  const entryLimit = Math.max(1, maxEntries);
+  const dataLimit = Math.max(1, maxDataLength);
+  while (entries.length > entryLimit && entries.length > 1) entries.shift();
+
+  let totalDataLength = entries.reduce((total, entry) => total + entry.data.length, 0);
+  while (totalDataLength > dataLimit && entries.length > 1) {
+    const first = entries[0];
+    const remainingDataLength = totalDataLength - first.data.length;
+    if (!first.data || remainingDataLength >= dataLimit) {
+      entries.shift();
+      totalDataLength = remainingDataLength;
+      continue;
+    }
+    first.data = trimTerminalReplay(first.data, dataLimit - remainingDataLength);
+    totalDataLength = remainingDataLength + first.data.length;
+  }
+
+  if (entries.length === 1 && totalDataLength > dataLimit) entries[0].data = trimTerminalReplay(entries[0].data, dataLimit);
 }
 
 export function sanitizeTerminalReplayChunk(state: TerminalReplaySanitizerState, data: string): SanitizedTerminalReplayChunk {
