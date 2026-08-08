@@ -247,7 +247,7 @@ type ExtensionUiRequest = { id: string; sessionId?: string; method: ExtensionUiR
 type ExtensionUiReply = { value?: string; confirmed?: boolean; cancelled?: boolean; sessionId?: string };
 type AgentStatusPart = { text: string; title?: string; tone?: 'warning' | 'danger' };
 type ModelListItem = { value: string; label: string; provider: string; id: string; reasoning: boolean; thinkingLevels?: ThinkingLevel[] };
-type AgentListItem = { value: string; id: string; label: string; description?: string; type: 'main' | 'subagent' | 'both'; source: 'suite' | 'legacy'; model?: string; thinking?: string; tools?: string[]; agents?: string[] };
+type AgentListItem = { value: string; id: string; label: string; description?: string; type: 'main' | 'subagent' | 'both'; source: 'suite' | 'legacy' | 'project'; model?: string; thinking?: string; tools?: string[]; workflows?: string[]; agents?: string[] };
 type AgentListResponse = { supported: boolean; active?: string | null; agents: AgentListItem[] };
 type RichTextPart = { text: string; kind?: 'code' | 'file' | 'strong' };
 type MarkdownTableCell = { text?: string; tokens?: Token[]; align?: 'center' | 'left' | 'right' | null };
@@ -7176,10 +7176,10 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     const list = await currentAgentList(projectId, draftKey).catch(() => undefined);
     if (props.sessionNavigationRevision !== navigationRevision || props.project.id !== projectId || activeComposerDraftKey !== draftKey) return 'stale';
     if (!list?.supported) return false;
-    const reset = ['default', 'reset', 'none', 'off'].includes(requested.toLowerCase());
+    const reset = requested.toLowerCase() === 'none';
     const nextAgent = reset
       ? ''
-      : list.agents.find((item) => [item.value, item.id, item.label].some((candidate) => candidate.toLowerCase() === requested.toLowerCase()))?.value;
+      : list.agents.find((item) => [item.value, item.id, item.label].some((candidate) => candidate.normalize('NFC') === requested.normalize('NFC')))?.value;
     if (nextAgent === undefined) return false;
     handleAgentChange(nextAgent);
     return true;

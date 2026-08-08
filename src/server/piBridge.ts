@@ -1,7 +1,7 @@
 import { getAgentDir, parseFrontmatter, resizeImage, type ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, type Dirent, type Stats } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
 import { open, readdir, readFile, realpath, stat, type FileHandle } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -81,9 +81,10 @@ type CommandInfo = {
 };
 
 type CommandCompletion = { value: string; label?: string; description?: string };
-type AgentProfileSource = 'suite' | 'legacy';
+type AgentProfileSource = 'suite' | 'legacy' | 'project';
 type AgentProfileType = 'main' | 'subagent' | 'both';
-type AgentListItem = { value: string; id: string; label: string; description?: string; type: AgentProfileType; source: AgentProfileSource; model?: string; thinking?: string; tools?: string[]; agents?: string[] };
+type AgentProfileLocation = { agentsDir: string; suiteStateDir: string; legacyStateDir: string; source: Exclude<AgentProfileSource, 'project'> };
+type AgentListItem = { value: string; id: string; label: string; description?: string; type: AgentProfileType; source: AgentProfileSource; model?: string; thinking?: string; tools?: string[]; workflows?: string[]; agents?: string[] };
 type AgentListResponse = { supported: boolean; active: string | null; agents: AgentListItem[] };
 
 type ExtensionUiRequestMethod = 'select' | 'confirm' | 'input' | 'editor';
@@ -110,7 +111,7 @@ type PendingExtensionUiRequest<T = unknown> = {
   defaultValue: T;
   cleanup: () => boolean;
 };
-type CustomUiRuntime = { TUI: new (terminal: WebExtensionTerminal, showHardwareCursor?: boolean) => any; visibleWidth: (value: string) => number; keybindings: unknown; theme: unknown };
+type CustomUiRuntime = { TuiMainScreen: new (terminal: WebExtensionTerminal, showHardwareCursor?: boolean) => any; visibleWidth: (value: string) => number; keybindings: unknown; theme: unknown };
 type PendingExtensionCustomUi<T = unknown> = {
   id: string;
   session: object;
@@ -996,7 +997,7 @@ export class PiBridge {
       const result = {
         supported: true,
         active: await this.activeAgentId(projectPath, location),
-        agents: await this.loadAgentProfilesFromDir(location.agentsDir, location.source),
+        agents: await this.loadAgentProfiles(projectPath, location),
       };
       if (!this.runtimeSessionCurrent(projectPath, sessionId, session)) throw new Error('Session runtime changed while loading agents.');
       return result;
@@ -1749,12 +1750,12 @@ export class PiBridge {
         const nestedTuiEntry = path.join(agentRoot, 'node_modules/@earendil-works/pi-tui/dist/index.js');
         const siblingTuiEntry = path.join(path.dirname(agentRoot), 'pi-tui/dist/index.js');
         const tuiEntry = await stat(nestedTuiEntry).then(() => nestedTuiEntry).catch(() => siblingTuiEntry);
-        const [{ TUI, visibleWidth }, { KeybindingsManager }, { theme }] = await Promise.all([
+        const [{ TuiMainScreen, visibleWidth }, { KeybindingsManager }, { theme }] = await Promise.all([
           import(pathToFileURL(tuiEntry).href),
           import(pathToFileURL(path.join(path.dirname(agentEntry), 'core/keybindings.js')).href),
           import(pathToFileURL(path.join(path.dirname(agentEntry), 'modes/interactive/theme/theme.js')).href),
         ]);
-        return { TUI, visibleWidth, keybindings: KeybindingsManager.create(getAgentDir()), theme } as CustomUiRuntime;
+        return { TuiMainScreen, visibleWidth, keybindings: KeybindingsManager.create(getAgentDir()), theme } as CustomUiRuntime;
       })();
       this.customUiRuntimePromise.catch(() => { this.customUiRuntimePromise = undefined; });
     }
@@ -1764,13 +1765,13 @@ export class PiBridge {
   private async createExtensionCustomUi<T>(session: object, projectPath: string, sessionId: string | undefined, factory: (tui: any, theme: any, keybindings: any, done: (result: T) => void) => any, options?: { overlay?: boolean; overlayOptions?: object | (() => object); onHandle?: (handle: any) => void }) {
     if (this.sessionCannotPublish(session)) return undefined as T;
     const cancellationGeneration = this.extensionCustomUiCancellationGenerations.get(session) ?? 0;
-    const { TUI, visibleWidth, keybindings, theme } = await this.loadCustomUiRuntime();
+    const { TuiMainScreen, visibleWidth, keybindings, theme } = await this.loadCustomUiRuntime();
     if (this.sessionCannotPublish(session) || (this.extensionCustomUiCancellationGenerations.get(session) ?? 0) !== cancellationGeneration) return undefined as T;
 
     const id = randomUUID();
     const streamKey = this.sessionStreamKeys.get(session) ?? [];
     const terminal = new WebExtensionTerminal();
-    const tui = new TUI(terminal, true);
+    const tui = new TuiMainScreen(terminal, true);
     let pending: PendingExtensionCustomUi<T>;
     const result = new Promise<T>((resolve, reject) => {
       pending = {
@@ -2274,7 +2275,7 @@ export class PiBridge {
     const location = await this.agentProfileLocation();
     const completions: CommandCompletion[] = [
       { value: 'none', label: 'No agent', description: 'Clear selected main agent' },
-      ...(await this.loadAgentProfilesFromDir(location.agentsDir, location.source)).map((agent) => ({
+      ...(await this.loadAgentProfiles(projectPath, location)).map((agent) => ({
         value: agent.id,
         label: `${agent.id} · ${agent.source}`,
         description: agent.description,
@@ -2286,62 +2287,102 @@ export class PiBridge {
       .some((item) => item.toLowerCase().includes(normalized))).slice(0, 25);
   }
 
-  private async agentProfileLocation(): Promise<{ agentsDir: string; stateDir: string; source: AgentProfileSource }> {
+  private async agentProfileLocation(): Promise<AgentProfileLocation> {
     const suiteDir = process.env.PI_AGENT_SUITE_DIR
       ? path.resolve(this.expandHomePath(process.env.PI_AGENT_SUITE_DIR))
       : path.join(getAgentDir(), 'agent-suite');
     const suiteAgentsDir = path.join(suiteDir, 'agent-selection', 'agents');
-    if (await this.isDirectory(suiteAgentsDir)) {
-      return {
-        agentsDir: suiteAgentsDir,
-        stateDir: path.join(suiteDir, 'agent-selection', 'state'),
-        source: 'suite',
-      };
-    }
-    return {
-      agentsDir: path.join(getAgentDir(), 'agents'),
-      stateDir: path.join(getAgentDir(), 'agent-selection', 'state'),
-      source: 'legacy',
+    const stateLocation = {
+      suiteStateDir: path.join(suiteDir, 'agent-selection', 'state'),
+      legacyStateDir: path.join(getAgentDir(), 'agent-selection', 'state'),
     };
+    try {
+      await readdir(suiteAgentsDir);
+      return { agentsDir: suiteAgentsDir, source: 'suite', ...stateLocation };
+    } catch (error) {
+      if (!this.isFileNotFoundError(error)) throw error;
+    }
+    return { agentsDir: path.join(getAgentDir(), 'agents'), source: 'legacy', ...stateLocation };
   }
 
-  private async activeAgentId(projectPath: string, location: { stateDir: string }): Promise<string | null> {
+  private async activeAgentId(projectPath: string, location: Pick<AgentProfileLocation, 'suiteStateDir' | 'legacyStateDir'>): Promise<string | null> {
+    const cwd = path.resolve(projectPath);
+    const stateFile = `${createHash('sha256').update(cwd).digest('hex')}.json`;
+    let content: string;
     try {
-      const statePath = path.join(location.stateDir, `${createHash('sha256').update(path.resolve(projectPath)).digest('hex')}.json`);
-      const state = JSON.parse(await readFile(statePath, 'utf8')) as { cwd?: unknown; activeAgentId?: unknown };
-      if (typeof state.cwd === 'string' && path.resolve(state.cwd) !== path.resolve(projectPath)) return null;
-      return typeof state.activeAgentId === 'string' ? state.activeAgentId : null;
+      content = await readFile(path.join(location.suiteStateDir, stateFile), 'utf8');
+    } catch (error) {
+      if (!this.isFileNotFoundError(error)) return null;
+      try {
+        content = await readFile(path.join(location.legacyStateDir, stateFile), 'utf8');
+      } catch {
+        return null;
+      }
+    }
+    try {
+      const state: unknown = JSON.parse(content);
+      if (!state || typeof state !== 'object' || Array.isArray(state)) return null;
+      const record = state as Record<string, unknown>;
+      if (Object.keys(record).some((key) => key !== 'cwd' && key !== 'activeAgentId') || record.cwd !== cwd) return null;
+      if (record.activeAgentId === null) return null;
+      return this.frontmatterString(record.activeAgentId).normalize('NFC');
     } catch {
       return null;
     }
   }
 
-  private async loadAgentProfilesFromDir(dir: string, source: AgentProfileSource): Promise<AgentListItem[]> {
-    let entries: Dirent[];
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return [];
+  private async loadAgentProfiles(projectPath: string, location: AgentProfileLocation): Promise<AgentListItem[]> {
+    const [globalEntries, projectEntries] = await Promise.all([
+      this.agentProfileEntries(location.agentsDir, location.source),
+      this.agentProfileEntries(path.join(projectPath, '.pi', 'agents'), 'project'),
+    ]);
+    const projectGroups = new Map<string, string[]>();
+    for (const entry of projectEntries) {
+      const id = path.basename(entry, '.md').normalize('NFC');
+      projectGroups.set(id, [...(projectGroups.get(id) ?? []), entry]);
     }
-    const agents = await Promise.all(entries
-      .filter((entry) => entry.name.endsWith('.md') && (entry.isFile() || entry.isSymbolicLink()))
-      .map((entry) => this.agentProfileFromFile(path.join(dir, entry.name), source)));
-    return agents
-      .filter((agent): agent is AgentListItem => Boolean(agent))
-      .sort((a, b) => a.label.localeCompare(b.label) || a.id.localeCompare(b.id));
+    const projectIds = new Set(projectGroups.keys());
+    const selectedFiles: Array<{ filePath: string; source: AgentProfileSource }> = [
+      ...globalEntries
+        .filter((entry) => !projectIds.has(path.basename(entry, '.md').normalize('NFC')))
+        .map((entry) => ({ filePath: path.join(location.agentsDir, entry), source: location.source })),
+      ...[...projectGroups.values()]
+        .filter((entries) => entries.length === 1)
+        .map(([entry]) => ({ filePath: path.join(projectPath, '.pi', 'agents', entry!), source: 'project' as const })),
+    ];
+    selectedFiles.sort((a, b) => path.basename(a.filePath).localeCompare(path.basename(b.filePath)));
+    const agents = await Promise.all(selectedFiles.map(({ filePath, source }) => this.agentProfileFromFile(filePath, source)));
+    return agents.filter((agent): agent is AgentListItem => Boolean(agent));
+  }
+
+  private async agentProfileEntries(dir: string, source: AgentProfileSource): Promise<string[]> {
+    try {
+      return (await readdir(dir)).filter((entry) => entry.endsWith('.md')).sort();
+    } catch (error) {
+      if (source === 'legacy' || this.isFileNotFoundError(error)) return [];
+      throw error;
+    }
   }
 
   private async agentProfileFromFile(filePath: string, source: AgentProfileSource): Promise<AgentListItem | undefined> {
+    let content: string;
     try {
-      const id = path.basename(filePath, '.md').trim();
-      if (!id) return undefined;
-      const { frontmatter } = parseFrontmatter<Record<string, unknown>>(await readFile(filePath, 'utf8'));
+      content = await readFile(filePath, 'utf8');
+    } catch (error) {
+      if (source === 'suite') throw error;
+      return undefined;
+    }
+    try {
+      const id = this.frontmatterString(path.basename(filePath, '.md').normalize('NFC'));
+      const { frontmatter } = parseFrontmatter<Record<string, unknown>>(content);
+      if (Object.keys(frontmatter).some((key) => !['description', 'type', 'model', 'tools', 'workflows', 'agents'].includes(key))) return undefined;
       const type = this.agentProfileType(frontmatter.type);
       if (type === 'subagent') return undefined;
-      const description = this.frontmatterString(frontmatter.description);
+      const description = frontmatter.description === undefined ? undefined : this.frontmatterString(frontmatter.description);
       const model = this.frontmatterModel(frontmatter.model);
-      const tools = this.frontmatterStringArray(frontmatter.tools);
-      const agents = this.frontmatterStringArray(frontmatter.agents);
+      const tools = this.frontmatterStringArray(frontmatter.tools, false);
+      const workflows = this.frontmatterStringArray(frontmatter.workflows, true);
+      const agents = this.frontmatterStringArray(frontmatter.agents, true);
       return {
         value: id,
         id,
@@ -2351,8 +2392,9 @@ export class PiBridge {
         source,
         ...(model.id ? { model: model.id } : {}),
         ...(model.thinking ? { thinking: model.thinking } : {}),
-        ...(tools?.length ? { tools } : {}),
-        ...(agents?.length ? { agents } : {}),
+        ...(tools !== undefined ? { tools } : {}),
+        ...(workflows !== undefined ? { workflows } : {}),
+        ...(agents !== undefined ? { agents } : {}),
       };
     } catch {
       return undefined;
@@ -2361,36 +2403,42 @@ export class PiBridge {
 
   private agentProfileType(value: unknown): AgentProfileType {
     if (value === undefined || value === null) return 'main';
-    if (typeof value !== 'string') throw new Error('Invalid agent type');
-    const type = value.trim();
-    if (type === 'main' || type === 'subagent' || type === 'both') return type;
+    if (value === 'main' || value === 'subagent' || value === 'both') return value;
     throw new Error('Invalid agent type');
   }
 
-  private async isDirectory(filePath: string) {
-    try {
-      return (await stat(filePath)).isDirectory();
-    } catch {
-      return false;
+  private isFileNotFoundError(error: unknown) {
+    return Boolean(error && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ENOENT');
+  }
+
+  private frontmatterString(value: unknown): string {
+    if (typeof value !== 'string' || !value || value.trim() !== value || /[\r\n\u0085\u2028\u2029]/u.test(value)) throw new Error('Invalid agent profile text');
+    return value;
+  }
+
+  private frontmatterStringArray(value: unknown, normalizeIdentities: boolean): string[] | undefined {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value)) throw new Error('Invalid agent profile list');
+    const strings: string[] = [];
+    const seen = new Set<string>();
+    for (const item of value) {
+      const string = normalizeIdentities ? this.frontmatterString(item).normalize('NFC') : item;
+      if (typeof string !== 'string' || !string.trim() || seen.has(string)) throw new Error('Invalid agent profile list');
+      seen.add(string);
+      strings.push(string);
     }
-  }
-
-  private frontmatterString(value: unknown) {
-    return typeof value === 'string' ? value.trim() || undefined : undefined;
-  }
-
-  private frontmatterStringArray(value: unknown) {
-    const values = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/[\n,]/) : [];
-    const strings = values.map((item) => typeof item === 'string' ? item.trim() : '').filter(Boolean);
-    return strings.length ? [...new Set(strings)] : undefined;
+    return strings;
   }
 
   private frontmatterModel(value: unknown): { id?: string; thinking?: string } {
-    if (typeof value === 'string') return this.frontmatterString(value) ? { id: this.frontmatterString(value) } : {};
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+    if (value === undefined) return {};
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid agent model');
     const model = value as { id?: unknown; thinking?: unknown };
-    const id = this.frontmatterString(model.id);
-    const thinking = this.frontmatterString(model.thinking);
+    if (Object.keys(model).some((key) => key !== 'id' && key !== 'thinking')) throw new Error('Invalid agent model');
+    const id = typeof model.id === 'string' && model.id.length ? model.id : undefined;
+    if (model.id !== undefined && id === undefined) throw new Error('Invalid agent model id');
+    const thinking = model.thinking === undefined ? undefined : this.frontmatterString(model.thinking);
+    if (thinking && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinking)) throw new Error('Invalid agent thinking level');
     return {
       ...(id ? { id } : {}),
       ...(thinking ? { thinking } : {}),
@@ -2427,7 +2475,7 @@ export class PiBridge {
 
   private agentCommandArgument(value: string | undefined) {
     const requested = value?.trim() ?? '';
-    if (!requested || ['none', 'default', 'reset', 'off'].includes(requested.toLowerCase())) return 'none';
+    if (!requested || requested.toLowerCase() === 'none') return 'none';
     if (/[\r\n]/.test(requested)) throw new Error('Invalid agent id');
     return requested;
   }

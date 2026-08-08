@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, symlink, unlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -19,6 +19,135 @@ test('binds browser extension UI in RPC mode', async () => {
   }, '/workspace', 'session-1', 'project-1:session-1');
 
   assert.equal(bindings?.mode, 'rpc');
+});
+
+test('agent discovery overlays project profiles and exposes suite workflow policy', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-agent-profiles-'));
+  const projectPath = path.join(root, 'project');
+  const globalAgentsDir = path.join(root, 'suite-agents');
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(projectPath, '.pi', 'agents'), { recursive: true });
+  await mkdir(globalAgentsDir, { recursive: true });
+  await mkdir(path.join(projectPath, '.pi', 'agents', 'Reserved.md'));
+  await Promise.all([
+    writeFile(path.join(globalAgentsDir, 'Builder.md'), `---\ndescription: Global builder\ntype: main\ntools:\n  - read\nworkflows:\n  - Global\n---\nGlobal prompt\n`),
+    writeFile(path.join(globalAgentsDir, 'Reserved.md'), `---\ndescription: Reserved globally\ntype: main\n---\nGlobal prompt\n`),
+    writeFile(path.join(globalAgentsDir, 'Shared.md'), `---\ndescription: Shared agent\ntype: main\n---\nShared prompt\n`),
+    writeFile(path.join(globalAgentsDir, 'Shadow.md'), `---\ndescription: Global shadow\ntype: main\n---\nShadow prompt\n`),
+    writeFile(path.join(globalAgentsDir, 'Helper.md'), `---\ndescription: Child only\ntype: subagent\n---\nHelper prompt\n`),
+    writeFile(path.join(globalAgentsDir, 'ModelAlias.md'), `---\ndescription: Alias with padding\nmodel:\n  id: "  padded alias  "\n---\nAlias prompt\n`),
+    writeFile(path.join(projectPath, '.pi', 'agents', 'builder.md'), `---\ndescription: Project builder\ntype: both\nmodel:\n  id: fast\n  thinking: high\ntools: []\nworkflows:\n  - Review\n  - Delivery\nagents:\n  - Generalist\n---\nProject prompt\n`),
+    writeFile(path.join(projectPath, '.pi', 'agents', 'InvalidLists.md'), `---\ndescription: Invalid list\ntools: read\n---\nInvalid prompt\n`),
+    writeFile(path.join(projectPath, '.pi', 'agents', 'InvalidModel.md'), `---\ndescription: Invalid model\nmodel: fast\n---\nInvalid prompt\n`),
+    writeFile(path.join(projectPath, '.pi', 'agents', 'Local.md'), `---\ndescription: Local agent\ntype: main\nworkflows: []\nagents: []\n---\nLocal prompt\n`),
+    writeFile(path.join(projectPath, '.pi', 'agents', 'Shadow.md'), `---\ndescription: Invalid project override\nunsupported: true\n---\nInvalid prompt\n`),
+  ]);
+
+  const bridge = new PiBridge();
+  const location = {
+    agentsDir: globalAgentsDir,
+    suiteStateDir: path.join(root, 'suite-state'),
+    legacyStateDir: path.join(root, 'legacy-state'),
+    source: 'suite',
+  };
+  const agents = await (bridge as any).loadAgentProfiles(projectPath, location);
+  (bridge as any).agentProfileLocation = async () => location;
+  const completions = await (bridge as any).agentCommandCompletions(projectPath, '');
+  const agentsById = new Map(agents.map((agent: { id: string }) => [agent.id, agent]));
+
+  assert.deepEqual(agentsById.get('builder'), {
+    value: 'builder',
+    id: 'builder',
+    label: 'builder',
+    description: 'Project builder',
+    type: 'both',
+    source: 'project',
+    model: 'fast',
+    thinking: 'high',
+    tools: [],
+    workflows: ['Review', 'Delivery'],
+    agents: ['Generalist'],
+  });
+  assert.deepEqual(agentsById.get('Local'), {
+    value: 'Local',
+    id: 'Local',
+    label: 'Local',
+    description: 'Local agent',
+    type: 'main',
+    source: 'project',
+    workflows: [],
+    agents: [],
+  });
+  assert.equal(agentsById.get('Builder')?.source, 'suite');
+  assert.equal(agentsById.get('ModelAlias')?.model, '  padded alias  ');
+  assert.equal(agentsById.get('Shared')?.source, 'suite');
+  for (const id of ['Helper', 'InvalidLists', 'InvalidModel', 'Reserved', 'Shadow']) assert.equal(agentsById.has(id), false);
+  assert.equal(completions.some(({ value, label }: { value: string; label?: string }) => value === 'Builder' && label === 'Builder · suite'), true);
+  assert.equal(completions.some(({ value, label }: { value: string; label?: string }) => value === 'builder' && label === 'builder · project'), true);
+  assert.equal((bridge as any).agentCommandArgument('default'), 'default');
+  assert.equal((bridge as any).agentCommandArgument('none'), 'none');
+  await bridge.dispose();
+});
+
+test('agent discovery suppresses canonically ambiguous project identities without filesystem assumptions', async () => {
+  const bridge = new PiBridge();
+  (bridge as any).agentProfileEntries = async (_dir: string, source: string) => source === 'project'
+    ? ['Café.md', 'Café.md']
+    : ['Café.md'];
+  const agents = await (bridge as any).loadAgentProfiles('/project', {
+    agentsDir: '/global-agents',
+    suiteStateDir: '/suite-state',
+    legacyStateDir: '/legacy-state',
+    source: 'suite',
+  });
+
+  assert.deepEqual(agents, []);
+  await bridge.dispose();
+});
+
+test('selected agent state prefers strict suite state and falls back to legacy only when absent', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-agent-state-'));
+  const projectPath = path.join(root, 'project');
+  const suiteStateDir = path.join(root, 'suite-state');
+  const legacyStateDir = path.join(root, 'legacy-state');
+  const location = { suiteStateDir, legacyStateDir };
+  const cwd = path.resolve(projectPath);
+  const stateFile = `${createHash('sha256').update(cwd).digest('hex')}.json`;
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await Promise.all([mkdir(suiteStateDir, { recursive: true }), mkdir(legacyStateDir, { recursive: true })]);
+  await writeFile(path.join(legacyStateDir, stateFile), JSON.stringify({ cwd, activeAgentId: 'Café' }));
+
+  const bridge = new PiBridge();
+  assert.equal(await (bridge as any).activeAgentId(projectPath, location), 'Café');
+
+  await writeFile(path.join(suiteStateDir, stateFile), JSON.stringify({ cwd, activeAgentId: 'Suite' }));
+  assert.equal(await (bridge as any).activeAgentId(projectPath, location), 'Suite');
+
+  await writeFile(path.join(suiteStateDir, stateFile), JSON.stringify({ cwd, activeAgentId: 'Suite', unsupported: true }));
+  assert.equal(await (bridge as any).activeAgentId(projectPath, location), null);
+
+  await unlink(path.join(suiteStateDir, stateFile));
+  assert.equal(await (bridge as any).activeAgentId(projectPath, location), 'Café');
+  await bridge.dispose();
+});
+
+test('agent discovery propagates authoritative registry filesystem failures', async (t) => {
+  const root = await mkdtemp(path.join(tmpdir(), 'pi-web-agent-failures-'));
+  const projectPath = path.join(root, 'project');
+  const suiteAgentsPath = path.join(root, 'suite-agents');
+  const brokenDefinitionsDir = path.join(root, 'broken-definitions');
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(projectPath, '.pi'), { recursive: true });
+  await writeFile(path.join(projectPath, '.pi', 'agents'), 'not a directory');
+  await writeFile(suiteAgentsPath, 'not a directory');
+  await mkdir(path.join(brokenDefinitionsDir, 'Broken.md'), { recursive: true });
+
+  const bridge = new PiBridge();
+  const stateLocation = { suiteStateDir: path.join(root, 'suite-state'), legacyStateDir: path.join(root, 'legacy-state') };
+  await assert.rejects((bridge as any).loadAgentProfiles(root, { agentsDir: suiteAgentsPath, source: 'suite', ...stateLocation }));
+  await assert.rejects((bridge as any).loadAgentProfiles(projectPath, { agentsDir: root, source: 'legacy', ...stateLocation }));
+  await assert.rejects((bridge as any).loadAgentProfiles(root, { agentsDir: brokenDefinitionsDir, source: 'suite', ...stateLocation }));
+  await bridge.dispose();
 });
 
 test('applies explicit agent selection only before Pi Web review extension commands', async () => {
