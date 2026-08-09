@@ -920,14 +920,14 @@ body {
   }
 
   .notification-toast {
-    @apply pointer-events-auto relative flex items-stretch overflow-hidden rounded-2xl border border-border bg-popover/70 text-popover-foreground shadow-2xl ring-1 ring-foreground/5;
+    @apply pointer-events-auto relative flex items-stretch overflow-hidden rounded-2xl border border-border bg-popover/95 text-popover-foreground shadow-2xl ring-1 ring-foreground/5;
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     animation: toast-enter 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   }
 
   .dark .notification-toast {
-    background: oklch(var(--popover) / 0.55);
+    background: oklch(var(--popover) / 0.9);
   }
 
   .notification-toast-success {
