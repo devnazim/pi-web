@@ -521,6 +521,7 @@ const PROJECT_ORDER_KEY = 'pi-web-project-order';
 const SESSION_PAGE_SIZE = 30;
 const WORKSPACE_SHORTCUT_KEYS = '123456789'.split('');
 const CHAT_SEARCH_INPUT_SELECTOR = '[data-chat-search-input="true"]';
+const CHAT_COMPOSER_INPUT_SELECTOR = '[data-chat-composer-input="true"]';
 const SHORTCUT_BLOCKING_DIALOG_SELECTOR = '.project-modal-backdrop, .confirm-modal-backdrop, .asset-preview-backdrop';
 const KEYBINDINGS_STORAGE_KEY = 'pi-web-keybindings';
 const FAVICON_HREF = appUrl('/favicon.svg');
@@ -531,12 +532,12 @@ const FAVICON_BADGE_META: Record<Exclude<FaviconStatus, 'idle'>, { color: string
   error: { color: '#ef4444', glyph: 'alert' },
 };
 
-// Ctrl+. is an app-specific chord prefix that avoids browser-reserved shortcuts
-// like Ctrl/Cmd+F, Ctrl/Cmd+P, and Ctrl/Cmd+,, plus Ctrl/Cmd+K readline/editor conflicts.
-const APP_SHORTCUT_CHORD_PREFIX = 'ctrl+.';
+// Ctrl+B is the app-specific two-step chord prefix.
+const APP_SHORTCUT_CHORD_PREFIX = 'ctrl+b';
 
 const DEFAULT_SHORTCUT_BINDINGS: Record<string, string> = {
   toggleSidebar: `${APP_SHORTCUT_CHORD_PREFIX} b`,
+  focusComposer: `${APP_SHORTCUT_CHORD_PREFIX} i`,
   toggleTerminal: 'ctrl+`',
   toggleFiles: `${APP_SHORTCUT_CHORD_PREFIX} e`,
   toggleReview: `${APP_SHORTCUT_CHORD_PREFIX} g`,
@@ -556,6 +557,7 @@ const DEFAULT_SHORTCUT_BINDINGS: Record<string, string> = {
 
 const SHORTCUT_DEFINITIONS: { id: string; name: string; category: string }[] = [
   { id: 'toggleSidebar', name: 'Toggle sessions panel', category: 'Navigation' },
+  { id: 'focusComposer', name: 'Focus chat input', category: 'Navigation' },
   { id: 'toggleTerminal', name: 'Toggle terminal', category: 'Tool panels' },
   { id: 'toggleFiles', name: 'Toggle file explorer', category: 'Tool panels' },
   { id: 'toggleReview', name: 'Toggle review changes', category: 'Tool panels' },
@@ -1612,6 +1614,7 @@ function Shell() {
         toggleSessionSidebar();
         return true;
       }
+      if (id === 'focusComposer') return focusChatComposer();
       if (id === 'toggleTerminal') return toggleShortcutToolPanel('terminal');
       if (id === 'toggleFiles') return toggleShortcutToolPanel('files');
       if (id === 'toggleReview') return toggleShortcutToolPanel('review');
@@ -1669,6 +1672,7 @@ function Shell() {
         const blockedByTyping = !continuingChord && typingShortcutBlocked;
         const blockedByTerminal = terminalShortcutBlocked(id, steps);
         if (id === 'toggleTerminal') return !blockedByTerminal && !blockingDialogOpen && !blockedByTyping;
+        if (id === 'focusComposer') return !blockedByTerminal && !blockingDialogOpen && !blockedByTyping;
         if (id === 'openSettings') return !blockedByTerminal && !inMonaco && (!blockingDialogOpen || settingsOpen()) && !blockedByTyping;
         if (id === 'searchChat' || id === 'searchFiles') return !blockedByTerminal && !inMonaco && !blockingDialogOpen && !blockedByTyping;
         return !blockingDialogOpen && !blockedByTerminal && !inMonaco && !blockedByTyping;
@@ -2835,6 +2839,18 @@ function Shell() {
     });
   }
 
+  function focusChatComposer() {
+    if (!workspaceProject()) return false;
+    const focus = () => requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>(CHAT_COMPOSER_INPUT_SELECTOR)?.focus());
+    if (toolPanel() === 'files' && requestFileWorkspaceLeave(() => {
+      setWorkspaceToolPanel(undefined);
+      focus();
+    })) return true;
+    if (toolPanel() === 'review' || toolPanel() === 'files') setWorkspaceToolPanel(undefined);
+    focus();
+    return true;
+  }
+
   function toggleThemeMode() {
     setThemeMode(resolvedThemeMode() === 'dark' ? 'light' : 'dark');
   }
@@ -3091,7 +3107,7 @@ function ProjectRail(props: { projects: Project[]; activeProjectId?: string; pro
               {(project, index) => {
                 const preference = () => projectPreference(project);
                 const shortcut = () => workspaceShortcutLabel(index());
-                const shortcutTitle = () => props.shortcutsEnabled && shortcut() ? `\nShortcut: ${formatBindingStep('ctrl')} + . then ${shortcut()}` : '';
+                const shortcutTitle = () => props.shortcutsEnabled && shortcut() ? `\nShortcut: ${formatBinding(APP_SHORTCUT_CHORD_PREFIX)} then ${shortcut()}` : '';
                 return (
                   <button
                     data-id={project.id}
@@ -3672,7 +3688,7 @@ function ShortcutsSettingsPanel() {
     const q = query().trim().toLowerCase();
     return !q || [label, ...terms].some((term) => term.toLowerCase().includes(q));
   };
-  const showSwitchWorkspaceShortcut = () => shortcutMatches('Switch workspace/project by number', 'Ctrl+.', '1..9', 'workspace', 'project');
+  const showSwitchWorkspaceShortcut = () => shortcutMatches('Switch workspace/project by number', 'Ctrl+B', '1..9', 'workspace', 'project');
   const workspaceNavigationShortcuts = () => {
     const shortcuts: { id: string; name: string; category: string }[] = [];
     if (showSwitchWorkspaceShortcut()) shortcuts.push({ id: 'switchWorkspace', name: 'Switch workspace/project by number', category: 'Workspace' });
@@ -3705,7 +3721,7 @@ function ShortcutsSettingsPanel() {
         <div class="flex shrink-0 items-center gap-1">
           <Kbd>{formatBindingStep('ctrl')}</Kbd>
           <span class="text-xs text-muted-foreground">+</span>
-          <Kbd>.</Kbd>
+          <Kbd>B</Kbd>
           <span class="text-xs text-muted-foreground">then</span>
           <Kbd>1</Kbd>
           <span class="text-xs text-muted-foreground">..</span>
@@ -4267,7 +4283,7 @@ function WorkspaceSessionGroup(props: {
           {(shortcut) => (
             <span
               class={`flex h-5 w-5 items-center justify-center rounded-full font-mono text-[10px] font-semibold uppercase leading-none transition-colors ${props.hintsActive ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'}`}
-              title={`Workspace shortcut: ${formatBindingStep('ctrl')} + . then ${shortcut()}`}
+              title={`Workspace shortcut: ${formatBinding(APP_SHORTCUT_CHORD_PREFIX)} then ${shortcut()}`}
             >
               {shortcut()}
             </span>
@@ -7699,6 +7715,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
             <textarea
               ref={composerRef}
               class="composer-textarea"
+              data-chat-composer-input="true"
               placeholder={props.treeSelection ? 'Prompt for selected tree node...' : 'Ask anything...'}
               value={text()}
               rows={1}

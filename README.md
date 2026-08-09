@@ -29,7 +29,7 @@ In dev mode, open the Vite URL (`5173` by default), not the API server port.
 
 ## Keyboard shortcuts
 
-Pi Web includes configurable keyboard shortcuts under **Settings → Shortcuts**. Defaults use `Ctrl+.` as a chord prefix: press `Ctrl+.` then `1`-`9` to switch projects/workspaces, `[` / `]` to move to the previous/next project or workspace, and `T` to toggle light/dark theme. Theme mode shortcuts are also available by default: `Ctrl+.` then `S` for system, `L` for light, and `D` for dark.
+Pi Web includes configurable keyboard shortcuts under **Settings → Shortcuts**. Defaults use `Ctrl+B` as a chord prefix: press `Ctrl+B` then `1`-`9` to switch projects/workspaces, `[` / `]` to move to the previous/next project or workspace, `I` to focus the chat input, and `T` to toggle light/dark theme. Theme mode shortcuts are also available by default: `Ctrl+B` then `S` for system, `L` for light, and `D` for dark.
 
 To serve dev mode from a reverse-proxy subpath, pass `--base-path`:
 
