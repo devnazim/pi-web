@@ -5516,59 +5516,62 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
   });
 
   return (
-    <div class="h-full min-h-0 overflow-hidden">
+    <div class="grid h-full min-h-0 overflow-hidden">
       <Show when={props.project} fallback={<div class="grid h-full place-items-center text-sm text-muted-foreground">Open a project to start.</div>}>
         {(project) => (
-          <Show
-            when={props.toolPanel === 'review' || props.toolPanel === 'files'}
-            fallback={
-              <Show
-                when={props.toolPanel === 'terminal'}
-                fallback={
-                  <div
-                    ref={workspaceSplitRef}
-                    class={props.toolPanel === 'tree' ? 'grid h-full min-h-0 overflow-hidden' : 'h-full min-h-0 overflow-hidden'}
-                    style={props.toolPanel === 'tree' ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` } : {}}
-                  >
-                    <Chat project={project()} sessionId={props.sessionId} sessionNavigationRevision={props.sessionNavigationRevision} newComposerRevision={props.newComposerRevision} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onDraftSessionId={props.onDraftSessionId} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
-                    <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
-                  </div>
-                }
-              >
-                <div ref={terminalSplitRef} class="terminal-split mobile-terminal" style={{ 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }}>
-                  <Chat project={project()} sessionId={props.sessionId} sessionNavigationRevision={props.sessionNavigationRevision} newComposerRevision={props.newComposerRevision} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onDraftSessionId={props.onDraftSessionId} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
-                  <div
-                    class="terminal-resize-handle"
-                    role="separator"
-                    aria-label="Resize terminal"
-                    aria-orientation="horizontal"
-                    aria-valuemin={TERMINAL_MIN_HEIGHT}
-                    aria-valuemax={terminal.maxSize()}
-                    aria-valuenow={terminal.size()}
-                    tabIndex={0}
-                    data-dragging={terminal.resizing() ? 'true' : 'false'}
-                    onDblClick={() => terminal.setClampedSize(TERMINAL_DEFAULT_HEIGHT)}
-                    onKeyDown={terminal.resizeWithKeyboard}
-                    onPointerDown={terminal.startResize}
-                  />
-                  <Suspense fallback={<section class="terminal-panel"><div class="terminal-toolbar"><div class="terminal-title"><SquareTerminal class="size-3.5" /><span>Loading terminal...</span></div><button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClosePanel}><X class="size-4" /></button></div><div class="terminal-host" /></section>}>
-                    <TerminalPanel project={project()} themeMode={props.themeMode} onFilesystemActivity={() => scheduleTerminalFileInvalidation(project().id)} onClose={props.onClosePanel} />
-                  </Suspense>
-                </div>
-              </Show>
-            }
-          >
-            <Show
-              when={props.toolPanel === 'review'}
-              fallback={
-                <Show when={project()} keyed>
-                  {(fileProject) => <FileWorkspace project={fileProject} state={fileWorkspaceState(fileProject.id)} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} onController={props.onFileWorkspaceController} onClose={props.onClosePanel} />}
-                </Show>
-              }
+          <Show when={props.toolPanel === 'files'} fallback={
+            <>
+            <div
+              ref={(element) => {
+                terminalSplitRef = element;
+                workspaceSplitRef = element;
+              }}
+              class={props.toolPanel === 'review'
+                ? 'invisible pointer-events-none col-start-1 row-start-1 h-full min-h-0 overflow-hidden'
+                : props.toolPanel === 'terminal'
+                  ? 'terminal-split mobile-terminal col-start-1 row-start-1'
+                  : props.toolPanel === 'tree'
+                    ? 'col-start-1 row-start-1 grid h-full min-h-0 overflow-hidden'
+                    : 'col-start-1 row-start-1 h-full min-h-0 overflow-hidden'}
+              style={props.toolPanel === 'terminal'
+                ? { 'grid-template-rows': `minmax(0, 1fr) auto ${terminal.size()}px` }
+                : props.toolPanel === 'tree'
+                  ? { 'grid-template-columns': `minmax(0, 1fr) ${treePanel.size()}px` }
+                  : {}}
             >
-              <Show when={project()} keyed>
-                {(reviewProject) => <ReviewWorkspace project={reviewProject} sessionId={props.sessionId} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} agentRunning={props.liveActivity.running} onClose={props.onClosePanel} />}
+              <Chat project={project()} sessionId={props.sessionId} sessionNavigationRevision={props.sessionNavigationRevision} newComposerRevision={props.newComposerRevision} liveActivity={props.liveActivity} liveShellActivity={props.liveShellActivity} extensionUiRequests={props.extensionUiRequests} treeSelection={treeSelection()} suspended={props.toolPanel === 'review'} themeMode={props.themeMode} contrastUserMessages={props.contrastUserMessages} searchQuery={props.searchQuery} searchRequest={props.searchRequest} onSearchState={props.onSearchState} onSession={props.onSession} onDraftSessionId={props.onDraftSessionId} onSessionNotFound={props.onSessionNotFound} onExtensionUiReply={props.onExtensionUiReply} beginAgentStatusRequest={props.beginAgentStatusRequest} invalidateAgentStatusRequests={props.invalidateAgentStatusRequests} onTreeSelection={setTreeSelection} />
+              <Show when={props.toolPanel === 'tree' && props.sessionId}><SessionTreePanel project={project()} sessionId={props.sessionId!} selectedId={treeSelection()?.entry.id} resizing={treePanel.resizing()} onSelect={setTreeSelection} onResizeStart={treePanel.startResize} onResizeKeyDown={treePanel.resizeWithKeyboard} onResizeReset={() => treePanel.setClampedSize(TREE_PANEL_DEFAULT_WIDTH)} onClose={props.onClosePanel} /></Show>
+              <Show when={props.toolPanel === 'terminal'}>
+                <div
+                  class="terminal-resize-handle"
+                  role="separator"
+                  aria-label="Resize terminal"
+                  aria-orientation="horizontal"
+                  aria-valuemin={TERMINAL_MIN_HEIGHT}
+                  aria-valuemax={terminal.maxSize()}
+                  aria-valuenow={terminal.size()}
+                  tabIndex={0}
+                  data-dragging={terminal.resizing() ? 'true' : 'false'}
+                  onDblClick={() => terminal.setClampedSize(TERMINAL_DEFAULT_HEIGHT)}
+                  onKeyDown={terminal.resizeWithKeyboard}
+                  onPointerDown={terminal.startResize}
+                />
+                <Suspense fallback={<section class="terminal-panel"><div class="terminal-toolbar"><div class="terminal-title"><SquareTerminal class="size-3.5" /><span>Loading terminal...</span></div><button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClosePanel}><X class="size-4" /></button></div><div class="terminal-host" /></section>}>
+                  <TerminalPanel project={project()} themeMode={props.themeMode} onFilesystemActivity={() => scheduleTerminalFileInvalidation(project().id)} onClose={props.onClosePanel} />
+                </Suspense>
               </Show>
+            </div>
+            <Show when={props.toolPanel === 'review'}>
+              <div class="col-start-1 row-start-1 min-h-0 overflow-hidden">
+                <Show when={project()} keyed>
+                  {(reviewProject) => <ReviewWorkspace project={reviewProject} sessionId={props.sessionId} state={reviewWorkspaceState(reviewProject.id)} themeMode={props.themeMode} agentRunning={props.liveActivity.running} onClose={props.onClosePanel} />}
+                </Show>
+              </div>
+            </Show>
+            </>
+          }>
+            <Show when={project()} keyed>
+              {(fileProject) => <FileWorkspace project={fileProject} state={fileWorkspaceState(fileProject.id)} themeMode={props.themeMode} searchRequest={props.fileSearchRequest} onController={props.onFileWorkspaceController} onClose={props.onClosePanel} />}
             </Show>
           </Show>
         )}
@@ -5579,7 +5582,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
 
 type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessionId: string; clientMessageId: string; attachments: UploadAsset[]; steering: boolean };
 
-function Chat(props: { project: Project; sessionId?: string; sessionNavigationRevision: number; newComposerRevision: number; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null, expectedNavigationRevision?: number) => boolean; onDraftSessionId: (projectId: string, sessionId: string | undefined) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
+function Chat(props: { project: Project; sessionId?: string; sessionNavigationRevision: number; newComposerRevision: number; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; suspended: boolean; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null, expectedNavigationRevision?: number) => boolean; onDraftSessionId: (projectId: string, sessionId: string | undefined) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
@@ -5916,6 +5919,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
 
   createEffect(() => {
     props.sessionId;
+    props.suspended;
     session.data?.leafId;
     transcriptEntries().map((entry) => entry.id).join('|');
     const activity = liveActivity();
@@ -5928,7 +5932,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     shellActivity.running;
     uploads().length;
     runningCommand();
-    if (stickToBottom()) scrollTranscriptToBottom();
+    if (!props.suspended && stickToBottom()) scrollTranscriptToBottom();
   });
 
   createEffect(() => {
@@ -6035,7 +6039,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
 
   createEffect(() => {
     const activeId = activeSearchEntryId();
-    if (!activeId || !normalizedSearchQuery(props.searchQuery)) return;
+    if (props.suspended || !activeId || !normalizedSearchQuery(props.searchQuery)) return;
     const index = visibleTranscriptEntries().findIndex((entry) => entry.id === activeId);
     if (index === -1) return;
     const scrollActiveEntryIntoView = () => {
@@ -6218,6 +6222,13 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
   createEffect(() => {
     text();
     syncComposerLayout();
+  });
+
+  createEffect(() => {
+    if (!props.suspended) return;
+    stopVoiceRecognition(true);
+    dismissVoiceToast();
+    setVoicePermissionDialogOpen(false);
   });
 
   onCleanup(() => {
