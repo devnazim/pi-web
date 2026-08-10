@@ -530,8 +530,9 @@ const FAVICON_BADGE_META: Record<Exclude<FaviconStatus, 'idle'>, { color: string
   error: { color: '#ef4444', glyph: 'alert' },
 };
 
-// Ctrl+B is the app-specific two-step chord prefix.
-const APP_SHORTCUT_CHORD_PREFIX = 'ctrl+b';
+// Ctrl+. is an app-specific chord prefix that avoids browser-reserved shortcuts
+// like Ctrl/Cmd+F, Ctrl/Cmd+P, and Ctrl/Cmd+,, plus Ctrl/Cmd+K readline/editor conflicts.
+const APP_SHORTCUT_CHORD_PREFIX = 'ctrl+.';
 
 const DEFAULT_SHORTCUT_BINDINGS: Record<string, string> = {
   toggleSidebar: `${APP_SHORTCUT_CHORD_PREFIX} b`,
@@ -3683,7 +3684,7 @@ function ShortcutsSettingsPanel() {
     const q = query().trim().toLowerCase();
     return !q || [label, ...terms].some((term) => term.toLowerCase().includes(q));
   };
-  const showSwitchWorkspaceShortcut = () => shortcutMatches('Switch workspace/project by number', 'Ctrl+B', '1..9', 'workspace', 'project');
+  const showSwitchWorkspaceShortcut = () => shortcutMatches('Switch workspace/project by number', 'Ctrl+.', '1..9', 'workspace', 'project');
   const workspaceNavigationShortcuts = () => {
     const shortcuts: { id: string; name: string; category: string }[] = [];
     if (showSwitchWorkspaceShortcut()) shortcuts.push({ id: 'switchWorkspace', name: 'Switch workspace/project by number', category: 'Workspace' });
@@ -3716,7 +3717,7 @@ function ShortcutsSettingsPanel() {
         <div class="flex shrink-0 items-center gap-1">
           <Kbd>{formatBindingStep('ctrl')}</Kbd>
           <span class="text-xs text-muted-foreground">+</span>
-          <Kbd>B</Kbd>
+          <Kbd>.</Kbd>
           <span class="text-xs text-muted-foreground">then</span>
           <Kbd>1</Kbd>
           <span class="text-xs text-muted-foreground">..</span>
