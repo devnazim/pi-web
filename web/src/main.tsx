@@ -111,6 +111,7 @@ import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirect
 import { parseTextSearchPatternInput } from './textSearch';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
+import { buildSessionShareUrl, decodeProjectPath, encodeProjectPath, PROJECT_QUERY_KEY, SESSION_QUERY_KEY, WORKSPACE_QUERY_KEY } from './sessionShare';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
 import MermaidDiagram from './MermaidDiagram';
 import { COMPOSER_UPLOAD_ACCEPT, handleComposerFilePaste, writeClipboardText } from './clipboard';
@@ -494,9 +495,6 @@ const commandSessionPromises = new Map<string, Promise<string>>();
 const pendingAgentSelectionApplies = new Map<string, Promise<void>>();
 const OPEN_PROJECTS_KEY = 'pi-web-open-projects';
 const ACTIVE_PROJECT_KEY = 'pi-web-active-project';
-const PROJECT_QUERY_KEY = 'project';
-const WORKSPACE_QUERY_KEY = 'workspace';
-const SESSION_QUERY_KEY = 'session';
 const CUSTOM_UI_SESSION_IDS_KEY = 'pi-web-custom-ui-session-ids';
 const DRAFT_SESSION_IDS_KEY = 'pi-web-draft-session-ids';
 const ABANDONED_PENDING_SESSION_ABORT_IDS_KEY = 'pi-web-abandoned-pending-session-abort-ids';
@@ -2474,16 +2472,13 @@ function Shell() {
   }
 
   function currentSessionUrl() {
-    const url = new URL(location.href);
     const project = activeProject();
     const workspace = activeWorkspace();
-    if (project) url.searchParams.set(PROJECT_QUERY_KEY, encodeProjectPath(project.path));
-    if (workspace && project && workspace.path !== project.path) url.searchParams.set(WORKSPACE_QUERY_KEY, encodeProjectPath(workspace.path));
-    else url.searchParams.delete(WORKSPACE_QUERY_KEY);
-    const id = activeSessionId();
-    if (id) url.searchParams.set(SESSION_QUERY_KEY, id);
-    else url.searchParams.delete(SESSION_QUERY_KEY);
-    return `${url.origin}${url.pathname}${url.search}${url.hash}`;
+    return buildSessionShareUrl(location.href, {
+      projectPath: project?.path,
+      workspacePath: workspace?.path,
+      sessionId: activeSessionId(),
+    });
   }
 
   async function shareCurrentSession() {
@@ -15580,28 +15575,6 @@ function writeActiveSessionId(sessionId?: string) {
   if (sessionId) url.searchParams.set(SESSION_QUERY_KEY, sessionId);
   else url.searchParams.delete(SESSION_QUERY_KEY);
   history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
-}
-
-function encodeProjectPath(projectPath: string) {
-  const bytes = new TextEncoder().encode(projectPath);
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-function decodeProjectPath(value: string) {
-  try {
-    const base64 = value.replace(/-/g, '+').replace(/_/g, '/');
-    const binary = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '='));
-    const projectPath = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)));
-    return looksLikeProjectPath(projectPath) ? projectPath : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function looksLikeProjectPath(projectPath: string) {
-  return projectPath.startsWith('/') || projectPath.startsWith('~') || /^[A-Za-z]:[\\/]/.test(projectPath);
 }
 
 function looksLikeProjectSearchPath(projectPath: string) {
