@@ -163,7 +163,15 @@ type AgentStatus = {
   statuses: Array<{ key: string; text: string }>;
 };
 
-type CachedSession = { projectPath: string; projectKey: string; projectLexicalKey: string; promise: Promise<unknown>; expiresAt: number; timer?: NodeJS.Timeout };
+type CachedSession = {
+  projectPath: string;
+  projectKey: string;
+  projectLexicalKey: string;
+  promise: Promise<unknown>;
+  expiresAt: number;
+  timer?: NodeJS.Timeout;
+  retired?: boolean;
+};
 type RuntimeSessionLock = { release: () => void; wasActive: boolean };
 type RuntimeOperation = { session?: object; recover: (message: string) => boolean };
 type RuntimeWatchOptions = {
@@ -233,6 +241,7 @@ export class PiBridge {
   private readonly runtimeSessionEntries = new WeakMap<object, CachedSession>();
   private readonly recoveringSessions = new WeakSet<object>();
   private readonly sessionDisposals = new WeakMap<object, Promise<void>>();
+  private readonly extensionShutdownSessions = new WeakSet<object>();
   private readonly boundSessions = new WeakSet<object>();
   private readonly sessionStreamKeys = new WeakMap<object, string | string[]>();
   private readonly sessionOperationIds = new WeakMap<object, string>();
@@ -1065,6 +1074,7 @@ export class PiBridge {
       const latestRecovery = this.runtimeRecoveries.get(cacheKey);
       if (latestRecovery) return { ...inactiveStatus, recovery: latestRecovery };
       const currentEntry = this.runtimeSessions.get(cacheKey);
+      if (currentEntry?.retired) return inactiveStatus;
       if (!currentEntry) {
         if (attemptedCreation) return inactiveStatus;
         attemptedCreation = true;
@@ -1088,14 +1098,14 @@ export class PiBridge {
       if (!resolved.ok) throw resolved.error;
       const session = resolved.session;
       if (!session || typeof session !== 'object') return inactiveStatus;
-      if (this.recoveringSessions.has(session) || this.sessionDisposals.has(session)) return inactiveStatus;
+      if (this.sessionCannotPublish(session)) return inactiveStatus;
 
       const running = await this.isSessionActive(projectPath, sessionId);
       if (this.runtimeRecoveries.has(cacheKey) || this.runtimeSessions.get(cacheKey) !== currentEntry) continue;
       await this.bindWebExtensions(session, projectPath, sessionId, key);
       const recoveryAfterBind = this.runtimeRecoveries.get(cacheKey);
       if (recoveryAfterBind) return { ...inactiveStatus, recovery: recoveryAfterBind };
-      if (this.runtimeSessions.get(cacheKey) !== currentEntry || this.recoveringSessions.has(session) || this.sessionDisposals.has(session)) continue;
+      if (this.runtimeSessions.get(cacheKey) !== currentEntry || this.sessionCannotPublish(session)) continue;
       return this.agentStatus(session, branch, running);
     }
   }
@@ -2174,7 +2184,10 @@ export class PiBridge {
   }
 
   private sessionCannotPublish(session: object) {
-    return this.closing || this.recoveringSessions.has(session) || this.sessionDisposals.has(session);
+    return this.closing
+      || this.recoveringSessions.has(session)
+      || this.sessionDisposals.has(session)
+      || this.extensionShutdownSessions.has(session);
   }
 
   private setExtensionStatus(session: object, key: string, text: unknown, sessionId?: string) {
@@ -2602,12 +2615,12 @@ export class PiBridge {
     const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, filePath);
     for (const key of keys) {
       const cached = this.runtimeSessions.get(key);
-      if (cached) return cached;
+      if (cached && !cached.retired) return cached;
     }
     if (!filePath) return undefined;
     const targetPath = path.resolve(filePath);
     for (const [key, cached] of this.runtimeSessions) {
-      if (keys.has(key) || !this.isCachedSessionForProject(projectPath, cached)) continue;
+      if (cached.retired || keys.has(key) || !this.isCachedSessionForProject(projectPath, cached)) continue;
       if (this.cachedSessionFile(await cached.promise.catch(() => undefined)) === targetPath) return cached;
     }
     return undefined;
@@ -2776,6 +2789,18 @@ export class PiBridge {
   private getCachedSession(cache: Map<string, CachedSession>, key: string) {
     const cached = cache.get(key);
     if (!cached) return undefined;
+    if (cached.retired) {
+      cache.delete(key);
+      if (cached.timer) clearTimeout(cached.timer);
+      void cached.promise.then((session) => this.deferRuntimeSessionDisposal(
+        cached.projectPath,
+        key,
+        session,
+        cached.projectKey,
+        cached.projectLexicalKey,
+      )).catch(() => undefined);
+      return undefined;
+    }
     this.touchCachedSession(cache, key, cached);
     return cached.promise;
   }
@@ -2815,6 +2840,7 @@ export class PiBridge {
     try {
       await this.disposeCachedSession(session);
     } catch (error) {
+      if (session && typeof session === 'object' && this.extensionShutdownSessions.has(session)) cached.retired = true;
       if (!cache.has(key)) {
         cached.expiresAt = Date.now() + SESSION_CACHE_BUSY_RETRY_MS;
         cache.set(key, cached);
@@ -2863,6 +2889,7 @@ export class PiBridge {
     try {
       await this.disposeCachedSession(session);
     } catch (error) {
+      if (session && typeof session === 'object' && this.extensionShutdownSessions.has(session)) cached.retired = true;
       if (!cache.has(key)) {
         cached.expiresAt = Date.now() + SESSION_CACHE_BUSY_RETRY_MS;
         cache.set(key, cached);
@@ -2923,8 +2950,24 @@ export class PiBridge {
     if (!session || typeof session !== 'object') return;
     const existing = this.sessionDisposals.get(session);
     if (existing) return existing;
-    const disposable = session as { dispose?: () => unknown; close?: () => unknown; destroy?: () => unknown };
+    const disposable = session as {
+      extensionRunner?: {
+        hasHandlers?: (eventType: string) => boolean;
+        emit?: (event: { type: 'session_shutdown'; reason: 'quit' }) => unknown;
+      };
+      dispose?: () => unknown;
+      close?: () => unknown;
+      destroy?: () => unknown;
+    };
     const disposal = Promise.resolve().then(async () => {
+      const extensionRunner = disposable.extensionRunner;
+      if (!this.extensionShutdownSessions.has(session) && extensionRunner) {
+        if (typeof extensionRunner.emit === 'function'
+          && (typeof extensionRunner.hasHandlers !== 'function' || extensionRunner.hasHandlers('session_shutdown'))) {
+          await extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+        }
+        this.extensionShutdownSessions.add(session);
+      }
       if (typeof disposable.dispose === 'function') await disposable.dispose();
       else if (typeof disposable.close === 'function') await disposable.close();
       else if (typeof disposable.destroy === 'function') await disposable.destroy();

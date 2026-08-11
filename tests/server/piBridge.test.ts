@@ -21,6 +21,61 @@ test('binds browser extension UI in RPC mode', async () => {
   assert.equal(bindings?.mode, 'rpc');
 });
 
+test('emits extension shutdown before disposing a cached SDK session', async () => {
+  const bridge = new PiBridge();
+  const lifecycle: string[] = [];
+  const session = {
+    extensionRunner: {
+      hasHandlers: (eventType: string) => eventType === 'session_shutdown',
+      emit: async (event: { type: string; reason: string }) => { lifecycle.push(`${event.type}:${event.reason}`); },
+    },
+    dispose: () => { lifecycle.push('dispose'); },
+  };
+
+  await (bridge as any).disposeCachedSession(session);
+  await (bridge as any).disposeCachedSession(session);
+
+  assert.deepEqual(lifecycle, ['session_shutdown:quit', 'dispose']);
+});
+
+test('does not repeat extension shutdown or reuse sessions when SDK disposal is retried', async () => {
+  for (const hasShutdownHandler of [true, false]) {
+    const bridge = new PiBridge();
+    const projectPath = process.cwd();
+    const key = (bridge as any).runtimeSessionCacheKey(projectPath);
+    let shutdowns = 0;
+    let disposalAttempts = 0;
+    const staleSession = {
+      extensionRunner: {
+        hasHandlers: (eventType: string) => hasShutdownHandler && eventType === 'session_shutdown',
+        emit: async () => { shutdowns += 1; },
+      },
+      dispose: () => {
+        disposalAttempts += 1;
+        if (disposalAttempts === 1) throw new Error('first disposal failed');
+      },
+    };
+    const replacementSession = { dispose: () => undefined };
+    (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, key, Promise.resolve(staleSession));
+    const cached = (bridge as any).runtimeSessions.get(key);
+    (bridge as any).loadSdk = async () => ({
+      SessionManager: { create: () => ({ getSessionFile: () => undefined, appendSessionInfo: () => undefined }) },
+      createAgentSession: async () => ({ session: replacementSession }),
+    });
+
+    await assert.rejects(
+      (bridge as any).disposeCachedSessionEntry((bridge as any).runtimeSessions, key, cached),
+      /first disposal failed/i,
+    );
+    assert.equal((bridge as any).runtimeSessions.get(key)?.retired, true);
+    assert.equal(await (bridge as any).getSession(projectPath), replacementSession);
+    await bridge.dispose();
+
+    assert.equal(shutdowns, hasShutdownHandler ? 1 : 0);
+    assert.equal(disposalAttempts, 2);
+  }
+});
+
 test('agent discovery overlays project profiles and exposes suite workflow policy', async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), 'pi-web-agent-profiles-'));
   const projectPath = path.join(root, 'project');
