@@ -2932,8 +2932,61 @@ body {
     @apply bg-ring;
   }
 
-  .terminal-panel {
+  .terminal-panel,
+  .terminal-session {
     @apply grid h-full min-h-0 min-w-0 grid-rows-[auto_minmax(0,1fr)] overflow-hidden bg-card text-card-foreground;
+  }
+
+  .terminal-tab-bar {
+    @apply relative z-20 flex h-9 min-w-0 items-stretch border-b border-border bg-card;
+  }
+
+  .terminal-tab-scroll {
+    @apply flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: thin;
+  }
+
+  .terminal-tab {
+    @apply flex h-9 w-40 min-w-28 max-w-40 shrink-0 items-stretch border-r border-border text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground;
+  }
+
+  .terminal-tab-active {
+    @apply bg-background text-foreground;
+    box-shadow: inset 0 -2px 0 oklch(var(--primary));
+  }
+
+  .terminal-tab-closing {
+    @apply opacity-60;
+  }
+
+  .terminal-tab-main {
+    @apply flex min-w-0 flex-1 items-center gap-2 px-2.5 text-left text-xs outline-none focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50;
+  }
+
+  .terminal-tab-close {
+    @apply grid w-7 shrink-0 place-items-center text-muted-foreground opacity-60 outline-none transition-colors hover:bg-muted hover:text-foreground focus-visible:opacity-100 focus-visible:ring-[3px] focus-visible:ring-inset focus-visible:ring-ring/50 disabled:cursor-wait;
+  }
+
+  .terminal-tab:hover .terminal-tab-close,
+  .terminal-tab-active .terminal-tab-close {
+    @apply opacity-100;
+  }
+
+  .terminal-tab-actions {
+    @apply flex shrink-0 items-center px-1.5;
+  }
+
+  .terminal-session-stack {
+    @apply relative min-h-0 min-w-0 overflow-hidden;
+  }
+
+  .terminal-session-layer {
+    @apply invisible pointer-events-none absolute inset-0 min-h-0 min-w-0 overflow-hidden;
+  }
+
+  .terminal-session-layer-active {
+    @apply visible pointer-events-auto;
   }
 
   .terminal-toolbar {

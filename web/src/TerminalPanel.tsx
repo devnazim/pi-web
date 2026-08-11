@@ -1,8 +1,9 @@
-import { SquareTerminal, X } from 'lucide-solid';
+import { Plus, SquareTerminal, X } from 'lucide-solid';
 import { createEffect, createMemo, createSignal, For, onCleanup } from 'solid-js';
 import type { Terminal as XTermTerminal } from '@xterm/xterm';
-import { appWebSocketUrl } from './appUrl';
-import { terminalOperationCompleted } from './terminalLifecycle';
+import { appUrl, appWebSocketUrl } from './appUrl';
+import { createTerminalDisposeFallback, createTerminalRestoreWatchdog, terminalConnectionMode, terminalOperationCompleted } from './terminalLifecycle';
+import { addTerminalTab, createTerminalWorkspaceState, removeTerminalTab, requestTerminalTabClose, subscribeTerminalWorkspaceState, updateTerminalTabExited, updateTerminalTabSessionNonce, updateTerminalTabTitle, updateTerminalWorkspaceState, type TerminalWorkspaceState } from './terminalTabs';
 import { terminalCopyAction } from './terminalShortcuts';
 import { isTerminalGeneratedReply, terminalQueriesExpectingReplies, terminalReplyMatchesQuery } from './terminalReplay';
 import './terminal-font.css';
@@ -10,7 +11,7 @@ import './terminal-font.css';
 type TerminalProject = { id: string; path: string };
 type ResolvedThemeMode = 'light' | 'dark';
 type TerminalStatus = 'connecting' | 'restoring' | 'connected' | 'disconnected' | 'error';
-type TerminalServerMessage = { type?: string; data?: string; dataOffset?: number; replay?: boolean; responseQuery?: string; cols?: number; rows?: number; resizeId?: number; hydrated?: boolean; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; message?: string; exitCode?: number; signal?: number };
+type TerminalServerMessage = { type?: string; data?: string; dataOffset?: number; replay?: boolean; responseQuery?: string; cols?: number; rows?: number; resizeId?: number; hydrated?: boolean; cwd?: string; title?: string; shell?: string; shellName?: string; terminalId?: string; sessionNonce?: string; message?: string; exitCode?: number; signal?: number };
 type TerminalRuntime = { Terminal: typeof import('@xterm/xterm').Terminal; FitAddon: typeof import('@xterm/addon-fit').FitAddon };
 type Disposable = { dispose(): void };
 type TerminalModifier = 'ctrl' | 'alt' | 'shift';
@@ -64,6 +65,8 @@ const TERMINAL_RESIZE_SEND_DELAY_MS = 80;
 const TERMINAL_RESIZE_SETTLE_DELAY_MS = 180;
 const TERMINAL_RESIZE_RESPONSE_TIMEOUT_MS = 10_000;
 const TERMINAL_RENDERER_OPERATION_TIMEOUT_MS = 10_000;
+const TERMINAL_DISPOSE_FALLBACK_MS = 10_000;
+const TERMINAL_DISPOSE_REQUEST_TIMEOUT_MS = 5_000;
 const TERMINAL_RESTORE_TIMEOUT_MS = 30_000;
 const MIN_TERMINAL_COLS = 20;
 const MIN_TERMINAL_ROWS = 5;
@@ -74,6 +77,7 @@ const TERMINAL_RECONNECT_MAX_DELAY_MS = 8_000;
 const TERMINAL_RECONNECT_STABLE_MS = 10_000;
 const TERMINAL_REPLACED_CLOSE_CODE = 4001;
 const TERMINAL_STALE_CONNECTION_CLOSE_CODE = 4002;
+const TERMINAL_DISPOSED_CLOSE_CODE = 4004;
 const TERMINAL_PROTOCOL = '2';
 const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
   '`': '~',
@@ -101,15 +105,154 @@ const TERMINAL_SHIFT_CHARACTERS: Record<string, string> = {
 let terminalRuntimePromise: Promise<TerminalRuntime> | undefined;
 let terminalPrimaryClipboardText = '';
 let terminalConnectionGeneration = 0;
+let terminalIdSequence = 0;
 const terminalClientId = globalThis.crypto?.randomUUID?.() ?? `client-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
-export default function TerminalPanel(props: { project: TerminalProject; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onClose: () => void }) {
+function createTerminalId() {
+  return `terminal-${globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${++terminalIdSequence}`}`;
+}
+
+export default function TerminalPanel(props: { project: TerminalProject; state: TerminalWorkspaceState; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onClose: () => void }) {
+  const tabElements = new Map<string, HTMLButtonElement>();
+  const keyboardClosures = new Set<string>();
+  const initialState = props.state.tabs.length ? props.state : createTerminalWorkspaceState(createTerminalId());
+  if (!props.state.tabs.length) Object.assign(props.state, initialState);
+  const currentState = props.state;
+  const [workspace, setWorkspace] = createSignal<TerminalWorkspaceState>({ ...currentState, tabs: [...currentState.tabs] });
+  let panelDisposed = false;
+  const unsubscribeWorkspace = subscribeTerminalWorkspaceState(currentState, (state) => setWorkspace({ ...state, tabs: [...state.tabs] }));
+  onCleanup(() => {
+    panelDisposed = true;
+    unsubscribeWorkspace();
+  });
+
+  const updateWorkspace = (next: TerminalWorkspaceState) => {
+    updateTerminalWorkspaceState(currentState, () => next);
+  };
+  const activateTerminal = (id: string) => {
+    if (currentState.activeId === id) return;
+    updateWorkspace({ ...currentState, activeId: id });
+  };
+  const createTerminal = () => {
+    updateWorkspace(addTerminalTab(currentState, createTerminalId()));
+  };
+  const finishClosingTerminal = (id: string) => {
+    const focusReplacement = keyboardClosures.delete(id);
+    const next = removeTerminalTab(currentState, id);
+    updateWorkspace(next);
+    if (panelDisposed) return;
+    if (focusReplacement && next.activeId) focusTab(next.activeId);
+    if (!next.tabs.length) props.onClose();
+  };
+  const closeTerminal = (id: string) => {
+    if (currentState.tabs.find((tab) => tab.id === id)?.exited) {
+      finishClosingTerminal(id);
+      return;
+    }
+    updateWorkspace(requestTerminalTabClose(currentState, id));
+  };
+  const updateTerminalTitle = (id: string, title: string) => updateWorkspace(updateTerminalTabTitle(currentState, id, title));
+  const focusTab = (id: string) => queueMicrotask(() => tabElements.get(id)?.focus());
+
+  createEffect(() => {
+    const activeId = workspace().activeId;
+    if (!activeId) return;
+    queueMicrotask(() => tabElements.get(activeId)?.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
+  });
+  const handleTabKeyDown = (event: KeyboardEvent, id: string) => {
+    const tabs = workspace().tabs;
+    const index = tabs.findIndex((tab) => tab.id === id);
+    let nextId: string | undefined;
+    if (event.key === 'ArrowLeft') nextId = tabs[(index - 1 + tabs.length) % tabs.length]?.id;
+    else if (event.key === 'ArrowRight') nextId = tabs[(index + 1) % tabs.length]?.id;
+    else if (event.key === 'Home') nextId = tabs[0]?.id;
+    else if (event.key === 'End') nextId = tabs.at(-1)?.id;
+    else if (event.key === 'Delete') {
+      event.preventDefault();
+      keyboardClosures.add(id);
+      closeTerminal(id);
+      return;
+    }
+    if (!nextId) return;
+    event.preventDefault();
+    activateTerminal(nextId);
+    focusTab(nextId);
+  };
+
+  return (
+    <section class="terminal-panel">
+      <div class="terminal-tab-bar">
+        <div class="terminal-tab-scroll" role="tablist" aria-label="Terminals">
+          <For each={workspace().tabs.map(({ id }) => id)}>{(id) => {
+            const tab = () => workspace().tabs.find((item) => item.id === id)!;
+            const active = () => workspace().activeId === id;
+            return (
+              <div class={`terminal-tab ${active() ? 'terminal-tab-active' : ''} ${tab().closing ? 'terminal-tab-closing' : ''}`}>
+                <button
+                  ref={(element) => tabElements.set(id, element)}
+                  class="terminal-tab-main"
+                  type="button"
+                  role="tab"
+                  aria-selected={active()}
+                  aria-controls={`terminal-panel-${id}`}
+                  tabIndex={active() ? 0 : -1}
+                  title={`Terminal ${tab().number}: ${tab().title}`}
+                  onClick={() => activateTerminal(id)}
+                  onKeyDown={(event) => handleTabKeyDown(event, id)}
+                  onAuxClick={(event) => { if (event.button === 1) closeTerminal(id); }}
+                >
+                  <SquareTerminal class="size-3.5 shrink-0" />
+                  <span class="truncate">{tab().number}: {tab().title}</span>
+                </button>
+                <button class="terminal-tab-close" type="button" disabled={tab().closing} title={tab().closing ? `Killing terminal ${tab().number}` : `Kill terminal ${tab().number}`} aria-label={tab().closing ? `Killing terminal ${tab().number}` : `Kill terminal ${tab().number}`} onClick={(event) => { if (event.detail === 0) keyboardClosures.add(id); closeTerminal(id); }}><X class="size-3.5" /></button>
+              </div>
+            );
+          }}</For>
+        </div>
+        <div class="terminal-tab-actions">
+          <button class="ghost" type="button" title="New terminal" aria-label="New terminal" onClick={createTerminal}><Plus class="size-4" /></button>
+        </div>
+      </div>
+      <div class="terminal-session-stack">
+        <For each={workspace().tabs.map(({ id }) => id)}>{(id) => (
+          <div
+            id={`terminal-panel-${id}`}
+            class={`terminal-session-layer ${workspace().activeId === id ? 'terminal-session-layer-active' : ''}`}
+            role="tabpanel"
+            aria-label={`Terminal ${workspace().tabs.find((tab) => tab.id === id)?.number ?? ''}`}
+            aria-hidden={workspace().activeId !== id}
+          >
+            <TerminalSession
+              project={props.project}
+              terminalId={id}
+              sessionNonce={workspace().tabs.find((tab) => tab.id === id)?.sessionNonce}
+              active={workspace().activeId === id}
+              disposeRequested={workspace().tabs.find((tab) => tab.id === id)?.closing === true}
+              themeMode={props.themeMode}
+              onFilesystemActivity={props.onFilesystemActivity}
+              onTitle={(title) => updateTerminalTitle(id, title)}
+              onSessionNonce={(sessionNonce) => updateWorkspace(updateTerminalTabSessionNonce(currentState, id, sessionNonce))}
+              onRestarting={() => updateWorkspace(updateTerminalTabExited(currentState, id, false))}
+              onRunning={() => updateWorkspace(updateTerminalTabExited(currentState, id, false))}
+              onExited={() => updateWorkspace(updateTerminalTabExited(currentState, id, true))}
+              onDisposed={() => finishClosingTerminal(id)}
+              onClose={props.onClose}
+            />
+          </div>
+        )}</For>
+      </div>
+    </section>
+  );
+}
+
+function TerminalSession(props: { project: TerminalProject; terminalId: string; sessionNonce?: string; active: boolean; disposeRequested: boolean; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onTitle: (title: string) => void; onSessionNonce: (sessionNonce: string) => void; onRestarting: () => void; onRunning: () => void; onExited: () => void; onDisposed: () => void; onClose: () => void }) {
   let terminalElement: HTMLDivElement | undefined;
   let terminal: XTermTerminal | undefined;
   let terminalSocket: WebSocket | undefined;
   let sendInputRef: ((data: string) => void) | undefined;
   let mobileShortcutPointer: { id: number; x: number; y: number; moved: boolean } | undefined;
   let autoReconnectAttempts = 0;
+  let terminalSessionNonce = props.sessionNonce;
   let pendingProjectId = props.project.id;
   let pendingGeneratedInput = '';
   let pendingInput = '';
@@ -117,6 +260,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
   const [status, setStatus] = createSignal<TerminalStatus>('connecting');
   const [shellName, setShellName] = createSignal('terminal');
   const [cwd, setCwd] = createSignal(props.project.path);
+  const updateShellName = (title: string) => {
+    setShellName(title);
+    props.onTitle(title);
+  };
   const [reconnectKey, setReconnectKey] = createSignal(0);
   const [ctrlSticky, setCtrlSticky] = createSignal(false);
   const [altSticky, setAltSticky] = createSignal(false);
@@ -189,6 +336,60 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     (event.currentTarget as HTMLElement | null)?.blur();
     action();
   };
+  let disposalAcknowledged = false;
+  let disposalReconnectRequested = false;
+  let disposalHttpRequested = false;
+  async function disposeTerminalThroughApi() {
+    if (disposalHttpRequested || disposalAcknowledged) return;
+    if (!terminalSessionNonce) {
+      completeTerminalDisposal();
+      return;
+    }
+    disposalHttpRequested = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), TERMINAL_DISPOSE_REQUEST_TIMEOUT_MS);
+    try {
+      const params = new URLSearchParams({ sessionNonce: terminalSessionNonce });
+      await fetch(appUrl(`/api/projects/${encodeURIComponent(props.project.id)}/terminal/${encodeURIComponent(props.terminalId)}?${params}`), { method: 'DELETE', signal: controller.signal });
+    } catch {
+      // A bounded best-effort request prevents an unreachable server from leaving the tab stuck.
+    } finally {
+      window.clearTimeout(timeout);
+      completeTerminalDisposal();
+    }
+  }
+  const disposalFallback = createTerminalDisposeFallback(() => { void disposeTerminalThroughApi(); }, TERMINAL_DISPOSE_FALLBACK_MS);
+  const completeTerminalDisposal = () => {
+    if (disposalAcknowledged) return;
+    disposalAcknowledged = true;
+    disposalFallback.clear();
+    props.onDisposed();
+  };
+  const requestTerminalDisposal = () => {
+    if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) return false;
+    if (!terminalSessionNonce) return true;
+    return sendTerminalClientMessage(terminalSocket, { type: 'dispose', sessionNonce: terminalSessionNonce });
+  };
+
+  createEffect(() => {
+    if (!props.disposeRequested) return;
+    disposalFallback.schedule();
+    if (requestTerminalDisposal() || disposalReconnectRequested || !terminalSessionNonce) return;
+    disposalReconnectRequested = true;
+    autoReconnectAttempts = 0;
+    setStatus('connecting');
+    setReconnectKey((key) => key + 1);
+  });
+
+  onCleanup(() => {
+    if (props.disposeRequested && !disposalAcknowledged) disposalFallback.trigger();
+    else disposalFallback.clear();
+  });
+
+  createEffect(() => {
+    if (!props.active || props.disposeRequested) return;
+    queueMicrotask(() => { if (props.active && !props.disposeRequested) focusTerminal(); });
+  });
 
   createEffect(() => {
     props.themeMode;
@@ -205,6 +406,9 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     const projectId = props.project.id;
     const projectPath = props.project.path;
     reconnectKey();
+    const connectionMode = terminalConnectionMode(props.disposeRequested, terminalSessionNonce);
+    if (connectionMode === 'wait-for-fallback') return;
+    if (connectionMode === 'connect') props.onRestarting();
     if (!terminalElement) return;
     if (pendingProjectId !== projectId) {
       pendingProjectId = projectId;
@@ -231,7 +435,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let reconnectAttemptResetTimer: number | undefined;
     let heartbeatTimer: number | undefined;
     let heartbeatTimeoutTimer: number | undefined;
-    let restoreTimer: number | undefined;
+    let restoreWatchdog: ReturnType<typeof createTerminalRestoreWatchdog> | undefined;
     let resumeHeartbeat: (() => void) | undefined;
     let abortTerminalConnection: (() => void) | undefined;
     let terminalExited = false;
@@ -242,7 +446,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let scheduleResizeTerminal: (() => void) | undefined;
 
     setStatus('connecting');
-    setShellName('terminal');
+    updateShellName('terminal');
     setCwd(projectPath);
     terminalElement.textContent = 'Loading terminal…';
 
@@ -273,6 +477,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         xterm.loadAddon(fitAddon);
         xterm.open(terminalElement);
         terminal = xterm;
+        if (props.active && !props.disposeRequested) queueMicrotask(() => { if (terminal === xterm && props.active && !props.disposeRequested) xterm?.focus(); });
 
         const sendTerminalMetadata = (metadata: { cwd?: string; title?: string }) => {
           if (status() === 'connected' && sendTerminalClientMessage(socket, { type: 'metadata', ...metadata })) return;
@@ -281,7 +486,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         const updateTerminalTitle = (value: string) => {
           const title = normalizeTerminalMetadata(value);
           if (!title || title === shellName()) return;
-          setShellName(title);
+          updateShellName(title);
           sendTerminalMetadata({ title });
         };
         const updateTerminalCwd = (value: string) => {
@@ -301,6 +506,20 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         };
         let deferredAckOffset = 0;
         let lastHydrationProgressAt = 0;
+        const reportTerminalHydrationProgress = () => {
+          const now = Date.now();
+          if (
+            disposed
+            || terminalExited
+            || terminalSocket !== socket
+            || terminal !== xterm
+            || status() !== 'restoring'
+            || now - lastHydrationProgressAt < 2_000
+            || !sendTerminalClientMessage(socket, { type: 'hydrate-progress' })
+          ) return;
+          lastHydrationProgressAt = now;
+          restoreWatchdog?.refresh();
+        };
         let rendererFailed = false;
         let rendererOperations = Promise.resolve(true);
         const failTerminalRenderer = () => {
@@ -341,14 +560,12 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             expectedReplayReplies.push(...expectedReplies);
             if (replay) {
               replaySideEffectSuppression += 1;
-              const now = Date.now();
-              if (status() === 'restoring' && now - lastHydrationProgressAt >= 2_000 && sendTerminalClientMessage(socket, { type: 'hydrate-progress' })) lastHydrationProgressAt = now;
+              reportTerminalHydrationProgress();
             }
             xterm.write(data, () => {
               if (replay) {
                 replaySideEffectSuppression = Math.max(0, replaySideEffectSuppression - 1);
-                const now = Date.now();
-                if (status() === 'restoring' && now - lastHydrationProgressAt >= 2_000 && sendTerminalClientMessage(socket, { type: 'hydrate-progress' })) lastHydrationProgressAt = now;
+                reportTerminalHydrationProgress();
               }
               for (const expectedReply of expectedReplies) {
                 const index = expectedReplayReplies.indexOf(expectedReply);
@@ -514,11 +731,15 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           projectPath,
           cols: String(xterm.cols),
           rows: String(xterm.rows),
-          terminalId: 'main',
+          terminalId: props.terminalId,
           protocol: TERMINAL_PROTOCOL,
           clientId: terminalClientId,
           generation: String(connectionGeneration),
         });
+        if (connectionMode === 'dispose-existing' && terminalSessionNonce) {
+          params.set('existingOnly', '1');
+          params.set('sessionNonce', terminalSessionNonce);
+        }
         const clearHeartbeatTimeout = () => {
           if (heartbeatTimeoutTimer === undefined) return;
           window.clearTimeout(heartbeatTimeoutTimer);
@@ -545,18 +766,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           setStatus('error');
           closeTerminalSocket();
         };
-        const clearRestoreTimer = () => {
-          if (restoreTimer === undefined) return;
-          window.clearTimeout(restoreTimer);
-          restoreTimer = undefined;
-        };
-        const watchTerminalRestore = () => {
-          clearRestoreTimer();
-          restoreTimer = window.setTimeout(() => {
-            restoreTimer = undefined;
-            if (status() === 'restoring') abortTerminalConnection?.();
-          }, TERMINAL_RESTORE_TIMEOUT_MS);
-        };
+        const connectionRestoreWatchdog = createTerminalRestoreWatchdog(() => {
+          if (status() === 'restoring') abortTerminalConnection?.();
+        }, TERMINAL_RESTORE_TIMEOUT_MS);
+        restoreWatchdog = connectionRestoreWatchdog;
         const sendTerminalHeartbeat = () => {
           if (document.visibilityState === 'hidden' || heartbeatTimeoutTimer !== undefined) return;
           const currentSocket = socket;
@@ -614,6 +827,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
 
         socket.addEventListener('open', () => {
           if (terminalSocket !== socket) return;
+          if (props.disposeRequested) {
+            if (!requestTerminalDisposal()) closeTerminalSocket();
+            return;
+          }
           startTerminalHeartbeat();
         });
         const requestTerminalHydration = () => {
@@ -639,12 +856,32 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             clearHeartbeatTimeout();
             return;
           }
+          if (message.type === 'disposed' && message.terminalId === props.terminalId && message.sessionNonce === terminalSessionNonce) {
+            completeTerminalDisposal();
+            return;
+          }
 
           if (message.type === 'ready') {
+            if (!message.sessionNonce) {
+              abortTerminalConnection?.();
+              return;
+            }
+            if (props.disposeRequested && terminalSessionNonce && message.sessionNonce !== terminalSessionNonce) {
+              closeTerminalSocket();
+              completeTerminalDisposal();
+              return;
+            }
+            terminalSessionNonce = message.sessionNonce;
+            props.onSessionNonce(message.sessionNonce);
+            if (props.disposeRequested) {
+              requestTerminalDisposal();
+              return;
+            }
             serverReady = true;
+            props.onRunning();
             setStatus('restoring');
-            watchTerminalRestore();
-            setShellName(normalizeTerminalMetadata(message.title ?? '') || message.shellName || message.shell || 'terminal');
+            connectionRestoreWatchdog.refresh();
+            updateShellName(normalizeTerminalMetadata(message.title ?? '') || message.shellName || message.shell || 'terminal');
             setCwd(normalizeTerminalMetadata(message.cwd ?? '') || projectPath);
           } else if (message.type === 'replay-complete') {
             requestTerminalHydration();
@@ -664,7 +901,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
               lastConfirmedRows = acceptedRows;
               resizeInFlight = undefined;
               if (request.hydration && message.hydrated === true && status() === 'restoring') {
-                clearRestoreTimer();
+                connectionRestoreWatchdog.clear();
                 setStatus('connected');
                 if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
                 reconnectAttemptResetTimer = window.setTimeout(() => {
@@ -675,14 +912,14 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
                 if (pendingGeneratedInput && sendTerminalClientMessage(socket, { type: 'input', data: pendingGeneratedInput })) pendingGeneratedInput = '';
                 if (pendingInput && sendTerminalClientMessage(socket, { type: 'input', data: pendingInput })) pendingInput = '';
                 if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
-                xterm?.focus();
+                if (props.active && !props.disposeRequested) xterm?.focus();
               }
               sendPendingResize(true);
             });
           } else if (message.type === 'metadata') {
             const title = normalizeTerminalMetadata(message.title ?? '');
             const nextCwd = normalizeTerminalMetadata(message.cwd ?? '');
-            if (title) setShellName(title);
+            if (title) updateShellName(title);
             if (nextCwd) setCwd(nextCwd);
           } else if (message.type === 'data' && typeof message.data === 'string') {
             props.onFilesystemActivity?.();
@@ -696,7 +933,12 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           } else if (message.type === 'exit') {
             terminalExited = true;
             serverReady = false;
-            clearRestoreTimer();
+            connectionRestoreWatchdog.clear();
+            props.onExited();
+            if (props.disposeRequested) {
+              completeTerminalDisposal();
+              return;
+            }
             props.onFilesystemActivity?.();
             setStatus('disconnected');
             writeTerminalLine(`\r\n\x1b[2mTerminal exited${typeof message.exitCode === 'number' ? ` with code ${message.exitCode}` : ''}.\x1b[0m`);
@@ -707,7 +949,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           serverReady = false;
           clearHeartbeatTimers();
           clearResizeResponseTimer();
-          clearRestoreTimer();
+          connectionRestoreWatchdog.clear();
           if (resizeMessageTimer !== undefined) {
             window.clearTimeout(resizeMessageTimer);
             resizeMessageTimer = undefined;
@@ -716,6 +958,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             window.clearTimeout(reconnectAttemptResetTimer);
             reconnectAttemptResetTimer = undefined;
           }
+          if (event.code === TERMINAL_DISPOSED_CLOSE_CODE && props.disposeRequested) {
+            completeTerminalDisposal();
+            return;
+          }
           setStatus(status() === 'error' ? 'error' : 'disconnected');
           if (disposed || terminalExited) return;
           if (event.code === TERMINAL_REPLACED_CLOSE_CODE) {
@@ -723,6 +969,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             return;
           }
           if (event.code === TERMINAL_STALE_CONNECTION_CLOSE_CODE) return;
+          if (terminalConnectionMode(props.disposeRequested, terminalSessionNonce) === 'wait-for-fallback') return;
 
           const delay = Math.min(TERMINAL_RECONNECT_MAX_DELAY_MS, TERMINAL_RECONNECT_BASE_DELAY_MS * (2 ** Math.min(autoReconnectAttempts, 5)));
           autoReconnectAttempts += 1;
@@ -749,6 +996,10 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
       })
       .catch(() => {
         if (disposed || !terminalElement) return;
+        if (props.disposeRequested) {
+          void disposeTerminalThroughApi();
+          return;
+        }
         setStatus('error');
         terminalElement.textContent = 'Could not load terminal.';
       });
@@ -764,7 +1015,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
       if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
       if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer);
       if (heartbeatTimeoutTimer !== undefined) window.clearTimeout(heartbeatTimeoutTimer);
-      if (restoreTimer !== undefined) window.clearTimeout(restoreTimer);
+      restoreWatchdog?.clear();
       if (resumeHeartbeat) {
         document.removeEventListener('visibilitychange', resumeHeartbeat);
         window.removeEventListener('focus', resumeHeartbeat);
@@ -789,7 +1040,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
   });
 
   return (
-    <section class="terminal-panel">
+    <section class="terminal-session">
       <div class="terminal-toolbar">
         <div class="terminal-toolbar-desktop">
           <div class="terminal-title">
@@ -805,7 +1056,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
               onClick={clearTerminal}
             >Clear</button>
             <button class="button-secondary h-7 px-2 text-xs" type="button" disabled={status() === 'connecting'} onClick={reconnectTerminal}>Reconnect</button>
-            <button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClose}><X class="size-4" /></button>
+            <button class="ghost" type="button" title="Hide terminal panel" aria-label="Hide terminal panel" onClick={props.onClose}><X class="size-4" /></button>
           </div>
         </div>
         <div class="terminal-toolbar-mobile">
@@ -814,7 +1065,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
               <SquareTerminal class="size-3.5" />
               <span class="truncate">{shellName()}</span>
             </div>
-            <button class="ghost shrink-0" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClose}><X class="size-4" /></button>
+            <button class="ghost shrink-0" type="button" title="Hide terminal panel" aria-label="Hide terminal panel" onClick={props.onClose}><X class="size-4" /></button>
           </div>
           <div class="terminal-toolbar-row">
             <span class={`terminal-status ${statusClass()}`}>{statusText()}</span>

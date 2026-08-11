@@ -4,7 +4,7 @@ import { once } from 'node:events';
 import { test } from 'node:test';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
-import { processGroupExists, registerTerminalRoutes, resizeTerminalSession, signalProcessGroup } from '../../src/server/terminal.js';
+import { processGroupExists, processGroupsForSessions, registerTerminalRoutes, resizeTerminalSession, signalProcessGroup } from '../../src/server/terminal.js';
 
 async function waitUntil(check: () => boolean, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
@@ -197,6 +197,168 @@ test('clamps terminal dimensions and reports the accepted grid', async () => {
     });
   } finally {
     socket.close();
+    await app.close();
+  }
+});
+
+test('terminal IDs create independent sessions and disposing one leaves the other running', { skip: process.platform === 'win32' }, async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const baseUrl = `${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal`;
+  const firstSocket = new WebSocket(`${baseUrl}?terminalId=first`);
+  const secondSocket = new WebSocket(`${baseUrl}?terminalId=second`);
+  const firstMessages: Array<{ type?: string; data?: string; terminalId?: string; sessionNonce?: string }> = [];
+  const secondMessages: Array<{ type?: string; data?: string; terminalId?: string; sessionNonce?: string }> = [];
+  let firstChildPid: number | undefined;
+  firstSocket.addEventListener('message', (event) => firstMessages.push(JSON.parse(String(event.data)) as { type?: string; data?: string; terminalId?: string; sessionNonce?: string }));
+  secondSocket.addEventListener('message', (event) => secondMessages.push(JSON.parse(String(event.data)) as { type?: string; data?: string; terminalId?: string; sessionNonce?: string }));
+
+  try {
+    assert.equal(await waitUntil(() => firstMessages.some(({ type }) => type === 'ready') && secondMessages.some(({ type }) => type === 'ready'), 1_000), true);
+    firstSocket.send(JSON.stringify({ type: 'input', data: "printf 'FIRST_ONLY\\n'\n" }));
+    secondSocket.send(JSON.stringify({ type: 'input', data: "printf 'SECOND_ONLY\\n'\n" }));
+    assert.equal(await waitUntil(() => firstMessages.some(({ data }) => data?.includes('FIRST_ONLY')) && secondMessages.some(({ data }) => data?.includes('SECOND_ONLY')), 2_000), true);
+    assert.equal(firstMessages.some(({ data }) => data?.includes('SECOND_ONLY')), false);
+    assert.equal(secondMessages.some(({ data }) => data?.includes('FIRST_ONLY')), false);
+
+    firstSocket.send(JSON.stringify({ type: 'input', data: "(trap '' HUP TERM; while :; do sleep 1; done) & echo FIRST_CHILD:$!\n" }));
+    assert.equal(await waitUntil(() => /FIRST_CHILD:\d+/.test(firstMessages.map(({ data }) => data ?? '').join('')), 2_000), true);
+    firstChildPid = Number(/FIRST_CHILD:(\d+)/.exec(firstMessages.map(({ data }) => data ?? '').join(''))?.[1]);
+    assert.ok(firstChildPid > 0);
+
+    const firstClosed = new Promise<number>((resolve) => firstSocket.addEventListener('close', (event) => resolve(event.code), { once: true }));
+    const firstSessionNonce = firstMessages.find(({ type }) => type === 'ready')?.sessionNonce;
+    assert.ok(firstSessionNonce);
+    firstSocket.send(JSON.stringify({ type: 'dispose', sessionNonce: firstSessionNonce }));
+    assert.equal(await waitUntil(() => firstMessages.some(({ type, terminalId }) => type === 'disposed' && terminalId === 'first'), 1_000), true);
+    assert.equal(await firstClosed, 4004);
+    assert.equal(await waitUntil(() => {
+      try {
+        process.kill(firstChildPid!, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    }, 3_000), true);
+
+    secondSocket.send(JSON.stringify({ type: 'input', data: "printf 'SECOND_STILL_RUNNING\\n'\n" }));
+    assert.equal(await waitUntil(() => secondMessages.some(({ data }) => data?.includes('SECOND_STILL_RUNNING')), 2_000), true);
+
+    const replacementSocket = new WebSocket(`${baseUrl}?terminalId=first`);
+    const replacementMessages: Array<{ type?: string; data?: string }> = [];
+    replacementSocket.addEventListener('message', (event) => replacementMessages.push(JSON.parse(String(event.data)) as { type?: string; data?: string }));
+    try {
+      assert.equal(await waitUntil(() => replacementMessages.some(({ type }) => type === 'replay-complete'), 1_000), true);
+      assert.equal(replacementMessages.some(({ data }) => data?.includes('FIRST_ONLY')), false);
+      replacementSocket.send(JSON.stringify({ type: 'input', data: "printf 'FIRST_REPLACED\\n'\n" }));
+      assert.equal(await waitUntil(() => replacementMessages.some(({ data }) => data?.includes('FIRST_REPLACED')), 2_000), true);
+    } finally {
+      replacementSocket.close();
+    }
+  } finally {
+    if (firstChildPid) try { process.kill(firstChildPid, 'SIGKILL'); } catch { /* Already gone. */ }
+    firstSocket.close();
+    secondSocket.close();
+    await app.close();
+  }
+});
+
+test('HTTP disposal kills a disconnected persistent terminal session', { skip: process.platform === 'win32' }, async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const socket = new WebSocket(`${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal?terminalId=fallback`);
+  const messages: Array<{ type?: string; data?: string; sessionNonce?: string }> = [];
+  let childPid: number | undefined;
+  socket.addEventListener('message', (event) => messages.push(JSON.parse(String(event.data)) as { type?: string; data?: string; sessionNonce?: string }));
+
+  try {
+    assert.equal(await waitUntil(() => messages.some(({ type }) => type === 'ready'), 1_000), true);
+    socket.send(JSON.stringify({ type: 'input', data: "(trap '' HUP TERM; while :; do sleep 1; done) & echo FALLBACK_CHILD:$!\n" }));
+    assert.equal(await waitUntil(() => /FALLBACK_CHILD:\d+/.test(messages.map(({ data }) => data ?? '').join('')), 2_000), true);
+    childPid = Number(/FALLBACK_CHILD:(\d+)/.exec(messages.map(({ data }) => data ?? '').join(''))?.[1]);
+    assert.ok(childPid > 0);
+
+    const closed = new Promise<void>((resolve) => socket.addEventListener('close', () => resolve(), { once: true }));
+    socket.close();
+    await closed;
+
+    const sessionNonce = messages.find(({ type }) => type === 'ready')?.sessionNonce;
+    assert.ok(sessionNonce);
+    const response = await fetch(`${address}/api/projects/project-1/terminal/fallback?sessionNonce=${encodeURIComponent(sessionNonce)}`, { method: 'DELETE' });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { disposed: 1 });
+    assert.equal(await waitUntil(() => {
+      try {
+        process.kill(childPid!, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    }, 3_000), true);
+  } finally {
+    if (childPid) try { process.kill(childPid, 'SIGKILL'); } catch { /* Already gone. */ }
+    socket.close();
+    await app.close();
+  }
+});
+
+test('stale disposal cannot kill or replace a recreated terminal session', async () => {
+  const app = Fastify();
+  await app.register(websocket);
+  await registerTerminalRoutes(app, {
+    getOrAdd: () => ({ id: 'project-1', path: process.cwd() }),
+  } as never);
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const baseUrl = `${address.replace(/^http/, 'ws')}/ws/projects/project-1/terminal?terminalId=shared`;
+  const firstSocket = new WebSocket(baseUrl);
+  const firstMessages: Array<{ type?: string; sessionNonce?: string }> = [];
+  firstSocket.addEventListener('message', (event) => firstMessages.push(JSON.parse(String(event.data)) as { type?: string; sessionNonce?: string }));
+  let replacementSocket: WebSocket | undefined;
+  let staleDisposalSocket: WebSocket | undefined;
+
+  try {
+    assert.equal(await waitUntil(() => firstMessages.some(({ type }) => type === 'ready'), 1_000), true);
+    const originalSessionNonce = firstMessages.find(({ type }) => type === 'ready')?.sessionNonce;
+    assert.ok(originalSessionNonce);
+    const firstClosed = new Promise<void>((resolve) => firstSocket.addEventListener('close', () => resolve(), { once: true }));
+    firstSocket.close();
+    await firstClosed;
+
+    const initialDisposal = await fetch(`${address}/api/projects/project-1/terminal/shared?sessionNonce=${encodeURIComponent(originalSessionNonce)}`, { method: 'DELETE' });
+    assert.deepEqual(await initialDisposal.json(), { disposed: 1 });
+
+    replacementSocket = new WebSocket(baseUrl);
+    const replacementMessages: Array<{ type?: string; data?: string; sessionNonce?: string }> = [];
+    replacementSocket.addEventListener('message', (event) => replacementMessages.push(JSON.parse(String(event.data)) as { type?: string; data?: string; sessionNonce?: string }));
+    assert.equal(await waitUntil(() => replacementMessages.some(({ type }) => type === 'ready'), 1_000), true);
+    const replacementSessionNonce = replacementMessages.find(({ type }) => type === 'ready')?.sessionNonce;
+    assert.ok(replacementSessionNonce);
+    assert.notEqual(replacementSessionNonce, originalSessionNonce);
+
+    const staleHttpDisposal = await fetch(`${address}/api/projects/project-1/terminal/shared?sessionNonce=${encodeURIComponent(originalSessionNonce)}`, { method: 'DELETE' });
+    assert.deepEqual(await staleHttpDisposal.json(), { disposed: 0 });
+
+    staleDisposalSocket = new WebSocket(`${baseUrl}&existingOnly=1&sessionNonce=${encodeURIComponent(originalSessionNonce)}`);
+    const staleMessages: Array<{ type?: string; terminalId?: string; sessionNonce?: string }> = [];
+    staleDisposalSocket.addEventListener('message', (event) => staleMessages.push(JSON.parse(String(event.data)) as { type?: string; terminalId?: string; sessionNonce?: string }));
+    const staleClosed = new Promise<number>((resolve) => staleDisposalSocket!.addEventListener('close', (event) => resolve(event.code), { once: true }));
+    assert.equal(await waitUntil(() => staleMessages.some(({ type, terminalId, sessionNonce }) => type === 'disposed' && terminalId === 'shared' && sessionNonce === originalSessionNonce), 1_000), true);
+    assert.equal(await staleClosed, 4004);
+
+    replacementSocket.send(JSON.stringify({ type: 'input', data: "printf 'REPLACEMENT_ALIVE\\n'\n" }));
+    assert.equal(await waitUntil(() => replacementMessages.some(({ data }) => data?.includes('REPLACEMENT_ALIVE')), 2_000), true);
+  } finally {
+    firstSocket.close();
+    replacementSocket?.close();
+    staleDisposalSocket?.close();
     await app.close();
   }
 });
@@ -437,6 +599,21 @@ test('rotates inactive terminal client generations without locking out new contr
     }
   } finally {
     await app.close();
+  }
+});
+
+test('finds process groups in a detached process session', { skip: process.platform === 'win32' }, async () => {
+  const leader = spawn('/bin/sh', ['-c', 'while :; do sleep 1; done'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  const sessionId = leader.pid;
+  assert.ok(sessionId);
+
+  try {
+    assert.equal(await waitUntil(() => processGroupsForSessions([sessionId]).includes(sessionId), 1_000), true);
+  } finally {
+    signalProcessGroup(sessionId, 'SIGKILL');
   }
 });
 

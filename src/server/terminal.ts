@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { exec, execFileSync, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import * as pty from 'node-pty';
@@ -20,6 +21,7 @@ const TERMINAL_FLOW_CONTROL_LOW_WATERMARK = 5_000;
 const TERMINAL_REPLACED_CLOSE_CODE = 4001;
 const TERMINAL_STALE_CONNECTION_CLOSE_CODE = 4002;
 const TERMINAL_HYDRATION_TIMEOUT_CLOSE_CODE = 4003;
+const TERMINAL_DISPOSED_CLOSE_CODE = 4004;
 const TERMINAL_HYDRATION_TIMEOUT_MS = 30_000;
 const MAX_TERMINAL_CLIENT_IDENTITIES = 64;
 const TERMINAL_IDLE_TTL_MS = 30 * 60_000;
@@ -50,6 +52,7 @@ type TerminalClientMessage = {
   dataOffset?: unknown;
   cwd?: unknown;
   title?: unknown;
+  sessionNonce?: unknown;
 };
 
 type TerminalOutputSegment = { data: string; replay: boolean; responseQuery?: string; cols?: number; rows?: number };
@@ -59,6 +62,7 @@ type TerminalConnectionIdentity = { clientId: string; generation: number };
 type TerminalSession = {
   key: string;
   id: string;
+  nonce: string;
   projectId: string;
   cwd: string;
   shell: string;
@@ -161,7 +165,25 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
     }
   });
 
-  app.get<{ Params: { projectId: string }; Querystring: { projectPath?: string; cwd?: string; cols?: string; rows?: string; terminalId?: string; protocol?: string; clientId?: string; generation?: string } }>('/ws/projects/:projectId/terminal', { websocket: true }, (connection: any, request) => {
+  app.delete<{ Params: { projectId: string; terminalId: string }; Querystring: { sessionNonce?: string } }>('/api/projects/:projectId/terminal/:terminalId', async (request, reply) => {
+    if (closing || options.isClosing?.()) return reply.code(503).send({ error: 'pi-web is shutting down.' });
+    const terminalId = normalizeTerminalId(request.params.terminalId);
+    const sessionNonce = normalizeTerminalSessionNonce(request.query.sessionNonce);
+    if (!sessionNonce) return reply.code(400).send({ error: 'Missing or invalid terminal session nonce' });
+    let disposed = 0;
+    for (const session of [...terminalSessions.values()]) {
+      if (session.projectId !== request.params.projectId || session.id !== terminalId || session.nonce !== sessionNonce) continue;
+      for (const socket of session.sockets) {
+        sendTerminalMessage(socket, { type: 'disposed', terminalId: session.id, sessionNonce: session.nonce });
+        socket.close(TERMINAL_DISPOSED_CLOSE_CODE, 'Terminal disposed');
+      }
+      disposeTerminalSession(terminalSessions, session, true);
+      disposed += 1;
+    }
+    return { disposed };
+  });
+
+  app.get<{ Params: { projectId: string }; Querystring: { projectPath?: string; cwd?: string; cols?: string; rows?: string; terminalId?: string; protocol?: string; clientId?: string; generation?: string; existingOnly?: string; sessionNonce?: string } }>('/ws/projects/:projectId/terminal', { websocket: true }, (connection: any, request) => {
     const socket: WebSocket = connection.socket ?? connection;
     if (closing || options.isClosing?.()) {
       sendTerminalMessage(socket, { type: 'error', message: 'pi-web is shutting down.' });
@@ -188,7 +210,13 @@ export async function registerTerminalRoutes(app: FastifyInstance, registry: Pro
       const identity = request.query.protocol === '2'
         ? terminalConnectionIdentity(request.query.clientId, request.query.generation)
         : undefined;
+      const requestedSessionNonce = normalizeTerminalSessionNonce(request.query.sessionNonce);
       let session = terminalSessions.get(key);
+      if (request.query.existingOnly === '1' && (!requestedSessionNonce || session?.nonce !== requestedSessionNonce)) {
+        sendTerminalMessage(socket, { type: 'disposed', terminalId, ...(requestedSessionNonce ? { sessionNonce: requestedSessionNonce } : {}) });
+        socket.close(TERMINAL_DISPOSED_CLOSE_CODE, 'Terminal no longer exists');
+        return;
+      }
       if (!session) {
         session = createTerminalSession(terminalSessions, key, terminalId, project.id, cwd, shell, cols, rows);
         if (session.terminal.pid > 0) {
@@ -230,6 +258,7 @@ function createTerminalSession(sessions: Map<string, TerminalSession>, key: stri
   const session: TerminalSession = {
     key,
     id,
+    nonce: randomUUID(),
     projectId,
     cwd,
     shell,
@@ -295,7 +324,7 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
   resetTerminalFlowControl(session, socket);
   session.replayCatchup = !terminalReplaySanitizerIsGround(session.replaySanitizerState);
   if (!identity) resizeTerminalSession(session, cols, rows);
-  sendTerminalMessage(socket, { type: 'ready', cwd: session.cwd, title: session.title, shell: session.shell, shellName: session.shellName, terminalId: session.id, cols: session.cols, rows: session.rows, persistent: true });
+  sendTerminalMessage(socket, { type: 'ready', cwd: session.cwd, title: session.title, shell: session.shell, shellName: session.shellName, terminalId: session.id, sessionNonce: session.nonce, cols: session.cols, rows: session.rows, persistent: true });
   if (identity) {
     for (const entry of session.replay) sendTerminalMessage(socket, { type: 'data', data: entry.data, cols: entry.cols, rows: entry.rows, replay: true });
   } else {
@@ -321,6 +350,13 @@ function attachTerminalSocket(sessions: Map<string, TerminalSession>, session: T
     }
 
     const activeController = session.controller?.socket === socket ? session.controller : undefined;
+    if (message.type === 'dispose') {
+      if (!activeController || normalizeTerminalSessionNonce(message.sessionNonce) !== session.nonce) return;
+      sendTerminalMessage(socket, { type: 'disposed', terminalId: session.id, sessionNonce: session.nonce });
+      socket.close(TERMINAL_DISPOSED_CLOSE_CODE, 'Terminal disposed');
+      disposeTerminalSession(sessions, session, true);
+      return;
+    }
     if (message.type === 'hydrate-progress') {
       if (activeController?.identity && !activeController.hydrated) scheduleTerminalHydrationTimeout(session, activeController);
       return;
@@ -572,11 +608,22 @@ function disposeTerminalSession(sessions: Map<string, TerminalSession>, session:
   session.workspaceLease?.release();
   session.workspaceLease = undefined;
   if (!kill) return;
-  if (process.platform !== 'win32' && session.terminal.pid > 0) signalProcessGroup(session.terminal.pid, 'SIGTERM');
+  const processSessionId = process.platform === 'win32' || session.terminal.pid <= 0 ? undefined : session.terminal.pid;
+  const processGroupIds = processSessionId
+    ? [...new Set([processSessionId, ...processGroupsForSessions([processSessionId])])]
+    : [];
+  for (const processGroupId of processGroupIds) signalProcessGroup(processGroupId, 'SIGTERM');
   try {
     session.terminal.kill();
   } catch {
     // The process may already be gone.
+  }
+  if (processSessionId) {
+    const forceKillTimer = setTimeout(() => {
+      const remainingProcessGroupIds = processGroupsForSessions([processSessionId]);
+      for (const processGroupId of remainingProcessGroupIds) if (processGroupExists(processGroupId)) signalProcessGroup(processGroupId, 'SIGKILL');
+    }, 1_000);
+    forceKillTimer.unref();
   }
 }
 
@@ -594,7 +641,7 @@ export function processGroupsForSessions(sessionIds: number[]) {
   if (process.platform === 'win32' || !sessionIds.length) return [];
   const targets = new Set(sessionIds);
   try {
-    const output = execFileSync('ps', ['-eo', 'pgid=,sid='], { encoding: 'utf8', timeout: 1_000 });
+    const output = execFileSync('ps', ['-eo', `pgid=,${process.platform === 'darwin' ? 'sess' : 'sid'}=`], { encoding: 'utf8', timeout: 1_000 });
     const processGroups = new Set<number>();
     for (const line of output.split('\n')) {
       const [processGroupId, sessionId] = line.trim().split(/\s+/).map(Number);
@@ -684,6 +731,10 @@ function normalizeTerminalId(value: unknown) {
   if (typeof value !== 'string') return DEFAULT_TERMINAL_ID;
   const normalized = value.trim().replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 80);
   return normalized || DEFAULT_TERMINAL_ID;
+}
+
+function normalizeTerminalSessionNonce(value: unknown) {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) ? value : undefined;
 }
 
 function terminalConnectionIdentity(clientId: unknown, generation: unknown): TerminalConnectionIdentity {

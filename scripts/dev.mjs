@@ -121,7 +121,7 @@ function childRunning(child) {
 function processGroupsForSessions(sessionIds) {
   if (!detached || !sessionIds.length) return [];
   const targets = new Set(sessionIds);
-  const result = spawnSync('ps', ['-eo', 'pgid=,sid='], { encoding: 'utf8', timeout: 1_000 });
+  const result = spawnSync('ps', ['-eo', `pgid=,${process.platform === 'darwin' ? 'sess' : 'sid'}=`], { encoding: 'utf8', timeout: 1_000 });
   if (result.error || result.status !== 0) return [];
   const processGroups = new Set();
   for (const line of result.stdout.split('\n')) {

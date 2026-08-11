@@ -109,6 +109,7 @@ import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } f
 import { buildReviewFileTree, type ReviewFileTreeNode } from './reviewFileTree';
 import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, isTextPath, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
 import { parseTextSearchPatternInput } from './textSearch';
+import { createTerminalWorkspaceState, type TerminalWorkspaceState } from './terminalTabs';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
 import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import { buildSessionShareUrl, decodeProjectPath, encodeProjectPath, PROJECT_QUERY_KEY, SESSION_QUERY_KEY, WORKSPACE_QUERY_KEY } from './sessionShare';
@@ -5405,6 +5406,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
   let terminalServerFileInvalidationTimer: number | undefined;
   const fileWorkspaceStates = new Map<string, FileWorkspaceState>();
   const reviewWorkspaceStates = new Map<string, ReviewWorkspaceState>();
+  const terminalWorkspaceStates = new Map<string, TerminalWorkspaceState>();
   function fileWorkspaceState(projectId: string) {
     let state = fileWorkspaceStates.get(projectId);
     if (!state) {
@@ -5418,6 +5420,14 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
     if (!state) {
       state = createReviewWorkspaceState();
       reviewWorkspaceStates.set(projectId, state);
+    }
+    return state;
+  }
+  function terminalWorkspaceState(projectId: string) {
+    let state = terminalWorkspaceStates.get(projectId);
+    if (!state) {
+      state = createTerminalWorkspaceState();
+      terminalWorkspaceStates.set(projectId, state);
     }
     return state;
   }
@@ -5557,7 +5567,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
                   onPointerDown={terminal.startResize}
                 />
                 <Suspense fallback={<section class="terminal-panel"><div class="terminal-toolbar"><div class="terminal-title"><SquareTerminal class="size-3.5" /><span>Loading terminal...</span></div><button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClosePanel}><X class="size-4" /></button></div><div class="terminal-host" /></section>}>
-                  <TerminalPanel project={project()} themeMode={props.themeMode} onFilesystemActivity={() => scheduleTerminalFileInvalidation(project().id)} onClose={props.onClosePanel} />
+                  <Show when={project()} keyed>{(terminalProject) => <TerminalPanel project={terminalProject} state={terminalWorkspaceState(terminalProject.id)} themeMode={props.themeMode} onFilesystemActivity={() => scheduleTerminalFileInvalidation(terminalProject.id)} onClose={props.onClosePanel} />}</Show>
                 </Suspense>
               </Show>
             </div>
