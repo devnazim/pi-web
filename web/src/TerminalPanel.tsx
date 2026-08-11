@@ -2,6 +2,7 @@ import { SquareTerminal, X } from 'lucide-solid';
 import { createEffect, createMemo, createSignal, For, onCleanup } from 'solid-js';
 import type { Terminal as XTermTerminal } from '@xterm/xterm';
 import { appWebSocketUrl } from './appUrl';
+import { terminalOperationCompleted } from './terminalLifecycle';
 import { terminalCopyAction } from './terminalShortcuts';
 import { isTerminalGeneratedReply, terminalQueriesExpectingReplies, terminalReplyMatchesQuery } from './terminalReplay';
 import './terminal-font.css';
@@ -61,6 +62,9 @@ const TERMINAL_HEARTBEAT_MS = 30_000;
 const TERMINAL_HEARTBEAT_TIMEOUT_MS = 30_000;
 const TERMINAL_RESIZE_SEND_DELAY_MS = 80;
 const TERMINAL_RESIZE_SETTLE_DELAY_MS = 180;
+const TERMINAL_RESIZE_RESPONSE_TIMEOUT_MS = 10_000;
+const TERMINAL_RENDERER_OPERATION_TIMEOUT_MS = 10_000;
+const TERMINAL_RESTORE_TIMEOUT_MS = 30_000;
 const MIN_TERMINAL_COLS = 20;
 const MIN_TERMINAL_ROWS = 5;
 const MAX_TERMINAL_COLS = 500;
@@ -161,7 +165,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     focusTerminal();
   };
   const reconnectTerminal = () => {
-    if (status() === 'connecting' || status() === 'restoring') return;
+    if (status() === 'connecting') return;
     autoReconnectAttempts = 0;
     setStatus('connecting');
     setReconnectKey((key) => key + 1);
@@ -222,11 +226,14 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
     let resizeFrame: number | undefined;
     let resizeSettledTimer: number | undefined;
     let resizeMessageTimer: number | undefined;
+    let resizeResponseTimer: number | undefined;
     let reconnectTimer: number | undefined;
     let reconnectAttemptResetTimer: number | undefined;
     let heartbeatTimer: number | undefined;
     let heartbeatTimeoutTimer: number | undefined;
+    let restoreTimer: number | undefined;
     let resumeHeartbeat: (() => void) | undefined;
+    let abortTerminalConnection: (() => void) | undefined;
     let terminalExited = false;
     let serverReady = false;
     let replaySideEffectSuppression = 0;
@@ -294,12 +301,26 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         };
         let deferredAckOffset = 0;
         let lastHydrationProgressAt = 0;
-        let rendererOperations = Promise.resolve();
+        let rendererFailed = false;
+        let rendererOperations = Promise.resolve(true);
+        const failTerminalRenderer = () => {
+          if (disposed || rendererFailed || terminal !== xterm || terminalSocket !== socket) return;
+          rendererFailed = true;
+          if (abortTerminalConnection) abortTerminalConnection();
+          else setStatus('error');
+        };
         const enqueueRendererOperation = (operation: () => void | Promise<void>) => {
-          rendererOperations = rendererOperations.then(async () => {
-            if (disposed || terminal !== xterm || terminalSocket !== socket || !xterm) return;
-            await operation();
-          }).catch(() => undefined);
+          rendererOperations = rendererOperations.then(async (previousCompleted) => {
+            if (!previousCompleted || disposed || rendererFailed || terminal !== xterm || terminalSocket !== socket || !xterm) return false;
+            try {
+              const completed = await terminalOperationCompleted(operation(), TERMINAL_RENDERER_OPERATION_TIMEOUT_MS);
+              if (!completed) failTerminalRenderer();
+              return completed;
+            } catch {
+              failTerminalRenderer();
+              return false;
+            }
+          });
           return rendererOperations;
         };
         const writeTerminalData = (data: string, replay = false, dataOffset?: number, responseQuery?: string, cols?: number, rows?: number) => {
@@ -384,6 +405,20 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
         let restoreSnapshotComplete = false;
         let resizeInFlight: { id: number; hydration: boolean; forceRefresh: boolean } | undefined;
         let pendingResize: { cols: number; rows: number; forceRefresh: boolean } | undefined;
+        const clearResizeResponseTimer = () => {
+          if (resizeResponseTimer === undefined) return;
+          window.clearTimeout(resizeResponseTimer);
+          resizeResponseTimer = undefined;
+        };
+        const watchResizeResponse = (request: NonNullable<typeof resizeInFlight>) => {
+          clearResizeResponseTimer();
+          resizeResponseTimer = window.setTimeout(() => {
+            resizeResponseTimer = undefined;
+            if (disposed || terminalExited || terminalSocket !== socket || resizeInFlight !== request) return;
+            resizeInFlight = undefined;
+            abortTerminalConnection?.();
+          }, TERMINAL_RESIZE_RESPONSE_TIMEOUT_MS);
+        };
         const refreshTerminal = () => {
           if (!xterm || xterm.rows <= 0) return;
           xterm.clearTextureAtlas();
@@ -413,6 +448,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
             if (sendTerminalClientMessage(socket, { type: hydration ? 'hydrate' : 'resize', resizeId, cols: resize.cols, rows: resize.rows })) {
               pendingResize = undefined;
               resizeInFlight = { id: resizeId, hydration, forceRefresh: resize.forceRefresh };
+              watchResizeResponse(resizeInFlight);
               lastResizeSentAt = Date.now();
             }
           };
@@ -425,23 +461,30 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (!xterm || !terminalElement || !terminalElement.isConnected) return;
           const bounds = terminalElement.getBoundingClientRect();
           if (bounds.width <= 0 || bounds.height <= 0) return;
+          let proposed: ReturnType<typeof fitAddon.proposeDimensions>;
           try {
-            const proposed = fitAddon.proposeDimensions();
-            if (!proposed) return;
-            const cols = Math.max(MIN_TERMINAL_COLS, Math.min(MAX_TERMINAL_COLS, proposed.cols));
-            const rows = Math.max(MIN_TERMINAL_ROWS, Math.min(MAX_TERMINAL_ROWS, proposed.rows));
-            if (!socket) {
-              if (xterm.cols !== cols || xterm.rows !== rows) xterm.resize(cols, rows);
-              lastConfirmedCols = cols;
-              lastConfirmedRows = rows;
-              if (forceRefresh) refreshTerminal();
-              return;
-            }
-            pendingResize = { cols, rows, forceRefresh: forceRefresh || pendingResize?.forceRefresh === true };
-            sendPendingResize(immediate);
+            proposed = fitAddon.proposeDimensions();
           } catch {
             // Measurement can fail while fonts/layout are still settling.
+            return;
           }
+          if (!proposed) return;
+          const cols = Math.max(MIN_TERMINAL_COLS, Math.min(MAX_TERMINAL_COLS, proposed.cols));
+          const rows = Math.max(MIN_TERMINAL_ROWS, Math.min(MAX_TERMINAL_ROWS, proposed.rows));
+          try {
+            if (xterm.cols !== cols || xterm.rows !== rows) xterm.resize(cols, rows);
+            if (!socket && forceRefresh) refreshTerminal();
+          } catch {
+            failTerminalRenderer();
+            return;
+          }
+          if (!socket) {
+            lastConfirmedCols = cols;
+            lastConfirmedRows = rows;
+            return;
+          }
+          pendingResize = { cols, rows, forceRefresh: forceRefresh || pendingResize?.forceRefresh === true };
+          sendPendingResize(immediate);
         };
         scheduleResizeTerminal = () => {
           if (resizeFrame === undefined) {
@@ -465,6 +508,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           .catch(() => undefined);
 
         resizeTerminal();
+        if (rendererFailed) return;
         const connectionGeneration = ++terminalConnectionGeneration;
         const params = new URLSearchParams({
           projectPath,
@@ -494,6 +538,24 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           } catch {
             // Ignore close races.
           }
+        };
+        abortTerminalConnection = () => {
+          if (disposed || terminalExited || terminalSocket !== socket || !socket) return;
+          serverReady = false;
+          setStatus('error');
+          closeTerminalSocket();
+        };
+        const clearRestoreTimer = () => {
+          if (restoreTimer === undefined) return;
+          window.clearTimeout(restoreTimer);
+          restoreTimer = undefined;
+        };
+        const watchTerminalRestore = () => {
+          clearRestoreTimer();
+          restoreTimer = window.setTimeout(() => {
+            restoreTimer = undefined;
+            if (status() === 'restoring') abortTerminalConnection?.();
+          }, TERMINAL_RESTORE_TIMEOUT_MS);
         };
         const sendTerminalHeartbeat = () => {
           if (document.visibilityState === 'hidden' || heartbeatTimeoutTimer !== undefined) return;
@@ -581,6 +643,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (message.type === 'ready') {
             serverReady = true;
             setStatus('restoring');
+            watchTerminalRestore();
             setShellName(normalizeTerminalMetadata(message.title ?? '') || message.shellName || message.shell || 'terminal');
             setCwd(normalizeTerminalMetadata(message.cwd ?? '') || projectPath);
           } else if (message.type === 'replay-complete') {
@@ -588,18 +651,20 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           } else if (message.type === 'resized' && Number.isSafeInteger(message.resizeId) && Number.isSafeInteger(message.cols) && Number.isSafeInteger(message.rows)) {
             const request = resizeInFlight;
             if (!request || request.id !== message.resizeId) return;
+            clearResizeResponseTimer();
             const acceptedCols = Math.max(MIN_TERMINAL_COLS, Math.min(MAX_TERMINAL_COLS, message.cols!));
             const acceptedRows = Math.max(MIN_TERMINAL_ROWS, Math.min(MAX_TERMINAL_ROWS, message.rows!));
             void enqueueRendererOperation(() => {
               if (!xterm) return;
               if (xterm.cols !== acceptedCols || xterm.rows !== acceptedRows) xterm.resize(acceptedCols, acceptedRows);
               if (request.forceRefresh) refreshTerminal();
-            }).then(() => {
-              if (disposed || terminalExited || terminalSocket !== socket || terminal !== xterm || resizeInFlight !== request) return;
+            }).then((rendererCompleted) => {
+              if (!rendererCompleted || rendererFailed || disposed || terminalExited || terminalSocket !== socket || terminal !== xterm || socket?.readyState !== WebSocket.OPEN || resizeInFlight !== request) return;
               lastConfirmedCols = acceptedCols;
               lastConfirmedRows = acceptedRows;
               resizeInFlight = undefined;
               if (request.hydration && message.hydrated === true && status() === 'restoring') {
+                clearRestoreTimer();
                 setStatus('connected');
                 if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
                 reconnectAttemptResetTimer = window.setTimeout(() => {
@@ -631,6 +696,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           } else if (message.type === 'exit') {
             terminalExited = true;
             serverReady = false;
+            clearRestoreTimer();
             props.onFilesystemActivity?.();
             setStatus('disconnected');
             writeTerminalLine(`\r\n\x1b[2mTerminal exited${typeof message.exitCode === 'number' ? ` with code ${message.exitCode}` : ''}.\x1b[0m`);
@@ -640,6 +706,8 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           if (terminalSocket !== socket) return;
           serverReady = false;
           clearHeartbeatTimers();
+          clearResizeResponseTimer();
+          clearRestoreTimer();
           if (resizeMessageTimer !== undefined) {
             window.clearTimeout(resizeMessageTimer);
             resizeMessageTimer = undefined;
@@ -691,10 +759,12 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
       if (resizeFrame !== undefined) window.cancelAnimationFrame(resizeFrame);
       if (resizeSettledTimer !== undefined) window.clearTimeout(resizeSettledTimer);
       if (resizeMessageTimer !== undefined) window.clearTimeout(resizeMessageTimer);
+      if (resizeResponseTimer !== undefined) window.clearTimeout(resizeResponseTimer);
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
       if (reconnectAttemptResetTimer !== undefined) window.clearTimeout(reconnectAttemptResetTimer);
       if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer);
       if (heartbeatTimeoutTimer !== undefined) window.clearTimeout(heartbeatTimeoutTimer);
+      if (restoreTimer !== undefined) window.clearTimeout(restoreTimer);
       if (resumeHeartbeat) {
         document.removeEventListener('visibilitychange', resumeHeartbeat);
         window.removeEventListener('focus', resumeHeartbeat);
@@ -734,7 +804,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
               disabled={status() !== 'connected'}
               onClick={clearTerminal}
             >Clear</button>
-            <button class="button-secondary h-7 px-2 text-xs" type="button" disabled={status() === 'connecting' || status() === 'restoring'} onClick={reconnectTerminal}>Reconnect</button>
+            <button class="button-secondary h-7 px-2 text-xs" type="button" disabled={status() === 'connecting'} onClick={reconnectTerminal}>Reconnect</button>
             <button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClose}><X class="size-4" /></button>
           </div>
         </div>
@@ -749,7 +819,7 @@ export default function TerminalPanel(props: { project: TerminalProject; themeMo
           <div class="terminal-toolbar-row">
             <span class={`terminal-status ${statusClass()}`}>{statusText()}</span>
             <button class="ghost h-7 px-2 text-xs" type="button" disabled={status() !== 'connected'} onClick={clearTerminal}>Clear</button>
-            <button class="button-secondary h-7 px-2 text-xs" type="button" disabled={status() === 'connecting' || status() === 'restoring'} onClick={reconnectTerminal}>Reconnect</button>
+            <button class="button-secondary h-7 px-2 text-xs" type="button" disabled={status() === 'connecting'} onClick={reconnectTerminal}>Reconnect</button>
           </div>
           <div class="terminal-toolbar-row terminal-mobile-keys">
             <button class={`ghost terminal-mobile-key ${ctrlSticky() ? 'terminal-key-active' : ''}`} type="button" tabIndex={-1} title="Ctrl modifier" aria-label="Ctrl modifier" onPointerDown={startMobileShortcutPointer} onPointerMove={moveMobileShortcutPointer} onPointerCancel={cancelMobileShortcutPointer} onPointerUp={(event) => finishMobileShortcutPointer(event, () => toggleMobileModifier('ctrl'))}>ctrl</button>
