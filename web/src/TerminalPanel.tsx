@@ -1,5 +1,5 @@
 import { Plus, SquareTerminal, X } from 'lucide-solid';
-import { createEffect, createMemo, createSignal, For, onCleanup } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, onCleanup, untrack } from 'solid-js';
 import type { Terminal as XTermTerminal } from '@xterm/xterm';
 import { appUrl, appWebSocketUrl } from './appUrl';
 import { createTerminalDisposeFallback, createTerminalRestoreWatchdog, terminalConnectionMode, terminalOperationCompleted } from './terminalLifecycle';
@@ -406,7 +406,8 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
     const projectId = props.project.id;
     const projectPath = props.project.path;
     reconnectKey();
-    const connectionMode = terminalConnectionMode(props.disposeRequested, terminalSessionNonce);
+    // The disposal effect below owns close transitions; tracking this workspace-derived prop would reconnect on nonce/title updates.
+    const connectionMode = terminalConnectionMode(untrack(() => props.disposeRequested), terminalSessionNonce);
     if (connectionMode === 'wait-for-fallback') return;
     if (connectionMode === 'connect') props.onRestarting();
     if (!terminalElement) return;
