@@ -459,7 +459,6 @@ const SESSION_SIDEBAR_MIN_WIDTH = 220;
 const SESSION_SIDEBAR_MAIN_MIN_WIDTH = 480;
 const SESSION_SIDEBAR_RESIZE_KEY_STEP = 24;
 const TERMINAL_DEFAULT_HEIGHT = 280;
-const TERMINAL_MIN_HEIGHT = 160;
 const TERMINAL_CHAT_MIN_HEIGHT = 220;
 const TERMINAL_RESIZE_KEY_STEP = 24;
 const TERMINAL_FILE_CLIENT_INVALIDATION_DEBOUNCE_MS = 750;
@@ -616,7 +615,7 @@ function composerVoiceInsertion(value: string, start: number, end: number, trans
 
 function createResizableDimension(options: {
   defaultSize: number;
-  minSize: number;
+  minSize: number | (() => number);
   maxSize: () => number;
   keyStep: number;
   axis: 'x' | 'y';
@@ -628,7 +627,8 @@ function createResizableDimension(options: {
   let stopResize: (() => void) | undefined;
   const [size, setSize] = createSignal(options.defaultSize);
   const [resizing, setResizing] = createSignal(false);
-  const setClampedSize = (value: number) => setSize(Math.max(options.minSize, Math.min(options.maxSize(), Math.round(value))));
+  const minSize = () => typeof options.minSize === 'function' ? options.minSize() : options.minSize;
+  const setClampedSize = (value: number) => setSize(Math.max(minSize(), Math.min(options.maxSize(), Math.round(value))));
   const coordinate = (event: PointerEvent) => options.axis === 'x' ? event.clientX : event.clientY;
 
   function startResize(event: PointerEvent) {
@@ -670,7 +670,7 @@ function createResizableDimension(options: {
     else if (event.key === options.decreaseKey) nextSize = size() - options.keyStep;
     else if (event.key === 'PageUp') nextSize = size() + options.keyStep * 4;
     else if (event.key === 'PageDown') nextSize = size() - options.keyStep * 4;
-    else if (event.key === 'Home') nextSize = options.minSize;
+    else if (event.key === 'Home') nextSize = minSize();
     else if (event.key === 'End') nextSize = options.maxSize();
     else if (event.key === 'Enter') nextSize = options.defaultSize;
     if (nextSize === undefined) return;
@@ -678,6 +678,7 @@ function createResizableDimension(options: {
     setClampedSize(nextSize);
   }
 
+  createEffect(() => setClampedSize(size()));
   onCleanup(() => stopResize?.());
 
   return { size, resizing, maxSize: options.maxSize, setClampedSize, startResize, resizeWithKeyboard };
@@ -5443,10 +5444,11 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
   const terminalFileInvalidationProjectIds = new Set<string>();
   const terminalServerFileInvalidationProjectIds = new Set<string>();
   const [treeSelection, setTreeSelection] = createSignal<TreeSelection>();
+  const [terminalMinHeight, setTerminalMinHeight] = createSignal(TERMINAL_DEFAULT_HEIGHT);
   const terminal = createResizableDimension({
     defaultSize: TERMINAL_DEFAULT_HEIGHT,
-    minSize: TERMINAL_MIN_HEIGHT,
-    maxSize: () => Math.max(TERMINAL_MIN_HEIGHT, (terminalSplitRef?.getBoundingClientRect().height ?? window.innerHeight) - TERMINAL_CHAT_MIN_HEIGHT),
+    minSize: terminalMinHeight,
+    maxSize: () => Math.max(terminalMinHeight(), (terminalSplitRef?.getBoundingClientRect().height ?? window.innerHeight) - TERMINAL_CHAT_MIN_HEIGHT),
     keyStep: TERMINAL_RESIZE_KEY_STEP,
     axis: 'y',
     dragMultiplier: -1,
@@ -5557,7 +5559,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
                   role="separator"
                   aria-label="Resize terminal"
                   aria-orientation="horizontal"
-                  aria-valuemin={TERMINAL_MIN_HEIGHT}
+                  aria-valuemin={terminalMinHeight()}
                   aria-valuemax={terminal.maxSize()}
                   aria-valuenow={terminal.size()}
                   tabIndex={0}
@@ -5567,7 +5569,7 @@ function WorkspaceMain(props: { project?: Project; sessionId?: string; sessionNa
                   onPointerDown={terminal.startResize}
                 />
                 <Suspense fallback={<section class="terminal-panel"><div class="terminal-toolbar"><div class="terminal-title"><SquareTerminal class="size-3.5" /><span>Loading terminal...</span></div><button class="ghost" type="button" title="Close terminal" aria-label="Close terminal" onClick={props.onClosePanel}><X class="size-4" /></button></div><div class="terminal-host" /></section>}>
-                  <Show when={project()} keyed>{(terminalProject) => <TerminalPanel project={terminalProject} state={terminalWorkspaceState(terminalProject.id)} themeMode={props.themeMode} onFilesystemActivity={() => scheduleTerminalFileInvalidation(terminalProject.id)} onClose={props.onClosePanel} />}</Show>
+                  <Show when={project()} keyed>{(terminalProject) => <TerminalPanel project={terminalProject} state={terminalWorkspaceState(terminalProject.id)} themeMode={props.themeMode} onFilesystemActivity={() => scheduleTerminalFileInvalidation(terminalProject.id)} onMinimumHeight={setTerminalMinHeight} onClose={props.onClosePanel} />}</Show>
                 </Suspense>
               </Show>
             </div>

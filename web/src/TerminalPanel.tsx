@@ -3,8 +3,9 @@ import { createEffect, createMemo, createSignal, For, onCleanup, untrack } from 
 import type { Terminal as XTermTerminal } from '@xterm/xterm';
 import { appUrl, appWebSocketUrl } from './appUrl';
 import { createTerminalDisposeFallback, createTerminalRestoreWatchdog, terminalConnectionMode, terminalOperationCompleted } from './terminalLifecycle';
+import { terminalPanelMinimumHeight } from './terminalLayout';
 import { addTerminalTab, createTerminalWorkspaceState, removeTerminalTab, requestTerminalTabClose, subscribeTerminalWorkspaceState, updateTerminalTabExited, updateTerminalTabSessionNonce, updateTerminalTabTitle, updateTerminalWorkspaceState, type TerminalWorkspaceState } from './terminalTabs';
-import { terminalCopyAction } from './terminalShortcuts';
+import { terminalCopyAction, terminalPasteAction } from './terminalShortcuts';
 import { isTerminalGeneratedReply, terminalQueriesExpectingReplies, terminalReplyMatchesQuery } from './terminalReplay';
 import './terminal-font.css';
 
@@ -112,7 +113,7 @@ function createTerminalId() {
   return `terminal-${globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${++terminalIdSequence}`}`;
 }
 
-export default function TerminalPanel(props: { project: TerminalProject; state: TerminalWorkspaceState; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onClose: () => void }) {
+export default function TerminalPanel(props: { project: TerminalProject; state: TerminalWorkspaceState; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onMinimumHeight: (height: number) => void; onClose: () => void }) {
   const tabElements = new Map<string, HTMLButtonElement>();
   const keyboardClosures = new Set<string>();
   const initialState = props.state.tabs.length ? props.state : createTerminalWorkspaceState(createTerminalId());
@@ -230,6 +231,7 @@ export default function TerminalPanel(props: { project: TerminalProject; state: 
               disposeRequested={workspace().tabs.find((tab) => tab.id === id)?.closing === true}
               themeMode={props.themeMode}
               onFilesystemActivity={props.onFilesystemActivity}
+              onMinimumHeight={props.onMinimumHeight}
               onTitle={(title) => updateTerminalTitle(id, title)}
               onSessionNonce={(sessionNonce) => updateWorkspace(updateTerminalTabSessionNonce(currentState, id, sessionNonce))}
               onRestarting={() => updateWorkspace(updateTerminalTabExited(currentState, id, false))}
@@ -245,7 +247,7 @@ export default function TerminalPanel(props: { project: TerminalProject; state: 
   );
 }
 
-function TerminalSession(props: { project: TerminalProject; terminalId: string; sessionNonce?: string; active: boolean; disposeRequested: boolean; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onTitle: (title: string) => void; onSessionNonce: (sessionNonce: string) => void; onRestarting: () => void; onRunning: () => void; onExited: () => void; onDisposed: () => void; onClose: () => void }) {
+function TerminalSession(props: { project: TerminalProject; terminalId: string; sessionNonce?: string; active: boolean; disposeRequested: boolean; themeMode: ResolvedThemeMode; onFilesystemActivity?: () => void; onMinimumHeight: (height: number) => void; onTitle: (title: string) => void; onSessionNonce: (sessionNonce: string) => void; onRestarting: () => void; onRunning: () => void; onExited: () => void; onDisposed: () => void; onClose: () => void }) {
   let terminalElement: HTMLDivElement | undefined;
   let terminal: XTermTerminal | undefined;
   let terminalSocket: WebSocket | undefined;
@@ -256,6 +258,7 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
   let pendingProjectId = props.project.id;
   let pendingGeneratedInput = '';
   let pendingInput = '';
+  let pendingInputRequiresResize = false;
   let pendingMetadata: { cwd?: string; title?: string } = {};
   const [status, setStatus] = createSignal<TerminalStatus>('connecting');
   const [shellName, setShellName] = createSignal('terminal');
@@ -415,6 +418,7 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
       pendingProjectId = projectId;
       pendingGeneratedInput = '';
       pendingInput = '';
+      pendingInputRequiresResize = false;
       pendingMetadata = {};
     }
 
@@ -496,10 +500,25 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
           setCwd(nextCwd);
           sendTerminalMetadata({ cwd: nextCwd });
         };
+        const queueTerminalInput = (data: string) => {
+          pendingInput = trimTerminalQueuedInput(pendingInput + data);
+        };
+        const flushPendingTerminalInput = () => {
+          if (!pendingInput || pendingInputRequiresResize || status() !== 'connected') return;
+          if (sendTerminalClientMessage(socket, { type: 'input', data: pendingInput })) pendingInput = '';
+        };
         const sendTerminalInput = (data: string) => {
           props.onFilesystemActivity?.();
-          if (status() === 'connected' && sendTerminalClientMessage(socket, { type: 'input', data })) return;
-          pendingInput = trimTerminalQueuedInput(pendingInput + data);
+          if (data === '\t' || data === '\x1b[Z') {
+            resizeTerminal?.(true);
+            pendingInputRequiresResize = pendingInputRequiresResize || Boolean(resizeInFlight || pendingResize);
+          }
+          if (status() !== 'connected' || pendingInputRequiresResize || pendingInput) {
+            queueTerminalInput(data);
+            flushPendingTerminalInput();
+            return;
+          }
+          if (!sendTerminalClientMessage(socket, { type: 'input', data })) queueTerminalInput(data);
         };
         const sendTerminalGeneratedInput = (data: string) => {
           if (status() === 'connected' && sendTerminalClientMessage(socket, { type: 'input', data })) return;
@@ -675,6 +694,22 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
           if (delay === 0) sendResize();
           else resizeMessageTimer = window.setTimeout(sendResize, delay);
         };
+        const updateMinimumHeight = () => {
+          if (!xterm || !terminalElement || !props.active) return;
+          const panel = terminalElement.closest('.terminal-panel');
+          const screen = terminalElement.querySelector<HTMLElement>('.xterm-screen');
+          const xtermElement = terminalElement.querySelector<HTMLElement>('.xterm');
+          if (!panel || !screen || !xtermElement || xterm.rows <= 0) return;
+          const xtermStyle = window.getComputedStyle(xtermElement);
+          props.onMinimumHeight(terminalPanelMinimumHeight({
+            panelHeight: panel.getBoundingClientRect().height,
+            hostHeight: terminalElement.getBoundingClientRect().height,
+            xtermPaddingTop: Number.parseFloat(xtermStyle.paddingTop) || 0,
+            xtermPaddingBottom: Number.parseFloat(xtermStyle.paddingBottom) || 0,
+            screenHeight: screen.getBoundingClientRect().height,
+            renderedRows: xterm.rows,
+          }));
+        };
         resizeTerminal = (immediate = false, forceRefresh = false) => {
           if (!xterm || !terminalElement || !terminalElement.isConnected) return;
           const bounds = terminalElement.getBoundingClientRect();
@@ -696,6 +731,7 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
             failTerminalRenderer();
             return;
           }
+          updateMinimumHeight();
           if (!socket) {
             lastConfirmedCols = cols;
             lastConfirmedRows = rows;
@@ -911,11 +947,12 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
                 }, TERMINAL_RECONNECT_STABLE_MS);
                 if (deferredAckOffset > 0 && sendTerminalClientMessage(socket, { type: 'ack', dataOffset: deferredAckOffset })) deferredAckOffset = 0;
                 if (pendingGeneratedInput && sendTerminalClientMessage(socket, { type: 'input', data: pendingGeneratedInput })) pendingGeneratedInput = '';
-                if (pendingInput && sendTerminalClientMessage(socket, { type: 'input', data: pendingInput })) pendingInput = '';
                 if ((pendingMetadata.cwd || pendingMetadata.title) && sendTerminalClientMessage(socket, { type: 'metadata', ...pendingMetadata })) pendingMetadata = {};
                 if (props.active && !props.disposeRequested) xterm?.focus();
               }
               sendPendingResize(true);
+              if (pendingInputRequiresResize && !resizeInFlight && !pendingResize) pendingInputRequiresResize = false;
+              flushPendingTerminalInput();
             });
           } else if (message.type === 'metadata') {
             const title = normalizeTerminalMetadata(message.title ?? '');
@@ -1105,8 +1142,9 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
 function handleTerminalKeyEvent(event: KeyboardEvent, terminal: XTermTerminal) {
   if (event.type !== 'keydown') return true;
   const key = event.key.toLowerCase();
+  const isMac = navigator.platform.toLowerCase().includes('mac');
   const hasSelection = terminal.hasSelection();
-  const copyAction = terminalCopyAction(event, hasSelection, navigator.platform.toLowerCase().includes('mac'));
+  const copyAction = terminalCopyAction(event, hasSelection, isMac);
 
   if (copyAction) {
     event.preventDefault();
@@ -1114,6 +1152,11 @@ function handleTerminalKeyEvent(event: KeyboardEvent, terminal: XTermTerminal) {
       void copyTerminalSelection(terminal.getSelection());
       if (copyAction === 'copy-and-clear') terminal.clearSelection();
     }
+    return false;
+  }
+
+  if (terminalPasteAction(event, isMac)) {
+    // Stop xterm from encoding the shortcut as ^V; leave the browser default so xterm's paste event handles the clipboard text.
     return false;
   }
 
