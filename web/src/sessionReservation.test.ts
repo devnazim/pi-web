@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
+import { composerDraftKey, ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
+
+test('keys blank composer drafts by revision', () => {
+  assert.equal(composerDraftKey('project-1'), `project-1\0\0${0}`);
+  assert.equal(composerDraftKey('project-1', undefined, 1), `project-1\0\0${1}`);
+  assert.equal(composerDraftKey('project-1', 'session-1', 1), 'project-1\0session-1\0');
+});
 
 test('recognizes an unknown-session error that requires authoritative confirmation', () => {
   assert.equal(isUnknownSessionReservation(new Error('Unknown session')), true);

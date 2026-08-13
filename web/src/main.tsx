@@ -111,7 +111,7 @@ import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirect
 import { parseTextSearchPatternInput } from './textSearch';
 import { createTerminalWorkspaceState, type TerminalWorkspaceState } from './terminalTabs';
 import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
-import { ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
+import { composerDraftKey, createDraftSessionReservationEffect, ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import { buildSessionShareUrl, decodeProjectPath, encodeProjectPath, PROJECT_QUERY_KEY, SESSION_QUERY_KEY, WORKSPACE_QUERY_KEY } from './sessionShare';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
 import MermaidDiagram from './MermaidDiagram';
@@ -6443,13 +6443,16 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     return sessionId;
   }
 
-  createEffect(() => {
+  createDraftSessionReservationEffect(createEffect, () => {
     commandSessionRetry();
-    const projectId = props.project.id;
-    const routeSessionId = props.sessionId;
-    const reservedSessionId = commandSessionId();
-    const draftKey = activeComposerDraftKey;
-    if (routeSessionId || reservedSessionId || !draftKey) return;
+    return {
+      projectId: props.project.id,
+      routeSessionId: props.sessionId,
+      reservedSessionId: commandSessionId(),
+      newComposerRevision: props.newComposerRevision,
+      activeDraftKey: activeComposerDraftKey,
+    };
+  }, (draftKey, projectId) => {
     let cancelled = false;
     let retryTimer: number | undefined;
     void ensureCommandSession(draftKey).catch((error) => {
@@ -14765,10 +14768,6 @@ function composerFileReferencePaths(value: string) {
     if (filePath) paths.push(filePath);
   }
   return paths;
-}
-
-function composerDraftKey(projectId: string, sessionId?: string, newComposerRevision = 0) {
-  return `${projectId}\0${sessionId ?? ''}\0${sessionId ? '' : newComposerRevision}`;
 }
 
 function readComposerDraft(key: string): ComposerDraft {

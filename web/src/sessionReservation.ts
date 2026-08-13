@@ -1,3 +1,26 @@
+export function composerDraftKey(projectId: string, sessionId?: string, newComposerRevision = 0) {
+  return `${projectId}\0${sessionId ?? ''}\0${sessionId ? '' : newComposerRevision}`;
+}
+
+export function createDraftSessionReservationEffect(
+  createReactiveEffect: (effect: () => void) => unknown,
+  state: () => {
+    projectId: string;
+    routeSessionId: string | undefined;
+    reservedSessionId: string | undefined;
+    newComposerRevision: number;
+    activeDraftKey: string | undefined;
+  },
+  reserve: (draftKey: string, projectId: string) => void,
+) {
+  createReactiveEffect(() => {
+    const { projectId, routeSessionId, reservedSessionId, newComposerRevision, activeDraftKey } = state();
+    const draftKey = composerDraftKey(projectId, routeSessionId, newComposerRevision);
+    if (routeSessionId || reservedSessionId || activeDraftKey !== draftKey) return;
+    reserve(draftKey, projectId);
+  });
+}
+
 export function isUnknownSessionReservation(error: unknown) {
   return error instanceof Error && error.message.trim().toLowerCase() === 'unknown session';
 }
