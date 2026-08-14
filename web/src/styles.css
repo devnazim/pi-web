@@ -1800,6 +1800,10 @@ body {
     -webkit-overflow-scrolling: touch;
   }
 
+  .chat-scroll-to-bottom {
+    @apply absolute bottom-3 left-1/2 z-20 grid size-8 -translate-x-1/2 place-items-center rounded-full border border-border/60 bg-background/70 text-muted-foreground shadow-sm backdrop-blur-sm outline-none transition-colors hover:bg-background/90 hover:text-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50;
+  }
+
   .asset-preview-backdrop {
     @apply p-10;
   }
@@ -3255,7 +3259,7 @@ body {
   .chat-transcript.chat-transcript {
     padding-top: calc(env(safe-area-inset-top) + 5rem);
     padding-right: calc(env(safe-area-inset-right) + 1rem);
-    padding-bottom: 1rem;
+    padding-bottom: 4rem;
     padding-left: calc(env(safe-area-inset-left) + 1rem);
   }
 

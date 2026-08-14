@@ -5596,6 +5596,7 @@ type PendingUserMessage = PendingUserMessageHandoff & { projectId: string; sessi
 
 function Chat(props: { project: Project; sessionId?: string; sessionNavigationRevision: number; newComposerRevision: number; liveActivity: AgentActivity; liveShellActivity: BashActivity; extensionUiRequests: ExtensionUiRequest[]; treeSelection?: TreeSelection; suspended: boolean; themeMode: ResolvedThemeMode; contrastUserMessages: boolean; searchQuery: string; searchRequest: ChatSearchRequest; onSearchState: (state: ChatSearchState) => void; onSession: (id: string, projectId?: string, expectedSessionId?: string | null, expectedNavigationRevision?: number) => boolean; onDraftSessionId: (projectId: string, sessionId: string | undefined) => void; onSessionNotFound: (id: string, projectId: string) => void; onExtensionUiReply: (projectId: string, request: ExtensionUiRequest, reply: ExtensionUiReply) => Promise<void>; beginAgentStatusRequest: BeginAgentStatusRequest; invalidateAgentStatusRequests: () => void; onTreeSelection: (selection?: TreeSelection) => void }) {
   let transcriptScrollerRef: HTMLDivElement | undefined;
+  let transcriptContentRef: HTMLDivElement | undefined;
   let composerRef: HTMLTextAreaElement | undefined;
   let composerHighlightsRef: HTMLDivElement | undefined;
   const clearedComposerDraftKeys = new Set<string>();
@@ -5629,6 +5630,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
   let composerHistoryDraft: ComposerHistoryItem = { text: '', uploads: [] };
   const [text, setText] = createSignal('');
   const [stickToBottom, setStickToBottom] = createSignal(true);
+  const [showScrollToBottom, setShowScrollToBottom] = createSignal(false);
   const [transcriptWindow, setTranscriptWindow] = createSignal<{ key: string; start: number; leafId: string | null | undefined; expanded: boolean }>({ key: '', start: 0, leafId: undefined, expanded: false });
   const [uploads, setUploads] = createSignal<UploadAsset[]>([]);
   const [previewPath, setPreviewPath] = createSignal<string>();
@@ -6278,11 +6280,20 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     };
     window.addEventListener('keydown', onKeyDown);
 
-    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => syncComposerLayout());
-    if (observer && composerRef) observer.observe(composerRef);
+    const composerObserver = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => syncComposerLayout());
+    if (composerObserver && composerRef) composerObserver.observe(composerRef);
+    const transcriptObserver = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => {
+      const element = transcriptScrollerRef;
+      if (!element) return;
+      if (stickToBottom()) scrollTranscriptToBottom();
+      else updateTranscriptStickiness(element);
+    });
+    if (transcriptObserver && transcriptScrollerRef) transcriptObserver.observe(transcriptScrollerRef);
+    if (transcriptObserver && transcriptContentRef) transcriptObserver.observe(transcriptContentRef);
     onCleanup(() => {
       window.removeEventListener('keydown', onKeyDown);
-      observer?.disconnect();
+      composerObserver?.disconnect();
+      transcriptObserver?.disconnect();
     });
   });
 
@@ -6329,6 +6340,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     const distance = transcriptDistanceFromBottom(element);
     if (distance < 4) userScrollingTranscriptAwayFromBottom = false;
     setStickToBottom(!userScrollingTranscriptAwayFromBottom && distance < 120);
+    setShowScrollToBottom(distance >= 4);
   }
 
   function loadEarlierTranscript(element: HTMLDivElement) {
@@ -6361,6 +6373,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     if (force) {
       userScrollingTranscriptAwayFromBottom = false;
       transcriptScrollForce = true;
+      setShowScrollToBottom(false);
     }
     if (transcriptScrollFrame !== undefined) return;
     transcriptScrollFrame = requestAnimationFrame(() => {
@@ -7587,56 +7600,63 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
 
   return (
     <div class={`grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_auto] overflow-hidden${props.contrastUserMessages ? '' : ' chat-user-bubbles-surface'}`}>
-      <div
-        ref={transcriptScrollerRef}
-        class={`chat-transcript min-h-0 overflow-y-auto overflow-x-hidden px-6 pb-6 pt-24 ${centerTranscript() ? 'grid place-items-center' : ''}`}
-        onWheel={handleTranscriptWheel}
-        onScroll={(event) => handleTranscriptScroll(event.currentTarget)}
-      >
-        <div class="mx-auto w-full max-w-5xl">
-          <div class="min-w-0">
-            <Show when={!props.sessionId && !pendingUserMessageVisible()}>
-              <div class="mx-auto w-full max-w-xl rounded-2xl bg-card p-5 text-center text-sm text-muted-foreground ring-1 ring-foreground/10">Create or select a session, then ask Pi to work in this workspace.</div>
-            </Show>
-            <Show when={showEmptySessionPrompt()}>
-              <div class="mx-auto w-full max-w-xl rounded-2xl bg-card p-5 text-center text-sm text-muted-foreground ring-1 ring-foreground/10">Ask Pi to work in this workspace.</div>
-            </Show>
-            <Show when={props.sessionId && session.isLoading}>
-              <div class="mb-4 rounded-2xl bg-card p-5 text-sm text-muted-foreground ring-1 ring-foreground/10">Loading session...</div>
-            </Show>
-            <Show when={props.sessionId && session.error}>
-              <div class="mb-4 flex items-center justify-between gap-4 rounded-2xl bg-card p-5 text-sm text-destructive ring-1 ring-destructive/20">
-                <span>{session.error instanceof Error ? session.error.message : 'Could not load session'}</span>
-                <button type="button" class="ghost shrink-0" onClick={() => void session.refetch()}><RefreshCw class="size-4" />Retry</button>
-              </div>
-            </Show>
-            <For each={renderedTranscriptEntries()}>
-              {(item, index) => {
-                let element: HTMLDivElement | undefined;
-                onCleanup(() => {
-                  if (element) deleteTranscriptEntryRef(item.id, element);
-                });
-                return (
-                  <div
-                    ref={(node) => {
-                      element = node;
-                      setTranscriptEntryRef(item.id, node);
-                    }}
-                    data-index={transcriptRenderRange().start + index()}
-                    class={`chat-search-entry ${chatSearchMatchIds().has(item.id) ? 'chat-search-entry-match' : ''} ${activeSearchEntryId() === item.id ? 'chat-search-entry-active' : ''}`}
-                  >
-                    <TranscriptEntry entry={item} project={props.project} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} toolCalls={toolCalls()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
-                  </div>
-                );
-              }}
-            </For>
-            <For each={pendingUserMessagesBeforeLiveActivity()}>
-              {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
-            </For>
-            <LiveAgentActivity activity={displayedLiveActivity()} pendingUserMessages={pendingUserMessagesAfterLiveActivity()} project={props.project} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
-            <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
+      <div class="relative min-h-0 min-w-0 overflow-hidden">
+        <div
+          ref={transcriptScrollerRef}
+          class={`chat-transcript h-full min-h-0 overflow-y-auto overflow-x-hidden px-6 pb-16 pt-24 ${centerTranscript() ? 'grid place-items-center' : ''}`}
+          onWheel={handleTranscriptWheel}
+          onScroll={(event) => handleTranscriptScroll(event.currentTarget)}
+        >
+          <div ref={transcriptContentRef} class="mx-auto w-full max-w-5xl">
+            <div class="min-w-0">
+              <Show when={!props.sessionId && !pendingUserMessageVisible()}>
+                <div class="mx-auto w-full max-w-xl rounded-2xl bg-card p-5 text-center text-sm text-muted-foreground ring-1 ring-foreground/10">Create or select a session, then ask Pi to work in this workspace.</div>
+              </Show>
+              <Show when={showEmptySessionPrompt()}>
+                <div class="mx-auto w-full max-w-xl rounded-2xl bg-card p-5 text-center text-sm text-muted-foreground ring-1 ring-foreground/10">Ask Pi to work in this workspace.</div>
+              </Show>
+              <Show when={props.sessionId && session.isLoading}>
+                <div class="mb-4 rounded-2xl bg-card p-5 text-sm text-muted-foreground ring-1 ring-foreground/10">Loading session...</div>
+              </Show>
+              <Show when={props.sessionId && session.error}>
+                <div class="mb-4 flex items-center justify-between gap-4 rounded-2xl bg-card p-5 text-sm text-destructive ring-1 ring-destructive/20">
+                  <span>{session.error instanceof Error ? session.error.message : 'Could not load session'}</span>
+                  <button type="button" class="ghost shrink-0" onClick={() => void session.refetch()}><RefreshCw class="size-4" />Retry</button>
+                </div>
+              </Show>
+              <For each={renderedTranscriptEntries()}>
+                {(item, index) => {
+                  let element: HTMLDivElement | undefined;
+                  onCleanup(() => {
+                    if (element) deleteTranscriptEntryRef(item.id, element);
+                  });
+                  return (
+                    <div
+                      ref={(node) => {
+                        element = node;
+                        setTranscriptEntryRef(item.id, node);
+                      }}
+                      data-index={transcriptRenderRange().start + index()}
+                      class={`chat-search-entry ${chatSearchMatchIds().has(item.id) ? 'chat-search-entry-match' : ''} ${activeSearchEntryId() === item.id ? 'chat-search-entry-active' : ''}`}
+                    >
+                      <TranscriptEntry entry={item} project={props.project} hideThinking={hideThinking()} toolOutputMode={toolOutputMode()} toolCalls={toolCalls()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
+                    </div>
+                  );
+                }}
+              </For>
+              <For each={pendingUserMessagesBeforeLiveActivity()}>
+                {(pending) => <UserMessage project={props.project} parts={[{ type: 'text', text: pending.text }]} attachments={pending.attachments} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />}
+              </For>
+              <LiveAgentActivity activity={displayedLiveActivity()} pendingUserMessages={pendingUserMessagesAfterLiveActivity()} project={props.project} hideThinking={hideThinking()} optimizeStreamingRender={optimizeStreamingRender()} toolOutputMode={toolOutputMode()} syntaxTheme={syntaxTheme()} searchQuery={props.searchQuery} onPreviewAttachment={setPreviewPath} />
+              <LiveShellActivity activity={liveShellActivity()} command={runningCommand()} />
+            </div>
           </div>
         </div>
+        <Show when={showScrollToBottom()}>
+          <button type="button" class="chat-scroll-to-bottom" title="Scroll to bottom" aria-label="Scroll to bottom" onClick={() => scrollTranscriptToBottom(true)}>
+            <ChevronDown class="size-4" />
+          </button>
+        </Show>
       </div>
       <Show when={visibleExtensionUiRequests()[0]}>
         {(request) => (
