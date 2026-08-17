@@ -66,7 +66,7 @@ import {
 import type { LucideIcon } from 'lucide-solid';
 import { lexer } from 'marked';
 import type { Token } from 'marked';
-import { For, Show, Suspense, createEffect, createMemo, createSignal, lazy, onCleanup, onMount, untrack, type JSX } from 'solid-js';
+import { For, Show, Suspense, batch, createEffect, createMemo, createSignal, lazy, onCleanup, onMount, untrack, type JSX } from 'solid-js';
 import { Portal, render } from 'solid-js/web';
 import Sortable from 'sortablejs';
 import editorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
@@ -2385,16 +2385,17 @@ function Shell() {
     if (workspaceId && currentWorkspaceId !== workspaceId && requestFileWorkspaceLeave(() => selectSession(id, workspaceId, expectedSessionId, expectedNavigationRevision))) return false;
     workspaceSessionRestoreRequest += 1;
     const switchedWorkspace = Boolean(workspaceId && currentWorkspaceId !== workspaceId);
-    if (workspaceId && currentWorkspaceId !== workspaceId) {
-      setActiveSession(undefined, workspaceId);
-      setWorkspaceProjectId(workspaceId);
-      workspaceSessionRestoredForId = workspaceId;
-    }
     if (workspaceId) rememberWorkspaceSession(workspaceId, id);
     if (currentSessionId === id && !switchedWorkspace) return true;
     const keepEvents = eventsBelongToSession(events(), id);
-    setActiveSession(id, workspaceId);
-    if (!keepEvents) resetAgentEvents([]);
+    batch(() => {
+      if (switchedWorkspace) {
+        setWorkspaceProjectId(workspaceId);
+        workspaceSessionRestoredForId = workspaceId;
+      }
+      setActiveSession(id, workspaceId);
+      if (!keepEvents) resetAgentEvents([]);
+    });
     return true;
   }
 
@@ -2538,15 +2539,17 @@ function Shell() {
       for (const runningSessionId of workspaceNotificationState(workspaceNotificationStore()[targetWorkspaceId]).runningSessionIds) ignoredSessionIds.add(runningSessionId);
       while (ignoredSessionIds.size > 256) ignoredSessionIds.delete(ignoredSessionIds.values().next().value!);
       if (ignoredSessionIds.size) ignoredActiveStreamSessionIds.set(targetWorkspaceId, ignoredSessionIds);
-      setNewComposerRevisions((revisions) => ({ ...revisions, [targetWorkspaceId]: (revisions[targetWorkspaceId] ?? 0) + 1 }));
     }
-    setActiveSession(undefined, targetWorkspaceId, { forceNavigation: true });
-    if (workspaceId) {
-      setWorkspaceProjectId(workspaceId);
-      workspaceSessionRestoredForId = workspaceId;
-    }
-    resetAgentEvents([]);
-    setToolPanel((panel) => panel === 'tree' ? undefined : panel);
+    batch(() => {
+      if (targetWorkspaceId) setNewComposerRevisions((revisions) => ({ ...revisions, [targetWorkspaceId]: (revisions[targetWorkspaceId] ?? 0) + 1 }));
+      setActiveSession(undefined, targetWorkspaceId, { forceNavigation: true });
+      if (workspaceId) {
+        setWorkspaceProjectId(workspaceId);
+        workspaceSessionRestoredForId = workspaceId;
+      }
+      resetAgentEvents([]);
+      setToolPanel((panel) => panel === 'tree' ? undefined : panel);
+    });
   }
 
   function resetWorkspaceSelection(id: string) {
@@ -3944,7 +3947,6 @@ function Sidebar(props: {
   function newSession(workspaceId?: string) {
     const targetId = workspaceId ?? props.workspaceProject?.id;
     if (!targetId) return;
-    props.onWorkspace(targetId);
     props.onNewSession(targetId);
   }
 
@@ -5192,7 +5194,6 @@ function MobileMenu(props: {
   function newSession(workspaceId?: string) {
     const targetId = workspaceId ?? props.workspaceProject?.id;
     if (!targetId) return;
-    props.onWorkspace(targetId);
     props.onNewSession(targetId);
     props.onClose();
   }
