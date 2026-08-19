@@ -10,6 +10,7 @@ import { clearProjectFileCaches } from './files.js';
 import { getGitBranch } from './git.js';
 import type { ProjectRegistry } from './projects.js';
 import { createPiWebReviewExtension } from './reviewExtension.js';
+import { applyPiWebRetryDefaults } from './retrySettings.js';
 import { applyPendingSessionInfo, projectSessionDir, resolveSessionFile, sessionDetailFromManager, sessionManagerForSession } from './sessions.js';
 import type { AgentEvent } from './types.js';
 import { resolveWithin, sessionIdFromPath } from './util.js';
@@ -3048,7 +3049,7 @@ export class PiBridge {
       if (sessionId) {
         if (typeof sdk.DefaultResourceLoader !== 'function') throw new Error('Loaded pi SDK does not expose DefaultResourceLoader');
         settingsManager = typeof sdk.SettingsManager?.create === 'function'
-          ? sdk.SettingsManager.create(projectPath, getAgentDir())
+          ? applyPiWebRetryDefaults(sdk.SettingsManager.create(projectPath, getAgentDir()))
           : undefined;
         resourceLoader = new sdk.DefaultResourceLoader({
           cwd: projectPath,

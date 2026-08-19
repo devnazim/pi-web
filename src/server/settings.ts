@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { ProjectRegistry } from './projects.js';
+import { applyPiWebRetryDefaults } from './retrySettings.js';
 
 type Settings = Record<string, any>;
 type SettingsBody = { scope?: 'global' | 'project'; settings?: Partial<Settings> };
@@ -43,7 +44,7 @@ export async function registerSettingsRoutes(app: FastifyInstance, registry: Pro
   app.get<{ Params: { projectId: string } }>('/api/projects/:projectId/settings', async (request, reply) => {
     try {
       const project = registry.get(request.params.projectId);
-      return settingsPayload(SettingsManager.create(project.path, getAgentDir()));
+      return settingsPayload(applyPiWebRetryDefaults(SettingsManager.create(project.path, getAgentDir())));
     } catch (error) {
       return reply.code(404).send({ error: error instanceof Error ? error.message : 'Could not load settings' });
     }
@@ -56,7 +57,7 @@ export async function registerSettingsRoutes(app: FastifyInstance, registry: Pro
       const filePath = scope === 'project' ? path.join(project.path, '.pi', 'settings.json') : path.join(getAgentDir(), 'settings.json');
       const current = readJson(filePath);
       writeJson(filePath, deepMerge(current, sanitizeSettings(request.body?.settings ?? {})));
-      return settingsPayload(SettingsManager.create(project.path, getAgentDir()));
+      return settingsPayload(applyPiWebRetryDefaults(SettingsManager.create(project.path, getAgentDir())));
     } catch (error) {
       return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not save settings' });
     }

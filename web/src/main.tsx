@@ -368,6 +368,7 @@ const PI_WEB_AGENT_SELECTABLE_COMMAND_NAMES = new Set(['pi-web-review', 'pi-web-
 const CHAT_SEARCH_DEBOUNCE_MS = 200;
 const FILE_SEARCH_DEBOUNCE_MS = 250;
 const SETTINGS_CACHE_STALE_TIME_MS = 60_000;
+const PI_WEB_RETRY_DEFAULTS = { enabled: true, maxRetries: 5, baseDelayMs: 4_000 } as const;
 const SESSION_DETAIL_CACHE_STALE_TIME_MS = 30_000;
 const TRANSCRIPT_INITIAL_RENDER_COUNT = 160;
 const TRANSCRIPT_SEARCH_RENDER_COUNT = 160;
@@ -3561,6 +3562,11 @@ function SettingsModal(props: {
   }
 
   const effective = createMemo(() => settings.data?.effective ?? {});
+  const retrySettings = createMemo(() => ({
+    ...PI_WEB_RETRY_DEFAULTS,
+    ...(scope() === 'project' ? settings.data?.global.retry : {}),
+    ...form().retry,
+  }));
   const settingsModelValue = createMemo(() => defaultModelReference(form()) ?? '');
   const inheritedSettingsModel = createMemo(() => scope() === 'project' ? defaultModelReference(settings.data?.global) : undefined);
   const selectedSettingsModel = createMemo(() => settingsModelValue() || inheritedSettingsModel() || defaultModelReference(effective()));
@@ -3657,7 +3663,28 @@ function SettingsModal(props: {
                   </SettingsSection>
                   <SettingsSection title="Reliability">
                     <SettingsToggleRow label="Auto-compaction enabled" checked={form().compaction?.enabled ?? effective().compaction?.enabled ?? true} onChange={(checked) => updateNested('compaction', { enabled: checked })} />
-                    <SettingsToggleRow label="Automatic retry enabled" checked={form().retry?.enabled ?? effective().retry?.enabled ?? true} onChange={(checked) => updateNested('retry', { enabled: checked })} />
+                    <SettingsToggleRow label="Automatically retry transient agent failures" description="Retry temporary provider failures with exponential backoff." checked={retrySettings().enabled} onChange={(checked) => updateNested('retry', { enabled: checked })} />
+                    <div class="settings-grid">
+                      <label class="settings-field">
+                        <span>Maximum retries</span>
+                        <input class="input" type="number" min="1" max="10" step="1" value={retrySettings().maxRetries} disabled={!retrySettings().enabled} aria-label="Maximum automatic retries" onChange={(event) => {
+                          const value = event.currentTarget.valueAsNumber;
+                          if (Number.isFinite(value)) updateNested('retry', { maxRetries: Math.max(1, Math.min(10, Math.round(value))) });
+                        }} />
+                        <span>Additional attempts after the initial request.</span>
+                      </label>
+                      <label class="settings-field">
+                        <span>Initial retry delay</span>
+                        <div class="relative">
+                          <input class="input pr-9" type="number" min="1" max="60" step="1" value={retrySettings().baseDelayMs / 1_000} disabled={!retrySettings().enabled} aria-label="Initial automatic retry delay in seconds" onChange={(event) => {
+                            const value = event.currentTarget.valueAsNumber;
+                            if (Number.isFinite(value)) updateNested('retry', { baseDelayMs: Math.max(1, Math.min(60, Math.round(value))) * 1_000 });
+                          }} />
+                          <span class="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-muted-foreground">sec</span>
+                        </div>
+                        <span>Later retries wait twice as long.</span>
+                      </label>
+                    </div>
                   </SettingsSection>
                 </div>
               </form>

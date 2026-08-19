@@ -1344,6 +1344,8 @@ test('uses one pending runtime for command discovery, completion, and execution'
     let loaderOptions: Record<string, any> | undefined;
     let reloads = 0;
     let createOptions: Record<string, any> | undefined;
+    let retryOverrides: Record<string, unknown> | undefined;
+    let runtimeRetrySettings: Record<string, unknown> | undefined;
     let creates = 0;
     let completionObserved = false;
     const probeCommand = {
@@ -1379,15 +1381,34 @@ test('uses one pending runtime for command discovery, completion, and execution'
     (bridge as any).loadSdk = async () => ({
       DefaultResourceLoader: class {
         constructor(options: Record<string, any>) { loaderOptions = options; }
-        async reload() { reloads += 1; }
+        async reload() {
+          reloads += 1;
+          await loaderOptions?.settingsManager.reload();
+        }
       },
-      SettingsManager: { create: () => ({ source: 'settings' }) },
+      SettingsManager: {
+        create: () => {
+          let retrySettings: Record<string, unknown> = { enabled: true, maxRetries: 3, baseDelayMs: 2_000 };
+          return {
+            source: 'settings',
+            getGlobalSettings: () => ({}),
+            getProjectSettings: () => ({}),
+            getRetrySettings: () => retrySettings,
+            applyOverrides: (overrides: { retry: Record<string, unknown> }) => {
+              retryOverrides = overrides;
+              retrySettings = { ...retrySettings, ...overrides.retry };
+            },
+            reload: async () => { retrySettings = { enabled: true, maxRetries: 3, baseDelayMs: 2_000 }; },
+          };
+        },
+      },
       SessionManager: {
         open: () => { throw new Error('pending sessions must use the server-retained session manager'); },
       },
       createAgentSession: async (options: Record<string, any>) => {
         creates += 1;
         createOptions = options;
+        runtimeRetrySettings = options.settingsManager.getRetrySettings();
         return { session };
       },
     });
@@ -1408,6 +1429,8 @@ test('uses one pending runtime for command discovery, completion, and execution'
     assert.equal(loaderOptions?.extensionFactories[0].name, 'pi-web-review');
     assert.equal(createOptions?.resourceLoader instanceof Object, true);
     assert.equal(createOptions?.settingsManager, loaderOptions?.settingsManager);
+    assert.deepEqual(retryOverrides, { retry: { enabled: true, maxRetries: 5, baseDelayMs: 4_000 } });
+    assert.deepEqual(runtimeRetrySettings, { enabled: true, maxRetries: 5, baseDelayMs: 4_000 });
     assert.equal(createOptions?.sessionManager, retainedSessionManager);
     assert.equal(existsSync(sessionFile), true);
     assert.deepEqual((await listSessions('project', projectPath)).map(({ id }) => id), [sessionId]);
