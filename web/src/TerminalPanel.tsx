@@ -5,7 +5,7 @@ import { appUrl, appWebSocketUrl } from './appUrl';
 import { createTerminalDisposeFallback, createTerminalRestoreWatchdog, terminalConnectionMode, terminalOperationCompleted } from './terminalLifecycle';
 import { terminalPanelMinimumHeight } from './terminalLayout';
 import { addTerminalTab, createTerminalWorkspaceState, removeTerminalTab, requestTerminalTabClose, subscribeTerminalWorkspaceState, updateTerminalTabExited, updateTerminalTabSessionNonce, updateTerminalTabTitle, updateTerminalWorkspaceState, type TerminalWorkspaceState } from './terminalTabs';
-import { terminalCopyAction, terminalPasteAction } from './terminalShortcuts';
+import { isTerminalApplePlatform, terminalCopyAction, terminalPasteAction } from './terminalShortcuts';
 import { isTerminalGeneratedReply, terminalQueriesExpectingReplies, terminalReplyMatchesQuery } from './terminalReplay';
 import './terminal-font.css';
 
@@ -1142,7 +1142,7 @@ function TerminalSession(props: { project: TerminalProject; terminalId: string; 
 function handleTerminalKeyEvent(event: KeyboardEvent, terminal: XTermTerminal) {
   if (event.type !== 'keydown') return true;
   const key = event.key.toLowerCase();
-  const isMac = navigator.platform.toLowerCase().includes('mac');
+  const isMac = isTerminalApplePlatform(navigator.platform);
   const hasSelection = terminal.hasSelection();
   const copyAction = terminalCopyAction(event, hasSelection, isMac);
 
@@ -1265,9 +1265,15 @@ function terminalTildeKey(number: number, modifiers: TerminalModifiers) {
   return modifierCode ? `\x1b[${number};${modifierCode}~` : `\x1b[${number}~`;
 }
 
-async function copyTerminalSelection(text: string) {
-  if (await writeClipboardText(text)) return;
-  copyTextWithHiddenTextarea(text);
+function copyTerminalSelection(text: string) {
+  // Remote pi-web sessions are commonly served over plain HTTP, where the async
+  // Clipboard API is unavailable. Keep the textarea fallback in the key event's
+  // user gesture instead of crossing an async boundary first.
+  if (!globalThis.isSecureContext || !navigator.clipboard?.writeText) {
+    copyTextWithHiddenTextarea(text);
+    return;
+  }
+  void navigator.clipboard.writeText(text).catch(() => copyTextWithHiddenTextarea(text));
 }
 
 type TerminalClipboardSelection = 'c' | 'p';
@@ -1319,6 +1325,7 @@ async function writeClipboardText(text: string) {
 }
 
 function copyTextWithHiddenTextarea(text: string) {
+  const focusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
   const textarea = document.createElement('textarea');
   textarea.value = text;
   textarea.readOnly = true;
@@ -1333,6 +1340,7 @@ function copyTextWithHiddenTextarea(text: string) {
     // Clipboard access can be denied by the browser.
   } finally {
     textarea.remove();
+    focusedElement?.focus({ preventScroll: true });
   }
 }
 
@@ -1406,6 +1414,7 @@ function terminalTheme() {
     foreground: oklch('--foreground', '0.92 0 0'),
     cursor: cssColor('--terminal-cursor-color', '#d4d4d4'),
     cursorAccent: cssColor('--terminal-cursor-accent-color', '#1f1f1f'),
-    selectionBackground: oklch('--primary', '0.488 0.243 264.376', '0.25'),
+    selectionBackground: cssColor('--terminal-selection-background', '#e5e5e566'),
+    selectionInactiveBackground: cssColor('--terminal-selection-inactive-background', '#e5e5e540'),
   };
 }

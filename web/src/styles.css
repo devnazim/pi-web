@@ -99,6 +99,8 @@
   --font-terminal: 'Pi GeistMono Nerd Font Mono', 'GeistMono Nerd Font Mono', 'Geist Mono', 'JetBrainsMono Nerd Font Mono', 'JetBrainsMono Nerd Font', 'JetBrains Mono', 'Noto Color Emoji', monospace;
   --terminal-cursor-color: #a1a1aa80;
   --terminal-cursor-accent-color: #ffffff;
+  --terminal-selection-background: #17171766;
+  --terminal-selection-inactive-background: #17171740;
 }
 
 .dark,
@@ -141,6 +143,8 @@
   --sidebar-ring: 0.556 0 0;
   --terminal-cursor-color: #d4d4d4;
   --terminal-cursor-accent-color: #1f1f1f;
+  --terminal-selection-background: #e5e5e566;
+  --terminal-selection-inactive-background: #e5e5e540;
   --radius: 0.625rem;
 }
 

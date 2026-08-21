@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { terminalCopyAction, terminalPasteAction, type TerminalShortcutEvent } from './terminalShortcuts';
+import { isTerminalApplePlatform, terminalCopyAction, terminalPasteAction, type TerminalShortcutEvent } from './terminalShortcuts';
 
 function keyEvent(overrides: Partial<TerminalShortcutEvent> = {}): TerminalShortcutEvent {
   return {
@@ -13,6 +13,13 @@ function keyEvent(overrides: Partial<TerminalShortcutEvent> = {}): TerminalShort
     ...overrides,
   };
 }
+
+test('recognizes macOS and iOS as Apple shortcut platforms', () => {
+  assert.equal(isTerminalApplePlatform('MacIntel'), true);
+  assert.equal(isTerminalApplePlatform('iPhone'), true);
+  assert.equal(isTerminalApplePlatform('iPad'), true);
+  assert.equal(isTerminalApplePlatform('Linux x86_64'), false);
+});
 
 test('plain Ctrl+C copies and clears a non-mac terminal selection, then passes through without one', () => {
   const event = keyEvent({ ctrlKey: true });
