@@ -21,6 +21,308 @@ test('binds browser extension UI in RPC mode', async () => {
   assert.equal(bindings?.mode, 'rpc');
 });
 
+test('shares pending browser extension binding and retries failed binding', async () => {
+  const bridge = new PiBridge();
+  let bindings = 0;
+  let finishBinding: () => void = () => undefined;
+  const session = {
+    bindExtensions: () => {
+      bindings += 1;
+      return new Promise<void>((resolve) => { finishBinding = resolve; });
+    },
+  };
+
+  const first = (bridge as any).bindWebExtensions(session, '/workspace', 'session-1', 'project-1:session-1');
+  const second = (bridge as any).bindWebExtensions(session, '/workspace', 'session-1', 'project-1:session-1');
+  assert.equal(bindings, 1);
+  finishBinding();
+  await Promise.all([first, second]);
+  await (bridge as any).bindWebExtensions(session, '/workspace', 'session-1', 'project-1:session-1');
+  assert.equal(bindings, 1);
+
+  let failedBindings = 0;
+  const failedSession = {
+    bindExtensions: async () => {
+      failedBindings += 1;
+      if (failedBindings === 1) throw new Error('binding failed');
+    },
+  };
+  await assert.rejects((bridge as any).bindWebExtensions(failedSession, '/workspace', 'session-2', 'project-1:session-2'), /binding failed/i);
+  await (bridge as any).bindWebExtensions(failedSession, '/workspace', 'session-2', 'project-1:session-2');
+  assert.equal(failedBindings, 2);
+});
+
+test('reloads the bound SDK session and refreshes runtime-backed commands', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'reload-runtime-session';
+  const events: Array<{ type?: string; message?: string; data?: { running?: boolean } }> = [];
+  let bindings: Record<string, any> | undefined;
+  let reloaded = false;
+  const session = {
+    extensionRunner: {
+      getRegisteredCommands: () => [{ name: reloaded ? 'new-command' : 'old-command', description: 'Runtime command' }],
+      getCommand: () => undefined,
+    },
+    resourceLoader: { getSkills: () => ({ skills: [] }) },
+    bindExtensions: async (next: Record<string, any>) => { bindings = next; },
+    reload: async (options?: { beforeSessionStart?: () => void | Promise<void> }) => {
+      assert.equal(bindings?.mode, 'rpc');
+      await options?.beforeSessionStart?.();
+      reloaded = true;
+    },
+    dispose: () => undefined,
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  (bridge as any).broadcast = (_key: string | string[], event: { type?: string; message?: string; data?: { running?: boolean } }) => { events.push(event); };
+
+  const before = await bridge.commands(projectPath, sessionId);
+  assert.deepEqual(before.filter(({ source }) => source === 'builtin').map(({ name }) => name), ['compact', 'reload']);
+  assert.equal(before.some(({ name }) => name === 'old-command'), true);
+
+  assert.deepEqual(await bridge.reload(projectPath, { sessionId }, `project:${sessionId}`), { ok: true });
+
+  const after = await bridge.commands(projectPath, sessionId);
+  assert.equal(after.some(({ name }) => name === 'old-command'), false);
+  assert.equal(after.some(({ name }) => name === 'new-command'), true);
+  assert.equal(events.some(({ type, message }) => type === 'agent:notice' && /reloaded extensions/i.test(message ?? '')), true);
+  assert.equal(events.some(({ type, data }) => type === 'agent:status' && data?.running === false), true);
+  await bridge.dispose();
+});
+
+test('runtime reads wait for reload and observe the refreshed command set', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'read-during-reload-session';
+  let reloaded = false;
+  let finishReload: () => void = () => undefined;
+  let markReloadStarted: () => void = () => undefined;
+  const reloadStarted = new Promise<void>((resolve) => { markReloadStarted = resolve; });
+  const session = {
+    extensionRunner: {
+      getRegisteredCommands: () => [{ name: reloaded ? 'fresh-command' : 'stale-command' }],
+      getCommand: () => undefined,
+    },
+    resourceLoader: { getSkills: () => ({ skills: [] }) },
+    bindExtensions: async () => undefined,
+    reload: async (options?: { beforeSessionStart?: () => void | Promise<void> }) => {
+      await options?.beforeSessionStart?.();
+      markReloadStarted();
+      await new Promise<void>((resolve) => { finishReload = resolve; });
+      reloaded = true;
+    },
+    dispose: () => undefined,
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  (bridge as any).broadcast = () => undefined;
+
+  const reload = bridge.reload(projectPath, { sessionId }, `project:${sessionId}`);
+  await reloadStarted;
+  let commandsSettled = false;
+  const commands = bridge.commands(projectPath, sessionId).then((result) => {
+    commandsSettled = true;
+    return result;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(commandsSettled, false);
+
+  finishReload();
+  await reload;
+  assert.equal((await commands).some(({ name }) => name === 'fresh-command'), true);
+  await bridge.dispose();
+});
+
+test('reload times out behind a stalled runtime read without leaving the session gated', async () => {
+  const bridge = new PiBridge({ sessionCreateTimeoutMs: 5 });
+  const projectPath = process.cwd();
+  const sessionId = 'stalled-read-before-reload-session';
+  let releaseCompletion: () => void = () => undefined;
+  let markCompletionStarted: () => void = () => undefined;
+  const completionStarted = new Promise<void>((resolve) => { markCompletionStarted = resolve; });
+  let reloads = 0;
+  let bindings: Record<string, any> | undefined;
+  const session = {
+    extensionRunner: {
+      getCommand: () => ({
+        getArgumentCompletions: () => {
+          markCompletionStarted();
+          return new Promise<Array<{ value: string }>>((resolve) => {
+            releaseCompletion = () => resolve([{ value: 'done' }]);
+          });
+        },
+      }),
+    },
+    bindExtensions: async (next: Record<string, any>) => { bindings = next; },
+    reload: async () => { reloads += 1; },
+    dispose: () => undefined,
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  (bridge as any).broadcast = () => undefined;
+  await (bridge as any).bindWebExtensions(session, projectPath, sessionId, `project:${sessionId}`);
+
+  const completion = bridge.commandCompletions(projectPath, { sessionId, command: 'slow' });
+  await completionStarted;
+  await assert.rejects(bridge.reload(projectPath, { sessionId }, `project:${sessionId}`), /timed out waiting for session reads/i);
+  assert.equal(reloads, 0);
+  assert.equal((bridge as any).runtimeReloads.has(cacheKey), false);
+  await assert.rejects(bindings?.commandContextActions.reload(), /timed out waiting for session reads/i);
+  assert.equal((bridge as any).runtimeSessions.has(cacheKey), true);
+  assert.equal((bridge as any).runtimeRecoveries.has(cacheKey), false);
+
+  releaseCompletion();
+  assert.deepEqual(await completion, [{ value: 'done', label: undefined, description: undefined }]);
+  await bridge.dispose();
+});
+
+test('abort rejects while SDK reload is in progress', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'abort-during-reload-session';
+  let aborts = 0;
+  let reloads = 0;
+  let bindings: Record<string, any> | undefined;
+  let finishReload: () => void = () => undefined;
+  let markReloadStarted: () => void = () => undefined;
+  let finishAbort: () => void = () => undefined;
+  let markAbortStarted: () => void = () => undefined;
+  const reloadStarted = new Promise<void>((resolve) => { markReloadStarted = resolve; });
+  const abortStarted = new Promise<void>((resolve) => { markAbortStarted = resolve; });
+  let blockAbort = false;
+  const session = {
+    bindExtensions: async (next: Record<string, any>) => { bindings = next; },
+    reload: async () => {
+      reloads += 1;
+      markReloadStarted();
+      await new Promise<void>((resolve) => { finishReload = resolve; });
+    },
+    abort: async () => {
+      aborts += 1;
+      if (blockAbort) {
+        markAbortStarted();
+        await new Promise<void>((resolve) => { finishAbort = resolve; });
+      }
+    },
+    dispose: () => undefined,
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  (bridge as any).broadcast = () => undefined;
+
+  const reload = bridge.reload(projectPath, { sessionId }, `project:${sessionId}`);
+  await reloadStarted;
+  await assert.rejects(bridge.abort(projectPath, sessionId), /reloading/i);
+  assert.equal(aborts, 0);
+
+  finishReload();
+  await reload;
+  assert.equal(reloads, 1);
+
+  blockAbort = true;
+  const abort = bridge.abort(projectPath, sessionId);
+  await abortStarted;
+  await assert.rejects(bindings?.commandContextActions.reload(), /stopping/i);
+  assert.equal(reloads, 1);
+  finishAbort();
+  await abort;
+  await bridge.dispose();
+});
+
+test('a timed out SDK reload retires the runtime but defers disposal until reload settles', async () => {
+  const bridge = new PiBridge({ sessionCreateTimeoutMs: 5 });
+  const projectPath = process.cwd();
+  const sessionId = 'timed-out-sdk-reload-session';
+  let disposed = 0;
+  let bindings: Record<string, any> | undefined;
+  let finishReload: () => void = () => undefined;
+  const session = {
+    bindExtensions: async (next: Record<string, any>) => { bindings = next; },
+    reload: () => new Promise<void>((resolve) => { finishReload = resolve; }),
+    dispose: () => { disposed += 1; },
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  (bridge as any).broadcast = () => undefined;
+
+  await assert.rejects(bridge.reload(projectPath, { sessionId }, `project:${sessionId}`), /reload timed out/i);
+  assert.equal((bridge as any).runtimeSessions.has(cacheKey), false);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(disposed, 0);
+  await assert.rejects(bindings?.commandContextActions.reload(), /runtime changed while reloading/i);
+
+  finishReload();
+  await bridge.dispose();
+  assert.equal(disposed, 1);
+});
+
+test('a failed SDK reload retires the tainted cached runtime', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'failed-reload-runtime-session';
+  const session = {
+    bindExtensions: async () => undefined,
+    reload: async () => { throw new Error('broken extension'); },
+    dispose: () => undefined,
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  (bridge as any).broadcast = () => undefined;
+
+  await assert.rejects(bridge.reload(projectPath, { sessionId }, `project:${sessionId}`), /broken extension/i);
+  assert.equal((bridge as any).runtimeSessions.has(cacheKey), false);
+  assert.match((bridge as any).runtimeRecoveries.get(cacheKey)?.message ?? '', /broken extension/i);
+  await bridge.dispose();
+});
+
+test('extension context reload failures publish an error and resource invalidation', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'extension-context-reload-failure-session';
+  const events: Array<{ type?: string; message?: string }> = [];
+  let bindings: Record<string, any> | undefined;
+  const session = {
+    bindExtensions: async (next: Record<string, any>) => { bindings = next; },
+    reload: async () => { throw new Error('extension reload failed'); },
+    dispose: () => undefined,
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  await (bridge as any).getSession(projectPath, sessionId);
+  (bridge as any).broadcast = (_key: string | string[], event: { type?: string; message?: string }) => { events.push(event); };
+  await (bridge as any).bindWebExtensions(session, projectPath, sessionId, `project:${sessionId}`);
+
+  await assert.rejects(bindings?.commandContextActions.reload(), /extension reload failed/i);
+  assert.equal(events.some(({ type }) => type === 'agent:resources-reload-failed'), true);
+  assert.equal(events.some(({ type, message }) => type === 'agent:error' && /extension reload failed/i.test(message ?? '')), true);
+  assert.equal((bridge as any).runtimeSessions.has(cacheKey), false);
+  await bridge.dispose();
+});
+
+test('rejects reload while the session is active', async () => {
+  const bridge = new PiBridge();
+  const projectPath = process.cwd();
+  const sessionId = 'busy-reload-runtime-session';
+  let reloads = 0;
+  const session = {
+    reload: async () => { reloads += 1; },
+    dispose: () => undefined,
+  };
+  const cacheKey = (bridge as any).runtimeSessionCacheKey(projectPath, sessionId);
+  (bridge as any).setCachedSession((bridge as any).runtimeSessions, projectPath, cacheKey, Promise.resolve(session));
+  (bridge as any).broadcast = () => undefined;
+  const release = await (bridge as any).markSessionActive(projectPath, sessionId);
+
+  try {
+    await assert.rejects(bridge.reload(projectPath, { sessionId }, `project:${sessionId}`), /already processing/i);
+    assert.equal(reloads, 0);
+  } finally {
+    release();
+    await bridge.dispose();
+  }
+});
+
 test('emits extension shutdown before disposing a cached SDK session', async () => {
   const bridge = new PiBridge();
   const lifecycle: string[] = [];

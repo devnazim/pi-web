@@ -452,6 +452,20 @@ const queryClient = new QueryClient({
     },
   },
 });
+
+async function refreshReloadedRuntimeQueries(projectId: string, sessionId: string) {
+  await Promise.all([
+    queryClient.resetQueries({ queryKey: ['commands', projectId, sessionId], exact: true }),
+    queryClient.resetQueries({ queryKey: ['command-completions', projectId, sessionId] }),
+    queryClient.invalidateQueries({ queryKey: ['agents', projectId, sessionId] }),
+    queryClient.invalidateQueries({ queryKey: ['models', projectId] }),
+    queryClient.invalidateQueries({ queryKey: ['settings', projectId] }),
+    queryClient.invalidateQueries({ queryKey: ['session', projectId, sessionId] }),
+    queryClient.invalidateQueries({ queryKey: ['sessions', projectId] }),
+    queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, sessionId] }),
+  ]);
+}
+
 const TerminalPanel = lazy(() => import('./TerminalPanel'));
 const PROJECT_RAIL_WIDTH = 72;
 const SESSION_SIDEBAR_DEFAULT_WIDTH = 276;
@@ -1510,6 +1524,10 @@ function Shell() {
   function handleWorkspaceNotificationEvent(workspaceId: string, event: WorkspaceNotificationServerEvent) {
     const workspace = workspaceLookup()[workspaceId];
     const sessionId = event.sessionId;
+    if ((event.type === 'agent:resources-reloaded' || event.type === 'agent:resources-reload-failed') && sessionId) {
+      void refreshReloadedRuntimeQueries(workspaceId, sessionId)
+        .catch((error) => console.warn('Could not refresh reloaded Pi resources', error));
+    }
     const read = isWorkspaceNotificationViewed(workspaceId, sessionId);
     const runningSessionId = sessionId ?? 'active';
     const idleStatusEvent = event.type === 'agent:status'
@@ -2038,6 +2056,10 @@ function Shell() {
           return;
         }
         const eventSessionId = parsed.sessionId ?? currentRuntimeSessionId;
+        if ((parsed.type === 'agent:resources-reloaded' || parsed.type === 'agent:resources-reload-failed') && eventSessionId) {
+          void refreshReloadedRuntimeQueries(project.id, eventSessionId)
+            .catch((error) => console.warn('Could not refresh reloaded Pi resources', error));
+        }
         if (customUiEvent) {
           const data = parsed.data && typeof parsed.data === 'object' ? parsed.data as Record<string, unknown> : undefined;
           const id = typeof data?.id === 'string' ? data.id : undefined;
@@ -5922,7 +5944,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     if (!busy()) return !composerSubmissionPending();
     const commandName = composerSlashCommandName(prompt);
     const extensionCommand = commandName ? slashCommands.data?.commands.find((command) => command.name === commandName)?.source === 'extension' : false;
-    return canSteerAgent() && !composerSubmission()?.steering && !extensionCommand && !parseShellComposerCommand(prompt) && parseCompactComposerCommand(prompt) === undefined;
+    return prompt !== '/reload' && canSteerAgent() && !composerSubmission()?.steering && !extensionCommand && !parseShellComposerCommand(prompt) && parseCompactComposerCommand(prompt) === undefined;
   });
   const showEmptySessionPrompt = createMemo(() => Boolean(props.sessionId && !session.isLoading && !session.error && visibleTranscriptEntries().length === 0 && !busy() && !pendingUserMessageVisible()));
   const centerTranscript = createMemo(() => (!props.sessionId && !pendingUserMessageVisible()) || showEmptySessionPrompt());
@@ -7103,6 +7125,18 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     await queryClient.invalidateQueries({ queryKey: ['agent-status', projectId, sessionId] });
   }
 
+  async function reloadSession(projectId: string, sessionId: string, mirrorActiveStream: boolean) {
+    try {
+      await api(`/api/projects/${projectId}/agent/reload`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, mirrorActiveStream }),
+      });
+    } finally {
+      await refreshReloadedRuntimeQueries(projectId, sessionId);
+    }
+  }
+
   async function executeShellCommand(projectId: string, sessionId: string, command: { command: string; excludeFromContext: boolean }, mirrorActiveStream: boolean, reflectActivity: () => boolean) {
     const token = Symbol('running-command');
     if (reflectActivity()) {
@@ -7361,8 +7395,9 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     const uploadAssets = composerUploadAssets(uploads());
     const shellCommand = parseShellComposerCommand(prompt);
     const compactCommand = parseCompactComposerCommand(prompt);
+    const reloadCommand = prompt === '/reload';
     const agentCommand = parseAgentComposerCommand(prompt);
-    const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined && !agentCommand;
+    const steeringSubmit = busy() && canSteerAgent() && !shellCommand && compactCommand === undefined && !reloadCommand && !agentCommand;
     const projectId = props.project.id;
     const routeSessionId = props.sessionId;
     const submittedNavigationRevision = props.sessionNavigationRevision;
@@ -7437,7 +7472,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     if (Object.keys(submittedControls).length) writeSessionComposerControls(projectId, submittedSessionId, submittedControls);
     let extensionCommand = false;
     let extensionMessageEntryIds = new Set<string>();
-    if (!shellCommand && compactCommand === undefined) {
+    if (!shellCommand && compactCommand === undefined && !reloadCommand) {
       try {
         extensionCommand = await isExtensionComposerCommand(projectId, submittedSessionId, prompt);
         if (extensionCommand) {
@@ -7516,6 +7551,12 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
           props.onTreeSelection(undefined);
           scrollTranscriptToBottom(true);
         }
+        return;
+      }
+      if (reloadCommand) {
+        addComposerHistory({ text: prompt, uploads: [] }, 'normal', projectId);
+        await reloadSession(projectId, submittedSessionId, mirrorActiveStream);
+        if (submittedComposerStillActive()) props.onTreeSelection(undefined);
         return;
       }
       const fileReferenceAssets = await resolveComposerFileReferenceAssets(projectId, prompt);

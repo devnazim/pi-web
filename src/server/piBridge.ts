@@ -65,6 +65,11 @@ interface CompactBody {
   mirrorActiveStream?: boolean;
 }
 
+interface ReloadBody {
+  sessionId?: string;
+  mirrorActiveStream?: boolean;
+}
+
 interface CommandCompletionQuery {
   sessionId?: string;
   command?: string;
@@ -174,6 +179,7 @@ type CachedSession = {
   retired?: boolean;
 };
 type RuntimeSessionLock = { release: () => void; wasActive: boolean };
+type RuntimeReloadGate = { promise: Promise<void>; finish: () => void };
 type RuntimeOperation = { session?: object; recover: (message: string) => boolean };
 type RuntimeWatchOptions = {
   session: object;
@@ -208,7 +214,7 @@ class AgentRuntimeRecoveryError extends Error {
   }
 }
 
-const WEB_BUILTIN_COMMAND_NAMES = new Set(['compact']);
+const WEB_BUILTIN_COMMAND_NAMES = new Set(['compact', 'reload']);
 const PI_WEB_AGENT_SELECTABLE_COMMAND_NAMES = new Set(['pi-web-review', 'pi-web-notes']);
 const AGENT_ALREADY_PROCESSING_MESSAGE = "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
 const AGENT_RUNTIME_RECOVERY_MESSAGE = 'Agent stopped responding or crashed. Its session runtime was reset. You can retry or continue.';
@@ -242,8 +248,10 @@ export class PiBridge {
   private readonly runtimeSessionEntries = new WeakMap<object, CachedSession>();
   private readonly recoveringSessions = new WeakSet<object>();
   private readonly sessionDisposals = new WeakMap<object, Promise<void>>();
+  private readonly sessionReloadTasks = new WeakMap<object, Promise<void>>();
   private readonly extensionShutdownSessions = new WeakSet<object>();
   private readonly boundSessions = new WeakSet<object>();
+  private readonly sessionBindingPromises = new WeakMap<object, Promise<void>>();
   private readonly sessionStreamKeys = new WeakMap<object, string | string[]>();
   private readonly sessionOperationIds = new WeakMap<object, string>();
   private readonly sessionStreamKeyLocks = new WeakMap<object, StreamKeyLock>();
@@ -268,6 +276,7 @@ export class PiBridge {
   private readonly deferredRuntimeDisposals = new Set<Promise<void>>();
   private readonly failedProjectDisposals = new Map<string, { projectPath: string; projectKey: string; projectLexicalKey: string; sessions: Set<unknown> }>();
   private readonly abortingRuntimeSessions = new Set<string>();
+  private readonly runtimeReloads = new Map<string, RuntimeReloadGate>();
   private readonly deletingRuntimeSessions = new Set<string>();
   private readonly deletingRuntimeSessionFiles = new Set<string>();
   private readonly runtimeSettledGraceMs: number;
@@ -418,7 +427,7 @@ export class PiBridge {
   private async isSessionInUse(projectPath: string, sessionId: string, filePath: string | undefined, includeLeases: boolean) {
     const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, filePath);
     for (const key of keys) {
-      if (this.activeRuntimeSessions.has(key) || (includeLeases && this.leasedRuntimeSessions.has(key))) return true;
+      if (this.runtimeReloads.has(key) || this.activeRuntimeSessions.has(key) || (includeLeases && this.leasedRuntimeSessions.has(key))) return true;
     }
     for (const key of keys) {
       const cached = this.runtimeSessions.get(key);
@@ -438,7 +447,7 @@ export class PiBridge {
   async lockSessionDeletion(projectPath: string, sessionId: string, filePath?: string) {
     const keys = this.runtimeSessionCacheKeys(projectPath, sessionId, filePath);
     const fileKey = filePath ? path.resolve(filePath) : undefined;
-    if ([...keys].some((key) => this.deletingRuntimeSessions.has(key)) || (fileKey && this.deletingRuntimeSessionFiles.has(fileKey))) return undefined;
+    if ([...keys].some((key) => this.runtimeReloads.has(key) || this.deletingRuntimeSessions.has(key)) || (fileKey && this.deletingRuntimeSessionFiles.has(fileKey))) return undefined;
     for (const key of keys) this.deletingRuntimeSessions.add(key);
     if (fileKey) this.deletingRuntimeSessionFiles.add(fileKey);
 
@@ -463,7 +472,14 @@ export class PiBridge {
   }
 
   async lockSessionMutation(projectPath: string, sessionId: string, filePath?: string) {
-    return this.lockRuntimeSession(projectPath, sessionId, filePath, false, true);
+    const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    if (this.runtimeReloads.has(cacheKey)) return undefined;
+    const release = await this.lockRuntimeSession(projectPath, sessionId, filePath, false, true);
+    if (this.runtimeReloads.has(cacheKey)) {
+      release?.();
+      return undefined;
+    }
+    return release;
   }
 
   async disposeSession(projectPath: string, sessionId: string, filePath?: string) {
@@ -1111,6 +1127,61 @@ export class PiBridge {
     }
   }
 
+  async reload(projectPath: string, body: ReloadBody, key: string | string[], options: { operationId?: string } = {}) {
+    if (!body.sessionId) throw new Error('Missing session');
+    const operationId = options.operationId ?? randomUUID();
+    const cacheKey = this.runtimeSessionCacheKey(projectPath, body.sessionId);
+    if (this.runtimeReloads.has(cacheKey)) throw new Error('Session runtime is already reloading.');
+    if (this.abortingRuntimeSessions.has(cacheKey)) throw new Error('Session is stopping. Wait for abort to finish.');
+    const reloadGate = this.startRuntimeReload(cacheKey);
+    if (!reloadGate) throw new Error('Session runtime is already reloading.');
+    let markSessionIdle: () => void = () => undefined;
+    let releaseStreamKeyLock: (() => void) | undefined;
+    let runtimeSession: object | undefined;
+    let setupSupervisor: RuntimeSetupSupervisor | undefined;
+    try {
+      await this.waitForRuntimeSessionReads(cacheKey);
+      const sessionLock = await this.lockRuntimeSessionWithState(projectPath, body.sessionId);
+      if (!sessionLock) throw new Error('Session is being deleted.');
+      markSessionIdle = sessionLock.release;
+      if (sessionLock.wasActive || this.abortingRuntimeSessions.has(cacheKey)) throw new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
+      setupSupervisor = this.superviseRuntimeSetup(projectPath, body.sessionId);
+      const session = await setupSupervisor.wait(this.getSession(projectPath, body.sessionId));
+      if (session && typeof session === 'object') {
+        runtimeSession = session;
+        setupSupervisor.operation.session = session;
+      }
+      if (this.cachedSessionInUse(session)) throw new Error(AGENT_ALREADY_PROCESSING_MESSAGE);
+      releaseStreamKeyLock = this.lockSessionStreamKeys(session, key);
+      this.clearRuntimeRecovery(projectPath, body.sessionId);
+      if (runtimeSession) this.sessionOperationIds.set(runtimeSession, operationId);
+      await setupSupervisor.wait(this.bindWebExtensions(session, projectPath, body.sessionId, key));
+      await setupSupervisor.wait(this.reloadBoundSession(session, projectPath, body.sessionId, true));
+      this.broadcast(key, {
+        type: 'agent:notice',
+        operationId,
+        sessionId: body.sessionId,
+        message: 'Reloaded extensions, skills, prompts, themes, settings, and context files.',
+        data: { level: 'info' },
+      });
+      this.broadcast(key, { type: 'agent:status', operationId, sessionId: body.sessionId, data: { running: false, statuses: this.statusEntries(session) } });
+      return { ok: true };
+    } catch (error) {
+      if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
+      const message = error instanceof Error ? error.message : 'Reload failed';
+      this.broadcast(key, isAgentAlreadyProcessingMessage(message) || /already reloading/i.test(message)
+        ? { type: 'agent:notice', operationId, sessionId: body.sessionId, message, data: { level: 'warning' } }
+        : { type: 'agent:error', operationId, sessionId: body.sessionId, message });
+      throw error;
+    } finally {
+      setupSupervisor?.release();
+      if (runtimeSession && this.sessionOperationIds.get(runtimeSession) === operationId) this.sessionOperationIds.delete(runtimeSession);
+      releaseStreamKeyLock?.();
+      markSessionIdle();
+      this.finishRuntimeReload(cacheKey, reloadGate);
+    }
+  }
+
   async compact(projectPath: string, body: CompactBody, key: string | string[], options: { operationId?: string } = {}) {
     if (!body.sessionId) throw new Error('Missing session');
     const operationId = options.operationId ?? randomUUID();
@@ -1252,6 +1323,7 @@ export class PiBridge {
 
   async abort(projectPath: string, sessionId?: string, key?: string | string[]) {
     const operationKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    if (this.runtimeReloads.has(operationKey)) throw new Error('Session runtime is reloading. Wait for reload to finish.');
     if (this.abortingRuntimeSessions.has(operationKey)) return;
     const hadActiveLock = this.activeRuntimeSessions.has(operationKey);
     const operationsAtAbort = new Set(this.runtimeOperations.get(operationKey) ?? []);
@@ -1536,6 +1608,7 @@ export class PiBridge {
 
   private recoverPendingRuntimeSession(projectPath: string, sessionId: string | undefined, message: string) {
     const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    this.finishRuntimeReload(cacheKey);
     this.runtimeRecoveries.set(cacheKey, { id: randomUUID(), message, at: Date.now() });
     const cached = this.runtimeSessions.get(cacheKey);
     if (cached && this.runtimeSessions.get(cacheKey) === cached) {
@@ -1548,6 +1621,7 @@ export class PiBridge {
 
   private recoverRuntimeSession(projectPath: string, sessionId: string | undefined, session: object, message: string) {
     const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    this.finishRuntimeReload(cacheKey);
     if (this.recoveringSessions.has(session)) return this.runtimeRecoveries.has(cacheKey);
     this.recoveringSessions.add(session);
 
@@ -1640,13 +1714,71 @@ export class PiBridge {
     this.extensionErrorCounts.set(session, this.extensionErrorCount(session) + 1);
   }
 
+  private async reloadBoundSession(session: any, projectPath: string, sessionId: string | undefined, coordinated = false) {
+    if (typeof session?.reload !== 'function') throw new Error('Loaded pi SDK session does not expose reload()');
+    if (session && typeof session === 'object' && (this.sessionCannotPublish(session) || this.sessionReloadTasks.has(session))) throw new Error('Session runtime changed while reloading. Retry with the current runtime.');
+    const cacheKey = sessionId ? this.runtimeSessionCacheKey(projectPath, sessionId) : undefined;
+    if (cacheKey && !coordinated && this.abortingRuntimeSessions.has(cacheKey)) throw new Error('Session is stopping. Wait for abort to finish.');
+    const reloadGate = cacheKey && !coordinated ? this.startRuntimeReload(cacheKey) : undefined;
+    if (cacheKey && !coordinated && !reloadGate) throw new Error('Session runtime is already reloading.');
+    let reloadStarted = false;
+    try {
+      if (cacheKey && reloadGate) await this.waitForRuntimeSessionReads(cacheKey);
+      if (session && typeof session === 'object' && (this.sessionCannotPublish(session) || this.sessionReloadTasks.has(session))) throw new Error('Session runtime changed while reloading. Retry with the current runtime.');
+      if (cacheKey && !coordinated && this.abortingRuntimeSessions.has(cacheKey)) throw new Error('Session is stopping. Wait for abort to finish.');
+      reloadStarted = true;
+      let timer: NodeJS.Timeout | undefined;
+      const reloadTask = Promise.resolve(session.reload({
+        beforeSessionStart: () => {
+          this.cancelExtensionUiRequests(projectPath, sessionId, { allWhenSessionMissing: false, session });
+          this.extensionStatuses.delete(session);
+        },
+      })).finally(() => {
+        if (this.sessionReloadTasks.get(session) === reloadTask) this.sessionReloadTasks.delete(session);
+      });
+      this.sessionReloadTasks.set(session, reloadTask);
+      const timeoutMs = this.sessionCreateTimeoutMs > 0 ? this.sessionCreateTimeoutMs : SESSION_CREATE_TIMEOUT_MS;
+      try {
+        await Promise.race([
+          reloadTask,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('Agent runtime reload timed out. Retry to start a fresh runtime.')), timeoutMs);
+            timer.unref();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      this.broadcast(this.sessionStreamKeys.get(session) ?? [], {
+        type: 'agent:resources-reloaded',
+        operationId: this.sessionOperationIds.get(session),
+        sessionId,
+      });
+    } catch (error) {
+      if (!reloadStarted) throw error;
+      const message = error instanceof Error ? error.message : 'Reload failed';
+      const report = sessionId && session && typeof session === 'object'
+        ? this.recoverRuntimeSession(projectPath, sessionId, session, message)
+        : true;
+      if (report) {
+        const key = this.sessionStreamKeys.get(session) ?? [];
+        this.broadcast(key, { type: 'agent:resources-reload-failed', operationId: this.sessionOperationIds.get(session), sessionId });
+        this.broadcast(key, { type: 'agent:error', operationId: this.sessionOperationIds.get(session), sessionId, message });
+      }
+      throw new AgentRuntimeRecoveryError(message, false);
+    } finally {
+      if (cacheKey && reloadGate) this.finishRuntimeReload(cacheKey, reloadGate);
+    }
+  }
+
   private async bindWebExtensions(session: any, projectPath: string, sessionId: string | undefined, key: string | string[]) {
     if (!session || typeof session !== 'object') return;
     this.bindSessionStreamKeys(session, key);
     this.wrapExtensionAsyncSessionMethods(session);
     if (this.boundSessions.has(session) || typeof session.bindExtensions !== 'function') return;
-    this.boundSessions.add(session);
-    await session.bindExtensions({
+    const pendingBinding = this.sessionBindingPromises.get(session);
+    if (pendingBinding) return pendingBinding;
+    const binding = Promise.resolve(session.bindExtensions({
       uiContext: this.webUiContext(session, projectPath, sessionId),
       mode: 'rpc',
       abortHandler: () => {
@@ -1666,9 +1798,7 @@ export class PiBridge {
           return { cancelled: Boolean(result?.cancelled) };
         },
         switchSession: async () => ({ cancelled: true }),
-        reload: async () => {
-          if (typeof session?.reload === 'function') await session.reload();
-        },
+        reload: () => this.reloadBoundSession(session, projectPath, sessionId),
       },
       onError: (error: { extensionPath?: string; event?: string; error?: string }) => {
         if (this.sessionCannotPublish(session)) return;
@@ -1680,7 +1810,14 @@ export class PiBridge {
           message: [error.extensionPath, error.event, error.error].filter(Boolean).join(': ') || 'Extension failed',
         });
       },
-    });
+    })).then(() => undefined);
+    this.sessionBindingPromises.set(session, binding);
+    try {
+      await binding;
+      this.boundSessions.add(session);
+    } finally {
+      if (this.sessionBindingPromises.get(session) === binding) this.sessionBindingPromises.delete(session);
+    }
   }
 
   private createExtensionUiRequest<T>(session: object, projectPath: string, sessionId: string | undefined, request: Omit<ExtensionUiRequest, 'id' | 'sessionId' | 'createdAt'>, opts: { signal?: AbortSignal; timeout?: number } | undefined, defaultValue: T, parseResponse: (response: ExtensionUiResponse) => T) {
@@ -2219,12 +2356,19 @@ export class PiBridge {
 
   private builtinCommands(includeSessionCommands: boolean): CommandInfo[] {
     return includeSessionCommands
-      ? [{
-        name: 'compact',
-        description: 'Manually compact the session context',
-        source: 'builtin',
-        argumentHint: 'custom instructions',
-      }]
+      ? [
+        {
+          name: 'compact',
+          description: 'Manually compact the session context',
+          source: 'builtin',
+          argumentHint: 'custom instructions',
+        },
+        {
+          name: 'reload',
+          description: 'Reload extensions, skills, prompts, themes, settings, and context files',
+          source: 'builtin',
+        },
+      ]
       : [];
   }
 
@@ -2631,8 +2775,18 @@ export class PiBridge {
     if (this.closing) throw new Error('pi-web is shutting down.');
     const cacheKey = this.runtimeSessionCacheKey(projectPath, sessionId);
     const task = (async () => {
-      const release = await this.lockRuntimeSession(projectPath, sessionId, undefined, false);
-      if (!release) throw new Error('Session is being deleted.');
+      let release: (() => void) | undefined;
+      while (!release) {
+        await this.runtimeReloads.get(cacheKey)?.promise;
+        release = await this.lockRuntimeSession(projectPath, sessionId, undefined, false);
+        if (!release) throw new Error('Session is being deleted.');
+        const reload = this.runtimeReloads.get(cacheKey);
+        if (reload) {
+          release();
+          release = undefined;
+          await reload.promise;
+        }
+      }
       this.runtimeReadLeases.set(cacheKey, (this.runtimeReadLeases.get(cacheKey) ?? 0) + 1);
       try {
         if (this.closing) throw new Error('pi-web is shutting down.');
@@ -2657,6 +2811,52 @@ export class PiBridge {
       return await task;
     } finally {
       this.runtimeReadTasks.delete(task);
+    }
+  }
+
+  private startRuntimeReload(cacheKey: string): RuntimeReloadGate | undefined {
+    if (this.runtimeReloads.has(cacheKey)) return undefined;
+    let finish: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => { finish = resolve; });
+    const gate = { promise, finish };
+    this.runtimeReloads.set(cacheKey, gate);
+    return gate;
+  }
+
+  private finishRuntimeReload(cacheKey: string, gate = this.runtimeReloads.get(cacheKey)) {
+    if (!gate) return;
+    if (this.runtimeReloads.get(cacheKey) === gate) this.runtimeReloads.delete(cacheKey);
+    gate.finish();
+  }
+
+  private async waitForRuntimeSessionReads(cacheKey: string) {
+    if (!this.runtimeReadLeases.has(cacheKey)) return;
+    let timer: NodeJS.Timeout | undefined;
+    let finishWait: () => void = () => undefined;
+    const readsFinished = new Promise<void>((resolve) => {
+      finishWait = resolve;
+      const waiters = this.runtimeReadLeaseWaiters.get(cacheKey) ?? new Set<() => void>();
+      waiters.add(resolve);
+      this.runtimeReadLeaseWaiters.set(cacheKey, waiters);
+      if (!this.runtimeReadLeases.has(cacheKey) && waiters.delete(resolve)) {
+        if (!waiters.size) this.runtimeReadLeaseWaiters.delete(cacheKey);
+        resolve();
+      }
+    });
+    const timeoutMs = this.sessionCreateTimeoutMs > 0 ? this.sessionCreateTimeoutMs : SESSION_CREATE_TIMEOUT_MS;
+    try {
+      await Promise.race([
+        readsFinished,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('Timed out waiting for session reads before reload.')), timeoutMs);
+          timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      const waiters = this.runtimeReadLeaseWaiters.get(cacheKey);
+      waiters?.delete(finishWait);
+      if (waiters && !waiters.size) this.runtimeReadLeaseWaiters.delete(cacheKey);
     }
   }
 
@@ -2772,11 +2972,16 @@ export class PiBridge {
   private async markSessionActiveWithState(projectPath: string, sessionId?: string): Promise<RuntimeSessionLock> {
     if (this.closing) throw new Error('pi-web is shutting down.');
     const operationKey = this.runtimeSessionCacheKey(projectPath, sessionId);
+    if (this.runtimeReloads.has(operationKey)) throw new Error('Session runtime is reloading. Wait for reload to finish.');
     if (this.abortingRuntimeSessions.has(operationKey)) throw new Error('Session is stopping. Wait for abort to finish.');
     if (!sessionId) return { release: () => undefined, wasActive: false };
     const lock = await this.lockRuntimeSessionWithState(projectPath, sessionId);
     if (!lock) throw new Error('Session is being deleted.');
-    if (this.abortingRuntimeSessions.has(this.runtimeSessionCacheKey(projectPath, sessionId))) {
+    if (this.runtimeReloads.has(operationKey)) {
+      lock.release();
+      throw new Error('Session runtime is reloading. Wait for reload to finish.');
+    }
+    if (this.abortingRuntimeSessions.has(operationKey)) {
       lock.release();
       throw new Error('Session is stopping. Wait for abort to finish.');
     }
@@ -2949,6 +3154,7 @@ export class PiBridge {
 
   private async disposeCachedSession(session: unknown) {
     if (!session || typeof session !== 'object') return;
+    await this.sessionReloadTasks.get(session)?.catch(() => undefined);
     const existing = this.sessionDisposals.get(session);
     if (existing) return existing;
     const disposable = session as {
@@ -3260,6 +3466,21 @@ export async function registerPiRoutes(
     }
   });
 
+  app.post<{ Params: { projectId: string }; Body: ReloadBody }>('/api/projects/:projectId/agent/reload', async (request, reply) => {
+    if (!request.body?.sessionId) return reply.code(400).send({ error: 'Missing session' });
+    try {
+      const project = registry.get(request.params.projectId);
+      const key = streamKey(project.id, request.body.sessionId);
+      const streamTarget = request.body.mirrorActiveStream
+        ? [key, streamKey(project.id, undefined)]
+        : key;
+      return await bridge.reload(project.path, request.body, streamTarget);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Reload failed';
+      return reply.code(isAgentAlreadyProcessingMessage(message) || /already reloading/i.test(message) ? 409 : 400).send({ error: message });
+    }
+  });
+
   app.post<{ Params: { projectId: string }; Body: CompactBody }>('/api/projects/:projectId/agent/compact', async (request, reply) => {
     if (!request.body?.sessionId) return reply.code(400).send({ error: 'Missing session' });
     try {
@@ -3515,7 +3736,7 @@ function projectIdFromStreamKey(key: string) {
 
 function isWorkspaceNotificationEvent(event: AgentEvent) {
   if (event.type === 'agent:status') return Boolean(event.data && typeof event.data === 'object' && (event.data as { running?: unknown }).running === false);
-  if (['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'agent:ui-request', 'bash:start', 'bash:finish', 'bash:error', 'error'].includes(event.type)) return true;
+  if (['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'agent:resources-reloaded', 'agent:resources-reload-failed', 'agent:ui-request', 'bash:start', 'bash:finish', 'bash:error', 'error'].includes(event.type)) return true;
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return false;
   const type = (event.data as { type?: unknown }).type;
   if (typeof type !== 'string') return false;
