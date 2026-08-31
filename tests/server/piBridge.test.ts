@@ -21,6 +21,27 @@ test('binds browser extension UI in RPC mode', async () => {
   assert.equal(bindings?.mode, 'rpc');
 });
 
+test('extension waitForIdle waits for the full SDK session with an older-SDK fallback', async () => {
+  const bridge = new PiBridge();
+  let bindings: Record<string, any> | undefined;
+  let sessionWaits = 0;
+  let agentWaits = 0;
+  const session = {
+    waitForIdle: async () => { sessionWaits += 1; },
+    agent: { waitForIdle: async () => { agentWaits += 1; } },
+    bindExtensions: async (next: Record<string, any>) => { bindings = next; },
+  };
+
+  await (bridge as any).bindWebExtensions(session, '/workspace', 'session-1', 'project-1:session-1');
+  await bindings?.commandContextActions.waitForIdle();
+  assert.equal(sessionWaits, 1);
+  assert.equal(agentWaits, 0);
+
+  delete (session as { waitForIdle?: () => Promise<void> }).waitForIdle;
+  await bindings?.commandContextActions.waitForIdle();
+  assert.equal(agentWaits, 1);
+});
+
 test('shares pending browser extension binding and retries failed binding', async () => {
   const bridge = new PiBridge();
   let bindings = 0;

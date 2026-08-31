@@ -1788,7 +1788,8 @@ export class PiBridge {
       },
       commandContextActions: {
         waitForIdle: async () => {
-          if (typeof session?.agent?.waitForIdle === 'function') await session.agent.waitForIdle();
+          if (typeof session?.waitForIdle === 'function') await session.waitForIdle();
+          else if (typeof session?.agent?.waitForIdle === 'function') await session.agent.waitForIdle();
         },
         newSession: async () => ({ cancelled: true }),
         fork: async () => ({ cancelled: true }),
