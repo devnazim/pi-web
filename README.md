@@ -37,6 +37,16 @@ To serve dev mode from a reverse-proxy subpath, pass `--base-path`:
 npm run dev -- --base-path /pi-web-development
 ```
 
+## Workspaces
+
+Enable workspaces from the project's options, then choose **New workspace**. Give it a display name, choose a branch name, and select the committed starting point. You can also select an existing local branch. If that branch already has a usable worktree, Pi Web opens it instead of creating another.
+
+Each workspace uses a Git worktree with its own working files and staging area. Git history is shared with the original repository. New worktrees do not copy uncommitted changes, ignored files, or dependencies from the original checkout.
+
+Use separate workspaces for features that agents should edit independently. Sessions within one workspace share its files. Switching workspaces changes the chat, file, review, and terminal context without stopping agents elsewhere. Worktrees do not isolate ports, databases, credentials, or other machine resources.
+
+Review and commit changes in their workspace, then merge or open a pull request through your usual Git workflow. Removing a workspace keeps its branch and commits. Existing deletion checks protect active workspaces and warn before removing local files.
+
 ## Logging
 
 `pi-web` defaults to quiet server logging: it prints the startup URLs plus warnings/errors, but not every HTTP/WebSocket request. Use `--log verbose` when you need request logs, `--log debug` for debug logs, or `--log silent` to disable Fastify logs entirely. The same setting is available as `PI_WEB_LOG`; `--quiet`, `--verbose`, `--debug`, and `--silent` are shorthands.

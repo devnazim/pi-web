@@ -104,6 +104,7 @@ import {
 } from './liveActivity';
 import { isDuplicateWorkspaceNotificationEvent, resetWorkspaceNotificationEventDeduplication, type WorkspaceNotificationServerEvent } from './workspaceNotifications';
 import { workspaceDeleteIdentityChanged, workspaceDeleteRequiresManualRecovery } from './workspaceDeletion';
+import { suggestWorkspaceBranch, workspaceCreationInput, type WorkspaceCreationInput, type WorkspaceCreationOptions } from './workspaceCreation';
 import { queryKeyTargetsWorkspace, reconcileWorkspaceSockets, WorkspaceSocketRegistry, withSuspendedWorkspaceSockets, type WorkspaceSocketCleanup } from './workspaceSockets';
 import { projectReviewAnchor, reviewSelectionLineRange, type ReviewLineRange } from './reviewSelection';
 import { buildReviewFileTree, type ReviewFileTreeNode } from './reviewFileTree';
@@ -861,6 +862,7 @@ function Shell() {
   const [chatSearchState, setChatSearchState] = createSignal<ChatSearchState>({ activeIndex: 0, total: 0 });
   const [fileSearchRequest, setFileSearchRequest] = createSignal(0);
   const [openProjectModal, setOpenProjectModal] = createSignal(false);
+  const [workspaceCreationTarget, setWorkspaceCreationTarget] = createSignal<{ project: Project; returnFocus?: HTMLElement }>();
   const [settingsOpen, setSettingsOpen] = createSignal(false);
   const [editingProject, setEditingProject] = createSignal<Project>();
   const [projectMenu, setProjectMenu] = createSignal<ProjectMenuState>();
@@ -2639,21 +2641,36 @@ function Shell() {
     }
   }
 
-  async function createWorkspace() {
+  createEffect(() => {
+    const target = workspaceCreationTarget();
+    if (target && target.project.id !== activeProject()?.id) setWorkspaceCreationTarget(undefined);
+  });
+
+  function createWorkspace() {
     const project = activeProject();
     if (!project) return;
-    if (requestFileWorkspaceLeave(() => void createWorkspace())) return;
-    try {
-      const { workspace } = await api<{ workspace: ProjectWorkspace }>(`/api/projects/${project.id}/workspaces`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({}),
-      });
-      await queryClient.invalidateQueries({ queryKey: ['workspaces', project.id] });
-      resetWorkspaceSelection(workspace.id);
-    } catch (error) {
-      setAppError({ title: 'Could not create workspace', description: errorMessage(error, 'Could not create workspace') });
-    }
+    if (requestFileWorkspaceLeave(createWorkspace)) return;
+    const returnFocus = mobileMenuOpen() ? document.querySelector<HTMLElement>('button[title="Menu"]') : document.activeElement;
+    setMobileMenuOpen(false);
+    setWorkspaceCreationTarget({ project, returnFocus: returnFocus instanceof HTMLElement ? returnFocus : undefined });
+  }
+
+  async function submitWorkspaceCreation(project: Project, input: WorkspaceCreationInput) {
+    const target = workspaceCreationTarget();
+    const { workspace } = await api<{ workspace: ProjectWorkspace }>(`/api/projects/${project.id}/workspaces`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    queryClient.setQueryData<{ workspaces: ProjectWorkspace[] }>(['workspaces', project.id], (current) => current ? {
+      workspaces: current.workspaces.some((item) => item.id === workspace.id)
+        ? current.workspaces.map((item) => item.id === workspace.id ? workspace : item)
+        : [...current.workspaces, workspace],
+    } : undefined);
+    void queryClient.invalidateQueries({ queryKey: ['workspaces', project.id] });
+    if (activeProject()?.id !== project.id || workspaceCreationTarget() !== target) return;
+    setWorkspaceCreationTarget(undefined);
+    resetWorkspaceSelection(workspace.id);
   }
 
   async function deleteWorkspace(workspace: ProjectWorkspace, options?: { force?: boolean }) {
@@ -2933,6 +2950,17 @@ function Shell() {
       </div>
       <Show when={openProjectModal()}>
         <OpenProjectModal projects={projects.data?.projects ?? []} onOpen={openProject} onClose={() => setOpenProjectModal(false)} />
+      </Show>
+      <Show when={workspaceCreationTarget()} keyed>
+        {(target) => (
+          <WorkspaceCreationDialog
+            project={target.project}
+            workspaces={projectWorkspaces()}
+            returnFocus={target.returnFocus}
+            onSubmit={(input) => submitWorkspaceCreation(target.project, input)}
+            onClose={() => setWorkspaceCreationTarget(undefined)}
+          />
+        )}
       </Show>
       <Show when={settingsOpen() && activeProject()}>
         {(project) => (
@@ -4360,6 +4388,134 @@ function WorkspaceSessionGroup(props: {
   );
 }
 
+function WorkspaceCreationDialog(props: {
+  project: Project;
+  workspaces: ProjectWorkspace[];
+  returnFocus?: HTMLElement;
+  onSubmit: (input: WorkspaceCreationInput) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [mode, setMode] = createSignal<'new' | 'existing'>('new');
+  const [name, setName] = createSignal('');
+  const [branchOverride, setBranchOverride] = createSignal<string>();
+  const [existingBranch, setExistingBranch] = createSignal('');
+  const [startPoint, setStartPoint] = createSignal('');
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal('');
+  let formRef: HTMLFormElement | undefined;
+  let nameRef: HTMLInputElement | undefined;
+  const options = createQuery(() => ({
+    queryKey: ['workspace-options', props.project.id],
+    queryFn: ({ signal }) => api<WorkspaceCreationOptions>(`/api/projects/${props.project.id}/workspace-options`, { signal }),
+    retry: false,
+    staleTime: 0,
+  }));
+  const branch = () => mode() === 'new' ? branchOverride() ?? suggestWorkspaceBranch(name()) : existingBranch();
+  const existingWorkspace = () => mode() === 'existing' ? props.workspaces.find((workspace) => workspace.branch === existingBranch()) : undefined;
+
+  createEffect(() => {
+    const data = options.data;
+    if (!data) return;
+    if (!startPoint()) setStartPoint(data.defaultStartPoint);
+    if (!existingBranch()) setExistingBranch(data.localBranches.includes(data.defaultStartPoint) ? data.defaultStartPoint : data.localBranches[0] ?? '');
+  });
+
+  onMount(() => {
+    nameRef?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        if (!busy()) props.onClose();
+      }
+      if (event.key !== 'Tab') return;
+      const selector = 'button:not(:disabled):not([tabindex="-1"]), input:not(:disabled), [tabindex="0"]';
+      const focusable = [...(formRef?.querySelectorAll<HTMLElement>(selector) ?? [])]
+        .filter((element) => element.getClientRects().length > 0);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first) { event.preventDefault(); formRef?.focus(); return; }
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      else if (!focusable.includes(document.activeElement as HTMLElement)) { event.preventDefault(); first.focus(); }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    onCleanup(() => window.removeEventListener('keydown', onKeyDown));
+  });
+  onCleanup(() => {
+    if (props.returnFocus?.isConnected) props.returnFocus.focus();
+  });
+
+  async function submit(event: SubmitEvent) {
+    event.preventDefault();
+    if (busy() || !options.data || options.isFetching || options.isError) return;
+    setError('');
+    try {
+      const input = workspaceCreationInput({ name: existingWorkspace() ? '' : name(), branch: branch(), startPoint: startPoint(), mode: mode() });
+      setBusy(true);
+      formRef?.focus();
+      await props.onSubmit(input);
+    } catch (error) {
+      setError(errorMessage(error, 'Could not create workspace'));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div class="confirm-modal-backdrop" onMouseDown={() => !busy() && props.onClose()}>
+      <form ref={formRef} class="confirm-modal max-h-[90dvh] overflow-y-auto" role="dialog" aria-modal="true" aria-labelledby="workspace-create-title" aria-describedby="workspace-create-description" aria-busy={busy()} tabIndex={-1} onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+        <h2 id="workspace-create-title" class="text-base font-medium leading-none">New workspace</h2>
+        <p id="workspace-create-description" class="mt-2 text-sm text-muted-foreground">Work on a separate branch of {props.project.name} using a Git worktree.</p>
+        <div class="mt-5 space-y-4">
+          <div class="flex gap-2" role="group" aria-label="Workspace branch mode">
+            <button type="button" class={mode() === 'new' ? 'button flex-1' : 'button-secondary flex-1'} aria-pressed={mode() === 'new'} disabled={busy()} onClick={() => { setMode('new'); setError(''); }}>New branch</button>
+            <button type="button" class={mode() === 'existing' ? 'button flex-1' : 'button-secondary flex-1'} aria-pressed={mode() === 'existing'} disabled={busy()} onClick={() => { setMode('existing'); setError(''); }}>Existing branch</button>
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium" for="workspace-create-name">Workspace name <Show when={mode() === 'existing'}><span class="font-normal text-muted-foreground">Optional</span></Show></label>
+            <input ref={nameRef} id="workspace-create-name" class="input w-full" placeholder="Authentication" maxLength={120} value={name()} disabled={busy() || Boolean(existingWorkspace())} required={mode() === 'new'} onInput={(event) => setName(event.currentTarget.value)} />
+          </div>
+          <Show when={options.isFetching}><p class="text-sm text-muted-foreground" role="status">Loading branches...</p></Show>
+          <Show when={options.isError}>
+            <div class="rounded-xl bg-destructive/10 p-3 text-sm text-destructive" role="alert">
+              <p>{errorMessage(options.error, 'Could not load branches')}</p>
+              <button type="button" class="button-secondary mt-2" disabled={options.isFetching || busy()} onClick={() => void options.refetch()}>Retry</button>
+            </div>
+          </Show>
+          <Show when={mode() === 'new'} fallback={(
+            <div class="space-y-1.5">
+              <div class="text-sm font-medium">Branch</div>
+              <UiSelect portalMount={formRef} ariaLabel="Existing branch" class="w-full" triggerClass="w-full" value={existingBranch()} options={(options.data?.localBranches ?? []).map((branch) => ({ value: branch, label: branch }))} onChange={setExistingBranch} disabled={busy() || options.isFetching || !options.data} placeholder="Choose a branch" searchable />
+              <Show when={options.data && !options.data.localBranches.length}><p class="text-sm text-muted-foreground">No local branches available.</p></Show>
+            </div>
+          )}>
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium" for="workspace-create-branch">Branch</label>
+              <input id="workspace-create-branch" class="input w-full font-mono" placeholder="feat/authentication" value={branch()} disabled={busy()} required onInput={(event) => setBranchOverride(event.currentTarget.value)} />
+              <Show when={branchOverride() !== undefined}><button type="button" class="text-xs text-muted-foreground underline" disabled={busy()} onClick={() => setBranchOverride(undefined)}>Use suggested branch name</button></Show>
+            </div>
+            <div class="space-y-1.5">
+              <div class="text-sm font-medium">Start from</div>
+              <UiSelect portalMount={formRef} ariaLabel="Start from" class="w-full" triggerClass="w-full" value={startPoint()} options={(options.data?.startPoints ?? []).map((branch) => ({ value: branch, label: branch }))} onChange={setStartPoint} disabled={busy() || options.isFetching || !options.data} placeholder="Choose a starting point" searchable />
+            </div>
+          </Show>
+          <Show when={existingWorkspace()} fallback={<p class="text-sm leading-6 text-muted-foreground">The worktree starts with committed code only. Uncommitted changes, ignored files, and installed dependencies are not copied.</p>}>
+            {(workspace) => <p class="break-words text-sm leading-6 text-muted-foreground">This branch is already open in {workspace().local ? 'Local workspace' : workspace().name}. Its files and sessions will be reused.</p>}
+          </Show>
+          <Show when={error()}><p class="rounded-xl bg-destructive/10 p-3 text-sm text-destructive" role="alert">{error()}</p></Show>
+        </div>
+        <div class="dialog-footer justify-end">
+          <button type="button" class="button-secondary" disabled={busy()} onClick={props.onClose}>Cancel</button>
+          <button type="submit" class="button" disabled={busy() || options.isFetching || options.isError || !options.data || !branch() || (mode() === 'new' && (!name().trim() || !startPoint()))}>
+            {busy() ? 'Opening workspace...' : existingWorkspace() ? 'Open workspace' : 'Create workspace'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 function ConfirmDialog(props: { title: string; description: string; confirmLabel: string; busyLabel?: string; variant?: 'primary' | 'danger'; busy?: boolean; confirmDisabled?: boolean; error?: string; onCancel: () => void; onConfirm: () => void }) {
   createEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -4674,7 +4830,7 @@ function NotificationVolumeControl(props: { value: number; onChange: (volume: nu
   );
 }
 
-function UiSelect(props: { value: string; options: SelectOption[]; onChange: (value: string) => void; onOpen?: () => Promise<boolean> | void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; contentAlign?: 'start' | 'end'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean; searchable?: boolean }) {
+function UiSelect(props: { value: string; options: SelectOption[]; portalMount?: HTMLElement; onChange: (value: string) => void; onOpen?: () => Promise<boolean> | void; placeholder?: JSX.Element; class?: string; triggerClass?: string; contentWidth?: 'trigger' | 'content'; contentAlign?: 'start' | 'end'; triggerWidth?: 'trigger' | 'content'; ariaLabel?: string; disabled?: boolean; compact?: boolean; searchable?: boolean }) {
   const [open, setOpen] = createSignal(false);
   const [refreshing, setRefreshing] = createSignal(false);
   const [refreshFailed, setRefreshFailed] = createSignal(false);
@@ -4905,7 +5061,7 @@ function UiSelect(props: { value: string; options: SelectOption[]; onChange: (va
         <ChevronDown class={`select-chevron transition-transform ${open() ? 'rotate-180' : ''}`} />
       </button>
       <Show when={open()}>
-        <Portal>
+        <Portal mount={props.portalMount}>
           <div
             ref={contentRef}
             class={`select-content ${props.compact ? 'select-content-compact' : ''}`}

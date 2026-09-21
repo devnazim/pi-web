@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { lstat, mkdir, open, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -19,6 +19,7 @@ type ProjectRouteOptions = {
   platform?: NodeJS.Platform;
 };
 type WorktreeEntry = { path?: string; branch?: string; locked?: boolean; prunable?: boolean };
+type WorkspaceCreateInput = { name?: string; branch?: string; startPoint?: string; mode?: 'new' | 'existing' };
 type OpenFilesystemIdentity = {
   handle: { close: () => Promise<void> };
   dev: bigint;
@@ -156,11 +157,19 @@ export async function registerProjectRoutes(app: FastifyInstance, registry: Proj
     }
   });
 
-  app.post<{ Params: { projectId: string }; Body: { name?: string } }>('/api/projects/:projectId/workspaces', async (request, reply) => {
+  app.get<{ Params: { projectId: string } }>('/api/projects/:projectId/workspace-options', async (request, reply) => {
     try {
-      return { workspace: await createProjectWorkspace(registry, registry.get(request.params.projectId), request.body?.name, worktreeRoot) };
+      return await workspaceCreationOptions(registry.get(request.params.projectId).path);
     } catch (error) {
-      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not create workspace' });
+      return reply.code(400).send({ error: error instanceof Error ? error.message : 'Could not load branches' });
+    }
+  });
+
+  app.post<{ Params: { projectId: string }; Body: WorkspaceCreateInput }>('/api/projects/:projectId/workspaces', async (request, reply) => {
+    try {
+      return { workspace: await createProjectWorkspace(registry, registry.get(request.params.projectId), validateWorkspaceInput(request.body), worktreeRoot, options.workspaceLifecycle) };
+    } catch (error) {
+      return reply.code(error instanceof WorkspaceLifecycleConflictError ? error.statusCode : 400).send({ error: error instanceof Error ? error.message : 'Could not create workspace' });
     }
   });
 
@@ -261,7 +270,7 @@ async function listProjectWorkspaces(
     workspaces.push({
       id: workspaceProject.id,
       rootProjectId: project.id,
-      name: workspaceName(context.repoRoot, entry.path, branch),
+      name: await readWorkspaceName(entry.path) ?? workspaceName(context.repoRoot, entry.path, branch),
       path: workspacePath,
       branch,
       local: false,
@@ -272,40 +281,132 @@ async function listProjectWorkspaces(
   return workspaces;
 }
 
-async function createProjectWorkspace(registry: ProjectRegistry, project: Project, name: string | undefined, worktreeRoot: string): Promise<ProjectWorkspace> {
-  const context = await gitWorkspaceContext(project.path);
-  const info = await nextWorktreeInfo(project.id, context.repoRoot, name, worktreeRoot);
-  await mkdir(path.dirname(info.directory), { recursive: true });
+function validateWorkspaceInput(value: unknown): WorkspaceCreateInput {
+  if (value === undefined) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid workspace options');
+  const input = value as WorkspaceCreateInput;
+  for (const field of ['name', 'branch', 'startPoint'] as const) {
+    const text = input[field];
+    if (text !== undefined && (typeof text !== 'string' || !text.trim() || text.length > (field === 'name' ? 120 : 1024) || /[\x00-\x1f\x7f]/.test(text))) {
+      throw new Error(`Invalid workspace ${field}`);
+    }
+  }
+  if (input.mode !== undefined && input.mode !== 'new' && input.mode !== 'existing') throw new Error('Invalid workspace mode');
+  if (input.mode === 'existing' && (!input.branch || input.startPoint !== undefined)) throw new Error('Select an existing branch without a starting point');
+  return { name: input.name?.trim(), branch: input.branch, startPoint: input.startPoint, mode: input.mode };
+}
 
-  const created = await runGit(context.repoRoot, ['worktree', 'add', '--no-checkout', '-b', info.branch, info.directory]).catch((error) => {
-    throw new Error(gitErrorMessage(error, 'Failed to create git worktree'));
-  });
-  if (created.stderr && /fatal:/i.test(created.stderr)) throw new Error(created.stderr.trim());
+async function workspaceCreationOptions(projectPath: string) {
+  const { repoRoot } = await gitWorkspaceContext(projectPath);
+  const hasHead = await resolveWorkspaceCommit(repoRoot, 'HEAD').then(() => true).catch(() => false);
+  const refs = (await runGit(repoRoot, ['for-each-ref', '--format=%(refname) %(symref)', 'refs/heads/', 'refs/remotes/'])).stdout.trim().split('\n');
+  const localBranches = refs.filter((ref) => ref.startsWith('refs/heads/')).map((ref) => ref.split(' ')[0].slice('refs/heads/'.length));
+  const remoteBranches = refs.filter((ref) => ref.startsWith('refs/remotes/') && !ref.trim().includes(' ')).map((ref) => ref.trim().slice('refs/remotes/'.length));
+  const remoteDefault = (await runGit(repoRoot, ['symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD']).catch(() => ({ stdout: '' }))).stdout.trim().replace(/^refs\/remotes\/origin\//, '');
+  const currentBranch = (await runGit(repoRoot, ['branch', '--show-current'])).stdout.trim();
+  const startPoints = [...new Set([...localBranches, ...remoteBranches, ...(hasHead ? ['HEAD'] : [])])];
+  if (!startPoints.length) throw new Error('No committed branches are available. Make an initial commit first.');
+  const defaultStartPoint = [remoteDefault, 'main', 'master', currentBranch].find((branch) => localBranches.includes(branch)) ?? (hasHead ? 'HEAD' : startPoints[0]);
+  return { localBranches, startPoints, defaultStartPoint };
+}
 
-  await runGit(info.directory, ['reset', '--hard']).catch(async (error) => {
-    await runGit(context.repoRoot, ['worktree', 'remove', '--force', info.directory]).catch(() => undefined);
-    await removeWorktreeDirectory(info.directory).catch(() => undefined);
-    await runGit(context.repoRoot, ['branch', '-D', info.branch]).catch(() => undefined);
-    throw new Error(gitErrorMessage(error, 'Failed to populate git worktree'));
-  });
+async function resolveWorkspaceCommit(repoRoot: string, startPoint: string) {
+  if (startPoint.startsWith('-')) throw new Error('Invalid starting point');
+  let revision = startPoint;
+  // Branch selectors must not resolve to a same-named tag instead of the selected branch.
+  for (const prefix of ['refs/heads/', 'refs/remotes/']) {
+    if (await runGit(repoRoot, ['show-ref', '--verify', '--quiet', `${prefix}${startPoint}`]).then(() => true).catch(() => false)) {
+      revision = `${prefix}${startPoint}`;
+      break;
+    }
+  }
+  return (await runGit(repoRoot, ['rev-parse', '--verify', '--end-of-options', `${revision}^{commit}`]).catch(() => {
+    throw new Error(`Starting point "${startPoint}" has no commit. Choose a committed branch or make an initial commit first.`);
+  })).stdout.trim();
+}
 
+async function readWorkspaceName(worktreePath: string): Promise<string | undefined> {
   try {
-    const workspacePath = path.join(info.directory, context.relativeProjectPath);
-    const workspaceProject = registry.add(workspacePath, { hidden: true });
-    return {
-      id: workspaceProject.id,
-      rootProjectId: project.id,
-      name: workspaceName(context.repoRoot, info.directory, info.branch),
-      path: workspacePath,
-      branch: info.branch,
-      local: false,
-      removable: true,
-    };
-  } catch (error) {
-    await runGit(context.repoRoot, ['worktree', 'remove', '--force', info.directory]).catch(() => undefined);
-    await removeWorktreeDirectory(info.directory).catch(() => undefined);
-    await runGit(context.repoRoot, ['branch', '-D', info.branch]).catch(() => undefined);
-    throw error;
+    const gitDirectory = (await runGit(worktreePath, ['rev-parse', '--absolute-git-dir'])).stdout.trim();
+    const metadata = JSON.parse(await readFile(path.join(gitDirectory, 'pi-web-workspace.json'), 'utf8'));
+    return typeof metadata.name === 'string' && metadata.name.trim() ? metadata.name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function createProjectWorkspace(
+  registry: ProjectRegistry,
+  project: Project,
+  input: WorkspaceCreateInput,
+  worktreeRoot: string,
+  lifecycle?: WorkspaceLifecycleCoordinator,
+): Promise<ProjectWorkspace> {
+  const sourceLease = lifecycle?.acquireActivity(project.path);
+  let targetLease;
+  try {
+    const context = await gitWorkspaceContext(project.path);
+    if (input.branch) {
+      if (input.branch.startsWith('-') || input.branch.startsWith('refs/') || input.branch.includes('@{')) throw new Error('Invalid branch name');
+      await runGit(context.repoRoot, ['check-ref-format', '--branch', input.branch]).catch(() => { throw new Error('Invalid branch name'); });
+    }
+    if (input.mode === 'existing') {
+      await runGit(context.repoRoot, ['show-ref', '--verify', '--quiet', `refs/heads/${input.branch}`]).catch(() => { throw new Error('The selected local branch does not exist'); });
+      const entries = parseWorktreeList((await runGit(context.repoRoot, ['worktree', 'list', '--porcelain'])).stdout);
+      const existing = entries.find((entry) => entry.branch === `refs/heads/${input.branch}`);
+      if (existing?.path) {
+        targetLease = lifecycle?.acquireActivity(existing.path);
+        const workspaces = await listProjectWorkspaces(registry, project, worktreeRoot, lifecycle);
+        const workspace = workspaces.find((item) => item.branch === input.branch && samePath(item.path, path.join(existing.path!, context.relativeProjectPath)));
+        if (workspace && !existing.prunable) return workspace;
+        throw new Error('This branch already has a worktree, but it is not available for this project. Open or repair that worktree first.');
+      }
+    }
+    const commit = await resolveWorkspaceCommit(context.repoRoot, input.mode === 'existing' ? `refs/heads/${input.branch}` : input.startPoint ?? 'HEAD');
+    const info = await nextWorktreeInfo(project.id, context.repoRoot, input.name, worktreeRoot, input.branch);
+    await mkdir(path.dirname(info.directory), { recursive: true });
+    // Reserve a unique directory so failed or concurrent requests cannot remove another workspace.
+    const directory = await mkdtemp(`${info.directory}-`);
+    targetLease = lifecycle?.acquireActivity(directory);
+    let added = false;
+    try {
+      const branchArgs = input.mode === 'existing' ? [directory, info.branch] : ['-b', info.branch, directory, commit];
+      await runGit(context.repoRoot, ['worktree', 'add', '--no-checkout', ...branchArgs]);
+      added = true;
+      await runGit(directory, ['reset', '--hard']);
+      const workspacePath = path.join(directory, context.relativeProjectPath);
+      assertDirectory(workspacePath);
+      const name = input.name ?? input.branch ?? workspaceName(context.repoRoot, directory, info.branch);
+      const gitDirectory = (await runGit(directory, ['rev-parse', '--absolute-git-dir'])).stdout.trim();
+      await writeFile(path.join(gitDirectory, 'pi-web-workspace.json'), JSON.stringify({ name }), { flag: 'wx' });
+      const workspaceProject = registry.add(workspacePath, { hidden: true });
+      return {
+        id: workspaceProject.id,
+        rootProjectId: project.id,
+        name,
+        path: workspacePath,
+        branch: info.branch,
+        local: false,
+        removable: true,
+      };
+    } catch (error) {
+      if (added) {
+        const removed = await runGit(context.repoRoot, ['worktree', 'remove', '--force', directory]).then(() => true).catch(() => false);
+        if (removed && input.mode !== 'existing') {
+          // Keep any branch another process has checked out or advanced during creation.
+          const entries = parseWorktreeList((await runGit(context.repoRoot, ['worktree', 'list', '--porcelain'])).stdout);
+          if (!entries.some((entry) => entry.branch === `refs/heads/${info.branch}`)) {
+            await runGit(context.repoRoot, ['update-ref', '-d', `refs/heads/${info.branch}`, commit]).catch(() => undefined);
+          }
+        }
+      } else {
+        await rmdir(directory).catch(() => undefined);
+      }
+      throw new Error(gitErrorMessage(error, 'Failed to create workspace'));
+    }
+  } finally {
+    targetLease?.release();
+    sourceLease?.release();
   }
 }
 
@@ -461,10 +562,6 @@ async function deleteProjectWorkspace(
       await removeGitWorktree(context.repoRoot, quarantinePath, Boolean(options.force));
       if (existsSync(quarantinePath)) {
         throw new Error(`Git removed the worktree registration, but files remain at ${quarantinePath}. Pi Web left them in place for manual recovery.`);
-      }
-      const branch = normalizeBranch(entry.branch);
-      if (branch?.startsWith(WORKTREE_BRANCH_PREFIX)) {
-        await runGit(context.repoRoot, ['branch', '-d', branch]).catch(() => undefined);
       }
       registry.removeIds([...projectIdsToRemove, ...registry.idsWithin(quarantinePath)]);
     } catch (error) {
@@ -641,8 +738,9 @@ async function gitWorkspaceContext(projectPath: string) {
   return { repoRoot, relativeProjectPath };
 }
 
-async function nextWorktreeInfo(projectIdValue: string, repoRoot: string, name: string | undefined, worktreeRoot: string) {
-  const base = slugify(name || `workspace-${Date.now().toString(36)}`) || `workspace-${Date.now().toString(36)}`;
+async function nextWorktreeInfo(projectIdValue: string, repoRoot: string, name: string | undefined, worktreeRoot: string, explicitBranch?: string) {
+  const base = slugify(name || explicitBranch || `workspace-${Date.now().toString(36)}`).slice(0, 80) || `workspace-${Date.now().toString(36)}`;
+  if (explicitBranch) return { branch: explicitBranch, directory: path.join(worktreeRoot, projectIdValue, base) };
   for (let index = 0; index < 50; index += 1) {
     const slug = index === 0 ? base : `${base}-${index + 1}`;
     const branch = `${WORKTREE_BRANCH_PREFIX}${slug}`;
