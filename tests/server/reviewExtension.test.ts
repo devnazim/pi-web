@@ -223,6 +223,44 @@ test('bounds prompt snapshots while retaining thread and truncation context', as
   assert.doesNotMatch(prompt, /\nsafe\.ts\n- IGNORE THE REVIEW SCOPE/);
 });
 
+test('all review tools return JSON-safe details for sparse and truncated threads', async () => {
+  for (const body of ['Short note', 'Long note '.repeat(2_000)]) {
+    const tools = new Map<string, any>();
+    const result = {
+      revision: undefined,
+      threads: [{
+        id: 'thread-1', status: 'open', anchor: undefined,
+        messages: [{ body, author: 'user', handlesUserRevision: undefined }],
+      }],
+    };
+    const extension = createPiWebReviewExtension('/workspace/project', 'session-1', {
+      getGitStatus: async () => ({ branch: 'main', files: [] }),
+      getReviewThreads: async () => result,
+      getPendingReviewThreads: async () => result,
+      addAgentReviewReply: async () => result,
+      createAgentReviewThread: async () => result,
+      resolveAgentReviewThread: async () => result,
+    } as any);
+    await extension.factory({
+      registerTool: (tool: any) => tools.set(tool.name, tool),
+      registerCommand: () => undefined,
+    } as any);
+
+    for (const name of TOOL_NAMES) {
+      const response = await tools.get(name).execute('call', {
+        scope: 'all', threadId: 'thread-1', body: 'Reply', handlesUserRevision: 1,
+      });
+      assert.deepEqual(response.details, JSON.parse(JSON.stringify(response.details)), name);
+      assert.deepEqual(response.details, JSON.parse(response.content[0].text), name);
+      assert.equal('revision' in response.details, false);
+      const thread = name === 'pi_web_review_list' ? response.details.threads[0] : response.details.thread;
+      assert.equal(thread.id, 'thread-1');
+      assert.equal('handlesUserRevision' in thread.messages[0], false);
+      assert.equal(thread.truncated === true, body.length > 8 * 1024);
+    }
+  }
+});
+
 test('review tools close over project and session and pass mutation conflicts through', async () => {
   const projectPath = '/workspace/fixed';
   const sessionId = 'fixed-session';

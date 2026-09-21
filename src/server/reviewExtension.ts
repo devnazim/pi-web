@@ -1,4 +1,4 @@
-import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-agent';
+import type { AgentToolResult, ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-agent';
 import { getGitStatus } from './git.js';
 import {
   addAgentReviewReply,
@@ -32,7 +32,6 @@ type ListParams = { cursor?: string; limit?: number; path?: string; includeHandl
 type ReplyParams = { threadId: string; body: string; handlesUserRevision: number; resolve?: boolean };
 type CreateParams = { path: string; staged?: boolean; startLine: number; endLine: number; selectedText: string; contextBefore: string[]; contextAfter: string[]; body: string };
 type ResolveParams = { threadId: string; handlesUserRevision: number; body?: string };
-type ToolResult = { content: Array<{ type: 'text'; text: string }>; details: unknown };
 
 const dependencies: ReviewExtensionDependencies = {
   getGitStatus,
@@ -207,14 +206,16 @@ async function listReviewThreads(
   };
 }
 
-function toolResult(details: unknown): ToolResult {
+function toolResult(details: object): AgentToolResult {
+  // Keep structured details identical to the JSON sent to the model, omitting optional undefined fields.
+  const text = JSON.stringify(details);
   return {
-    content: [{ type: 'text', text: stringify(details) }],
-    details,
+    content: [{ type: 'text', text }],
+    details: JSON.parse(text),
   };
 }
 
-function mutationToolResult(details: unknown, threadId?: string): ToolResult {
+function mutationToolResult(details: unknown, threadId?: string): AgentToolResult {
   const threads = reviewItems(details);
   const thread = threadId
     ? threads.find((item) => reviewItemId(item) === threadId)
@@ -228,10 +229,7 @@ function mutationToolResult(details: unknown, threadId?: string): ToolResult {
     ...(thread ? { thread: boundedReviewItem(thread) } : {}),
     note: 'Mutation succeeded. Use pi_web_review_list for the current paginated thread collection.',
   };
-  return {
-    content: [{ type: 'text', text: stringify(summary) }],
-    details: summary,
-  };
+  return toolResult(summary);
 }
 
 function buildReviewPrompt(

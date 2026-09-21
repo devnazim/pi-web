@@ -1,5 +1,10 @@
 export type BranchEntry = { id: string; parentId: string | null };
 
+// Pi persists prompt/tool updates and accounting entries alongside conversation messages.
+export function isInternalSessionEntry(entry: { type: string; message?: { role?: unknown } }) {
+  return entry.type === 'usage' || (entry.type === 'message' && entry.message?.role === 'system');
+}
+
 export function branchForEntry<T extends BranchEntry>(entries: T[], leafId: string | null | undefined) {
   if (leafId === undefined) return entries;
   if (leafId === null) return [];

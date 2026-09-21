@@ -2284,13 +2284,14 @@ export class PiBridge {
       usage.cost = this.finiteNumber(stats.cost) ?? 0;
     } else {
       for (const entry of typeof session?.sessionManager?.getEntries === 'function' ? session.sessionManager.getEntries() : []) {
-        const message = entry?.type === 'message' ? entry.message : undefined;
-        if (message?.role !== 'assistant' || !message.usage) continue;
-        usage.input += this.finiteNumber(message.usage.input) ?? 0;
-        usage.output += this.finiteNumber(message.usage.output) ?? 0;
-        usage.cacheRead += this.finiteNumber(message.usage.cacheRead) ?? 0;
-        usage.cacheWrite += this.finiteNumber(message.usage.cacheWrite) ?? 0;
-        usage.cost += this.finiteNumber(message.usage.cost?.total) ?? 0;
+        const entryUsage = entry?.type === 'usage' ? entry.usage
+          : entry?.type === 'message' && entry.message?.role === 'assistant' ? entry.message.usage : undefined;
+        if (!entryUsage) continue;
+        usage.input += this.finiteNumber(entryUsage.input) ?? 0;
+        usage.output += this.finiteNumber(entryUsage.output) ?? 0;
+        usage.cacheRead += this.finiteNumber(entryUsage.cacheRead) ?? 0;
+        usage.cacheWrite += this.finiteNumber(entryUsage.cacheWrite) ?? 0;
+        usage.cost += this.finiteNumber(entryUsage.cost?.total) ?? 0;
       }
       usage.total = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
     }

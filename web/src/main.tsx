@@ -110,7 +110,7 @@ import { buildReviewFileTree, type ReviewFileTreeNode } from './reviewFileTree';
 import { activePathAfterRemoval, closestDraftTextSearchRange, fileAncestorDirectories, isTextPath, pathIsAtOrBelow, remapPathRoot, shouldRefreshFileSearchTarget } from './fileWorkspace';
 import { parseTextSearchPatternInput } from './textSearch';
 import { createTerminalWorkspaceState, type TerminalWorkspaceState } from './terminalTabs';
-import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
+import { boundedRangeAroundIndex, branchForEntry, isInternalSessionEntry } from './sessionLoading';
 import { composerDraftKey, createDraftSessionReservationEffect, ensureSessionReservation, forgetSessionReservationId, isUnknownSessionReservation, readSessionReservationIds, rememberSessionReservationId } from './sessionReservation';
 import { buildSessionShareUrl, decodeProjectPath, encodeProjectPath, PROJECT_QUERY_KEY, SESSION_QUERY_KEY, WORKSPACE_QUERY_KEY } from './sessionShare';
 import ExtensionCustomUiTerminal, { type ExtensionCustomUiEvent, type ExtensionCustomUiRequest, type ExtensionCustomUiSender } from './ExtensionCustomUiTerminal';
@@ -13556,7 +13556,7 @@ function chatDisplayEntries(entries: SessionEntry[]) {
 }
 
 function shouldDisplayTranscriptEntry(entry: SessionEntry, options?: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }) {
-  if (entry.type === 'custom') return false;
+  if (entry.type === 'custom' || isInternalSessionEntry(entry)) return false;
   if (entry.type === 'custom_message') return entry.display !== false && hasTextContent(entry.content);
   if (entry.type === 'label' || entry.type === 'session_info') return Boolean(entryText(entry).trim());
   if (entry.type === 'message' && entry.message?.role === 'assistant') {
@@ -13605,6 +13605,7 @@ function entryText(entry: SessionEntry) {
 }
 
 function transcriptEntrySearchText(entry: SessionEntry, options: { hideThinking: boolean; toolOutputMode: ChatToolOutputMode }, toolCalls?: Map<string, ToolCallInfo>) {
+  if (isInternalSessionEntry(entry)) return '';
   const partsText = entryContentParts(entry, options).map((part) => part.text).join('\n');
   if (entry.type === 'message' && entry.message?.role === 'bashExecution') {
     return [entry.message.excludeFromContext ? 'hidden from context' : '', String(entry.message.command ?? ''), String(entry.message.output ?? ''), partsText].filter(Boolean).join('\n');
@@ -14375,6 +14376,7 @@ function filterTreeNodes(nodes: FlatTreeNode[], search: string, filterMode: Tree
   const tokens = search.toLowerCase().split(/\s+/).filter(Boolean);
   return nodes.filter((flatNode) => {
     const entry = flatNode.node.entry;
+    if (isInternalSessionEntry(entry)) return false;
     const isCurrentLeaf = entry.id === leafId;
     if (flatNode.node.isEmptyAssistant && !isCurrentLeaf) return false;
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { boundedRangeAroundIndex, branchForEntry } from './sessionLoading';
+import { boundedRangeAroundIndex, branchForEntry, isInternalSessionEntry } from './sessionLoading';
 
 const entries = [
   { id: 'root', parentId: null },
@@ -21,6 +21,34 @@ test('stops safely when session ancestry is missing or cyclic', () => {
     { id: 'first', parentId: 'second' },
     { id: 'second', parentId: 'first' },
   ], 'first').map(({ id }) => id), ['second', 'first']);
+});
+
+test('recognizes pi internal entries without hiding ordinary conversation metadata', () => {
+  assert.equal(isInternalSessionEntry({ type: 'message', message: { role: 'system' } }), true);
+  assert.equal(isInternalSessionEntry({ type: 'usage' }), true);
+  for (const role of ['user', 'assistant', 'toolResult', 'bashExecution']) {
+    assert.equal(isInternalSessionEntry({ type: 'message', message: { role } }), false);
+  }
+  for (const type of ['custom_message', 'model_change', 'compaction', 'branch_summary']) {
+    assert.equal(isInternalSessionEntry({ type }), false);
+  }
+});
+
+test('retains ancestry through hidden prompt patches and usage entries', () => {
+  const entries = [
+    { id: 'system', parentId: null, type: 'message', message: { role: 'system' } },
+    { id: 'user', parentId: 'system', type: 'message', message: { role: 'user' } },
+    { id: 'patch', parentId: 'user', type: 'message', message: { role: 'system' } },
+    { id: 'usage', parentId: 'patch', type: 'usage', kind: 'future_usage_kind' },
+    { id: 'answer', parentId: 'usage', type: 'message', message: { role: 'assistant' } },
+    { id: 'other', parentId: 'patch', type: 'message', message: { role: 'user' } },
+  ];
+  const branch = branchForEntry(entries, 'answer');
+  assert.deepEqual(branch.map(({ id }) => id), ['system', 'user', 'patch', 'usage', 'answer']);
+  assert.deepEqual(branch.filter((entry) => !isInternalSessionEntry(entry)).map(({ id }) => id), ['user', 'answer']);
+  assert.deepEqual(branchForEntry(entries, 'other').filter((entry) => !isInternalSessionEntry(entry)).map(({ id }) => id), ['user', 'other']);
+  assert.deepEqual(branchForEntry(entries, 'usage').filter((entry) => !isInternalSessionEntry(entry)).map(({ id }) => id), ['user']);
+  assert.equal(entries.length, 6);
 });
 
 test('keeps search rendering bounded around early, middle, and late matches', () => {
