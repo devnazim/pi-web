@@ -26,6 +26,7 @@ test('stops safely when session ancestry is missing or cyclic', () => {
 test('recognizes pi internal entries without hiding ordinary conversation metadata', () => {
   assert.equal(isInternalSessionEntry({ type: 'message', message: { role: 'system' } }), true);
   assert.equal(isInternalSessionEntry({ type: 'usage' }), true);
+  assert.equal(isInternalSessionEntry({ type: 'context_edit' }), true);
   for (const role of ['user', 'assistant', 'toolResult', 'bashExecution']) {
     assert.equal(isInternalSessionEntry({ type: 'message', message: { role } }), false);
   }
@@ -49,6 +50,20 @@ test('retains ancestry through hidden prompt patches and usage entries', () => {
   assert.deepEqual(branchForEntry(entries, 'other').filter((entry) => !isInternalSessionEntry(entry)).map(({ id }) => id), ['user', 'other']);
   assert.deepEqual(branchForEntry(entries, 'usage').filter((entry) => !isInternalSessionEntry(entry)).map(({ id }) => id), ['user']);
   assert.equal(entries.length, 6);
+});
+
+test('hides context edits without hiding or replacing raw conversation history', () => {
+  const entries = [
+    { id: 'user', parentId: null, type: 'message', message: { role: 'user', content: 'Hello' } },
+    { id: 'answer', parentId: 'user', type: 'message', message: { role: 'assistant', content: 'Original answer' } },
+    { id: 'omit', parentId: 'answer', type: 'context_edit', targetId: 'user', replacement: null },
+    { id: 'replace', parentId: 'omit', type: 'context_edit', targetId: 'answer', replacement: { content: 'Revised answer' } },
+  ];
+  const branch = branchForEntry(entries, 'replace');
+  assert.deepEqual(branch.map(({ id }) => id), ['user', 'answer', 'omit', 'replace']);
+  assert.deepEqual(branch.filter((entry) => !isInternalSessionEntry(entry)), entries.slice(0, 2));
+  assert.equal(entries[1].message?.content, 'Original answer');
+  assert.equal(entries.length, 4);
 });
 
 test('keeps search rendering bounded around early, middle, and late matches', () => {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { mock, test } from 'node:test';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { PiBridge } from '../../src/server/piBridge.js';
 import { sessionDetailFromManager } from '../../src/server/sessions.js';
@@ -35,6 +35,59 @@ test('preserves pi system and usage entries through session detail and SDK resto
   assert.deepEqual(restored.getEntries(), manager.getEntries());
   assert.deepEqual(restored.buildSessionContext(), manager.buildSessionContext());
   assert.equal(restored.buildSessionContext().messages.some((message) => 'kind' in message), false);
+});
+
+test('refreshes canonical session context after branching and resetting the leaf', () => {
+  const manager = SessionManager.inMemory(process.cwd());
+  const firstId = manager.appendMessage({ role: 'user', content: 'First', timestamp: 1 });
+  const secondId = manager.appendMessage({ role: 'user', content: 'Second', timestamp: 2 });
+  const session = {
+    sessionManager: manager,
+    refreshContext: mock.fn(() => manager.getLeafId()),
+    agent: { state: Object.freeze({ messages: manager.buildSessionContext().messages }) },
+  };
+  const bridge = new PiBridge();
+
+  (bridge as any).branchSession(session, undefined);
+  assert.equal(manager.getLeafId(), secondId);
+  assert.equal(session.refreshContext.mock.callCount(), 0);
+
+  (bridge as any).branchSession(session, firstId);
+  assert.equal(manager.getLeafId(), firstId);
+  assert.equal(session.refreshContext.mock.callCount(), 1);
+  assert.equal(session.refreshContext.mock.calls[0].result, firstId);
+
+  (bridge as any).branchSession(session, null);
+  assert.equal(manager.getLeafId(), null);
+  assert.equal(session.refreshContext.mock.callCount(), 2);
+  assert.equal(session.refreshContext.mock.calls[1].result, null);
+  assert.deepEqual(manager.buildSessionContext().messages, []);
+  assert.equal(manager.getEntries().length, 2);
+});
+
+test('preserves context edits and raw history through session detail and SDK restoration', () => {
+  const manager = SessionManager.inMemory(process.cwd());
+  const userId = manager.appendMessage({ role: 'user', content: 'Original request', timestamp: 1 });
+  const answerId = manager.appendMessage({
+    role: 'assistant', content: [{ type: 'text', text: 'Original answer' }],
+    api: 'openai-completions', provider: 'test-provider', model: 'test-model',
+    stopReason: 'stop', timestamp: 2, usage,
+  });
+  manager.appendContextEdit(userId, { content: 'Revised request' });
+  const editId = manager.appendContextEdit(answerId, null);
+  const detail = sessionDetailFromManager('/tmp/pi-web-context-edit-session.jsonl', manager);
+  const restored = SessionManager.inMemory(process.cwd(), { id: manager.getSessionId() }, JSON.parse(JSON.stringify(detail.entries)));
+
+  assert.equal(detail.leafId, editId);
+  assert.deepEqual(restored.getEntries(), manager.getEntries());
+  assert.deepEqual(restored.buildSessionContext(), manager.buildSessionContext());
+  assert.deepEqual(restored.buildSessionContext().messages, [
+    { role: 'user', content: 'Revised request', timestamp: 1 },
+  ]);
+  assert.deepEqual(detail.entries.filter((entry) => entry.type === 'message').map((entry) => entry.message.content), [
+    'Original request', [{ type: 'text', text: 'Original answer' }],
+  ]);
+  assert.equal(detail.entries.filter(({ type }) => type === 'context_edit').length, 2);
 });
 
 test('status fallback includes pi usage entries without depending on their kind', () => {

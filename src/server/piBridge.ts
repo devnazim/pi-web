@@ -675,6 +675,7 @@ export class PiBridge {
         onActivityStart: extensionCommand ? ensureCommandBusyStarted : undefined,
         onEvent: (event, type) => {
           progressGeneration += 1;
+          if (type === 'agent_start') agentSettled = false;
           if (type === 'message_end' && event && typeof event === 'object') {
             const message = (event as { message?: unknown }).message;
             if (message && typeof message === 'object' && (message as { role?: unknown }).role === 'assistant') {
@@ -946,6 +947,7 @@ export class PiBridge {
       subscription = this.subscribeSessionEvents(session, key, body.sessionId, {
         onEvent: (_event, type) => {
           progressGeneration += 1;
+          if (type === 'agent_start') agentSettled = false;
           if (type === 'agent_settled') agentSettled = true;
         },
         operationId,
@@ -1211,6 +1213,7 @@ export class PiBridge {
       subscription = this.subscribeSessionEvents(session, key, body.sessionId, {
         onEvent: (event, type) => {
           progressGeneration += 1;
+          if (type === 'agent_start') agentSettled = false;
           if (type === 'compaction_end' && event && typeof event === 'object') {
             const compactionEvent = event as { aborted?: unknown; errorMessage?: unknown };
             compactionAborted = compactionEvent.aborted === true;
@@ -1412,6 +1415,7 @@ export class PiBridge {
       if (session && typeof session === 'object' && this.sessionCannotPublish(session)) return;
       const type = agentEventType(event);
       options.onEvent?.(event, type);
+      if (options.mirrorLifecycle && type === 'agent_start' && options.lifecycle) options.lifecycle.finished = false;
       if (options.mirrorLifecycle && isCommandActivityStartEvent(type) && !options.lifecycle?.started) {
         if (options.lifecycle) options.lifecycle.started = true;
         options.onActivityStart?.();
@@ -2648,9 +2652,7 @@ export class PiBridge {
     } else if (typeof manager?.branch === 'function') {
       manager.branch(branchFromId);
     }
-    if (session?.agent?.state && typeof manager?.buildSessionContext === 'function') {
-      session.agent.state.messages = manager.buildSessionContext().messages;
-    }
+    if (typeof session?.refreshContext === 'function') session.refreshContext();
   }
 
   private async applySessionControls(session: any, body: { model?: string; thinking?: string }) {

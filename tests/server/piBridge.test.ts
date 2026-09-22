@@ -641,6 +641,75 @@ test('recovers a settled agent operation whose SDK promise never resolves', asyn
   assert.equal((await bridge.status(process.cwd(), 'crashed-session', 'project:crashed-session')).recovery, undefined);
 });
 
+test('reopens the mirrored command lifecycle when a settled handler starts another run', () => {
+  const bridge = new PiBridge();
+  const lifecycle = { started: false, finished: false };
+  let listener: ((event: unknown) => void) | undefined;
+  const session = {
+    subscribe: (next: (event: unknown) => void) => { listener = next; },
+  };
+  (bridge as any).subscribeSessionEvents(session, 'project:deferred-session', 'deferred-session', { mirrorLifecycle: true, lifecycle });
+
+  listener?.({ type: 'agent_start' });
+  listener?.({ type: 'agent_settled' });
+  assert.deepEqual(lifecycle, { started: true, finished: true });
+  listener?.({ type: 'agent_start' });
+  assert.deepEqual(lifecycle, { started: true, finished: false });
+  listener?.({ type: 'agent_settled' });
+  assert.deepEqual(lifecycle, { started: true, finished: true });
+});
+
+for (const operation of ['prompt', 'extension command', 'navigateTree', 'compact'] as const) {
+  test(`does not recover ${operation} when a settled handler starts a deferred run`, async () => {
+    const bridge = new PiBridge({ runtimeSettledGraceMs: 5, runtimeNoProgressTimeoutMs: 1_000, runtimeIdleGraceMs: 1_000, runtimeWatchIntervalMs: 1 });
+    const events: Array<{ type?: string }> = [];
+    let listener: ((event: unknown) => void) | undefined;
+    let disposed = 0;
+    let released = false;
+    const run = async (options?: { preflightResult?: (success: boolean) => void }) => {
+      options?.preflightResult?.(true);
+      listener?.({ type: 'agent_start' });
+      listener?.({ type: 'agent_settled' });
+      // Pi 0.87 starts deferred work after it notifies settled subscribers.
+      session.isStreaming = true;
+      listener?.({ type: 'agent_start' });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      session.isStreaming = false;
+      listener?.({ type: 'agent_settled' });
+    };
+    const session = {
+      isStreaming: false,
+      extensionRunner: { getCommand: (name: string) => name === 'deferred' ? {} : undefined },
+      subscribe: (next: (event: unknown) => void) => {
+        listener = next;
+        return () => { listener = undefined; };
+      },
+      prompt: (_prompt: string, options: { preflightResult?: (success: boolean) => void }) => run(options),
+      navigateTree: () => run(),
+      compact: () => run(),
+      dispose: () => { disposed += 1; },
+    };
+    (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => { released = true; } });
+    (bridge as any).markSessionActive = async () => () => { released = true; };
+    (bridge as any).getSession = async () => session;
+    (bridge as any).broadcast = (_key: string, event: { type?: string }) => { events.push(event); };
+
+    if (operation === 'navigateTree') {
+      await bridge.navigateTree(process.cwd(), { sessionId: 'deferred-session', targetId: 'target' }, 'project:deferred-session');
+    } else if (operation === 'compact') {
+      await bridge.compact(process.cwd(), { sessionId: 'deferred-session' }, 'project:deferred-session');
+    } else {
+      await bridge.prompt(process.cwd(), { sessionId: 'deferred-session', prompt: operation === 'extension command' ? '/deferred' : 'test' }, 'project:deferred-session');
+    }
+
+    assert.equal(disposed, 0);
+    assert.equal(released, true);
+    assert.equal(events.some(({ type }) => type === 'agent:error'), false);
+    assert.equal(events.filter(({ type }) => type === 'agent:finish').length, 1);
+    await bridge.dispose();
+  });
+}
+
 test('does not recover a pending operation while the SDK reports it active', async () => {
   const bridge = new PiBridge({ runtimeSettledGraceMs: 2, runtimeIdleGraceMs: 5, runtimeWatchIntervalMs: 1 });
   let finishPrompt: (() => void) | undefined;
