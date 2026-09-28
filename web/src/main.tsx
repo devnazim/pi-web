@@ -4535,12 +4535,14 @@ function ConfirmDialog(props: { title: string; description: string; confirmLabel
 
   return (
     <div class="confirm-modal-backdrop" onMouseDown={() => !props.busy && props.onCancel()}>
-      <div class="confirm-modal" onMouseDown={(event) => event.stopPropagation()}>
+      <div class="confirm-modal confirm-dialog" onMouseDown={(event) => event.stopPropagation()}>
         <h2 class="text-base font-medium leading-none">{props.title}</h2>
-        <p class="mt-2 min-w-0 break-all text-sm leading-6 text-muted-foreground">{props.description}</p>
-        <Show when={props.error}>
-          <div class="mt-4 rounded-2xl bg-destructive/10 px-3 py-2 text-sm text-destructive ring-1 ring-destructive/20">{props.error}</div>
-        </Show>
+        <div class="confirm-dialog-body">
+          <p class="mt-2 min-w-0 break-all text-sm leading-6 text-muted-foreground">{props.description}</p>
+          <Show when={props.error}>
+            <div class="mt-4 rounded-2xl bg-destructive/10 px-3 py-2 text-sm text-destructive ring-1 ring-destructive/20">{props.error}</div>
+          </Show>
+        </div>
         <div class="dialog-footer justify-end">
           <button class="button-secondary" disabled={props.busy} onClick={props.onCancel}>Cancel</button>
           <button class={props.variant === 'primary' ? 'button' : 'button-danger'} disabled={props.busy || props.confirmDisabled} onClick={props.onConfirm}>{props.busy ? props.busyLabel ?? 'Working...' : props.confirmLabel}</button>
