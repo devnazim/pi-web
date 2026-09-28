@@ -1526,6 +1526,10 @@ function Shell() {
   function handleWorkspaceNotificationEvent(workspaceId: string, event: WorkspaceNotificationServerEvent) {
     const workspace = workspaceLookup()[workspaceId];
     const sessionId = event.sessionId;
+    if (event.type === 'agent:history-updated' && sessionId) {
+      void queryClient.invalidateQueries({ queryKey: ['session', workspaceId, sessionId] });
+      void queryClient.invalidateQueries({ queryKey: ['sessions', workspaceId] });
+    }
     if ((event.type === 'agent:resources-reloaded' || event.type === 'agent:resources-reload-failed') && sessionId) {
       void refreshReloadedRuntimeQueries(workspaceId, sessionId)
         .catch((error) => console.warn('Could not refresh reloaded Pi resources', error));
@@ -2058,6 +2062,10 @@ function Shell() {
           return;
         }
         const eventSessionId = parsed.sessionId ?? currentRuntimeSessionId;
+        if (parsed.type === 'agent:history-updated' && eventSessionId) {
+          void queryClient.invalidateQueries({ queryKey: ['session', project.id, eventSessionId] });
+          void queryClient.invalidateQueries({ queryKey: ['sessions', project.id] });
+        }
         if ((parsed.type === 'agent:resources-reloaded' || parsed.type === 'agent:resources-reload-failed') && eventSessionId) {
           void refreshReloadedRuntimeQueries(project.id, eventSessionId)
             .catch((error) => console.warn('Could not refresh reloaded Pi resources', error));

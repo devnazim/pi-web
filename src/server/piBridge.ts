@@ -1,5 +1,6 @@
 import { getAgentDir, parseFrontmatter, resizeImage, type ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
 import { open, readdir, readFile, realpath, stat, type FileHandle } from 'node:fs/promises';
@@ -27,8 +28,26 @@ type WebSocket = {
 type TreeSummaryOptions = { mode?: 'none' | 'summary' | 'custom'; instructions?: string; replace?: boolean };
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 type StreamingBehavior = 'steer' | 'followUp';
-type PendingStreamingClientMessage = { token: string; behavior: StreamingBehavior; clientMessageId?: string; queued: boolean };
+type PendingStreamingClientMessage = {
+  token: string;
+  behavior: StreamingBehavior;
+  clientMessageId?: string;
+  queued: boolean;
+  inputPending?: boolean;
+  inputHandled?: boolean;
+};
+type StreamingQueueSlot = { text: unknown; message?: PendingStreamingClientMessage };
 type ImageContent = { type: 'image'; mimeType: string; data: string };
+type SessionEventRelay = {
+  listeners: Set<{ onEvent: (event: unknown) => void; operationId?: string; superseded?: boolean; onSuperseded?: () => void }>;
+  observers: Set<(event: unknown) => void>;
+  progressGeneration: number;
+  pendingAgentSettlements: number;
+  pendingNavigations: number;
+  nextAgentStartIsNewRun: boolean;
+  unsubscribe?: () => void;
+  background?: { sessionId?: string; operationId?: string; assistantError?: string; terminalError?: string };
+};
 
 interface PromptBody {
   sessionId?: string;
@@ -254,12 +273,16 @@ export class PiBridge {
   private readonly sessionBindingPromises = new WeakMap<object, Promise<void>>();
   private readonly sessionStreamKeys = new WeakMap<object, string | string[]>();
   private readonly sessionOperationIds = new WeakMap<object, string>();
+  private readonly sessionEventRelays = new WeakMap<object, SessionEventRelay>();
+  private readonly extensionLoadErrors = new WeakMap<object, string[]>();
   private readonly sessionStreamKeyLocks = new WeakMap<object, StreamKeyLock>();
   private readonly pendingStreamingClientMessages = new WeakMap<object, PendingStreamingClientMessage[]>();
   private readonly deliveredStreamingClientMessages = new WeakMap<object, PendingStreamingClientMessage[]>();
-  private readonly streamingQueueSlots = new WeakMap<object, { steer: Array<PendingStreamingClientMessage | undefined>; followUp: Array<PendingStreamingClientMessage | undefined> }>();
+  private readonly streamingQueueSlots = new WeakMap<object, { steer: StreamingQueueSlot[]; followUp: StreamingQueueSlot[] }>();
   private readonly streamingDispatchTails = new Map<string, Promise<void>>();
+  private readonly streamingInputContext = new AsyncLocalStorage<PendingStreamingClientMessage | undefined>();
   private readonly extensionAsyncWrappedSessions = new WeakSet<object>();
+  private readonly extensionInputWrappedRunners = new WeakSet<object>();
   private readonly extensionAsyncTasks = new WeakMap<object, Set<Promise<unknown>>>();
   private readonly extensionErrorCounts = new WeakMap<object, number>();
   private readonly extensionStatuses = new WeakMap<object, Map<string, string>>();
@@ -574,6 +597,8 @@ export class PiBridge {
     let releaseStreamKeyLock: (() => void) | undefined;
     let subscription: (() => void) | undefined;
     let queuedStreamingPrompt = false;
+    let promptSuperseded = false;
+    let stopQueueObserver: (() => void) | undefined;
     let commandBusyTimer: NodeJS.Timeout | undefined;
     let commandBusyStarted = false;
     let preflightReported = false;
@@ -646,8 +671,8 @@ export class PiBridge {
           throw error;
         } else streamingBehavior = undefined;
       }
-      if (queuedStreamingPrompt && ((streamingBehavior === 'steer' && typeof session?.steer !== 'function') || (streamingBehavior === 'followUp' && typeof session?.followUp !== 'function'))) {
-        const error = new Error('Loaded pi SDK session does not support streamingBehavior');
+      if (queuedStreamingPrompt && typeof session?.prompt !== 'function') {
+        const error = new Error('Loaded pi SDK session does not support prompt() with streamingBehavior');
         reportPreflight(false, error);
         throw error;
       }
@@ -672,6 +697,7 @@ export class PiBridge {
       subscription = queuedStreamingPrompt ? undefined : this.subscribeSessionEvents(session, key, body.sessionId, {
         mirrorLifecycle: extensionCommand,
         lifecycle,
+        onSuperseded: () => { promptSuperseded = true; },
         onActivityStart: extensionCommand ? ensureCommandBusyStarted : undefined,
         onEvent: (event, type) => {
           progressGeneration += 1;
@@ -741,19 +767,6 @@ export class PiBridge {
       if (queuedStreamingPrompt && streamingBehavior) {
         await streamingDispatchReady;
         if (!this.cachedSessionIsStreaming(session)) throw new Error('Agent finished before the queued message could be delivered. Please retry.');
-        let queuedPrompt = prompt;
-        let queuedImages = images;
-        const extensionRunner = session?.extensionRunner;
-        if (typeof extensionRunner?.hasHandlers === 'function' && extensionRunner.hasHandlers('input') && typeof extensionRunner.emitInput === 'function') {
-          const inputResult = await setupSupervisor.wait(extensionRunner.emitInput(queuedPrompt, queuedImages.length ? queuedImages : undefined, 'rpc', streamingBehavior)) as { action?: string; text?: string; images?: typeof images };
-          if (inputResult.action === 'handled') {
-            releaseStreamingDispatch();
-            reportPreflight(true);
-          } else if (inputResult.action === 'transform' && typeof inputResult.text === 'string') {
-            queuedPrompt = inputResult.text;
-            queuedImages = inputResult.images ?? queuedImages;
-          }
-        }
         if (!preflightReported) {
           if (!this.cachedSessionIsStreaming(session)) throw new Error('Agent finished before the queued message could be delivered. Please retry.');
           if (runtimeSession) {
@@ -763,11 +776,86 @@ export class PiBridge {
               behavior: streamingBehavior,
               clientMessageId: body.clientMessageId,
               queued: false,
+              inputPending: session.extensionRunner?.hasHandlers?.('input') === true,
             }]);
           }
-          const queueTask = streamingBehavior === 'steer'
-            ? Promise.resolve(session.steer(queuedPrompt, queuedImages.length ? queuedImages : undefined))
-            : Promise.resolve(session.followUp(queuedPrompt, queuedImages.length ? queuedImages : undefined));
+          const relay = this.sessionEventRelay(session);
+          let directRunPending = false;
+          let directRunStarted = false;
+          let initialPromptReturned = false;
+          let deferredDirectRun = false;
+          let directClientMessage: PendingStreamingClientMessage | undefined;
+          let finishDirectRun!: () => void;
+          const directRunFinished = new Promise<void>((resolve) => { finishDirectRun = resolve; });
+          const observeQueue = (event: unknown) => {
+            const type = agentEventType(event);
+            if (directRunPending && type === 'agent_start') {
+              directRunPending = false;
+              directRunStarted = true;
+              relay.nextAgentStartIsNewRun = true;
+              for (const listener of relay.listeners) {
+                if (listener.operationId !== operationId) {
+                  listener.superseded = true;
+                  listener.onSuperseded?.();
+                }
+              }
+              this.sessionOperationIds.set(session, operationId);
+              relay.background = { sessionId: body.sessionId, operationId };
+              if (directClientMessage) {
+                this.deliveredStreamingClientMessages.set(session, [...(this.deliveredStreamingClientMessages.get(session) ?? []), directClientMessage]);
+                directClientMessage = undefined;
+              }
+              this.broadcast(key, { type: 'agent:start', operationId, sessionId: body.sessionId });
+            }
+            if (directRunStarted) {
+              progressGeneration += 1;
+              if (type === 'agent_start') agentSettled = false;
+              if (type === 'agent_settled') {
+                agentSettled = true;
+                finishDirectRun();
+              }
+            }
+          };
+          relay.observers.add(observeQueue);
+          stopQueueObserver = () => relay.observers.delete(observeQueue);
+          // prompt() rechecks streaming after asynchronous input hooks. Unlike
+          // steer()/followUp(), it starts a run if the previous one has settled.
+          let resolveSdkPreflight!: () => void;
+          let preflightError: Error | undefined;
+          const sdkPreflight = new Promise<void>((resolve) => { resolveSdkPreflight = resolve; });
+          const initialPromptTask = Promise.resolve(session.prompt(prompt, {
+            source: 'rpc', images: images.length ? images : undefined, streamingBehavior,
+            preflightResult: (success: boolean) => {
+              const pendingMessages = this.pendingStreamingClientMessages.get(session) ?? [];
+              const pending = pendingMessages.find(({ token }) => token === queuedClientMessageToken);
+              if (!success) {
+                preflightError = new Error('Queued prompt was rejected before delivery.');
+                const nextMessages = pendingMessages.filter(({ token }) => token !== queuedClientMessageToken);
+                if (nextMessages.length) this.pendingStreamingClientMessages.set(session, nextMessages);
+                else this.pendingStreamingClientMessages.delete(session);
+              } else if (pending?.inputHandled) {
+                const nextMessages = pendingMessages.filter(({ token }) => token !== queuedClientMessageToken);
+                if (nextMessages.length) this.pendingStreamingClientMessages.set(session, nextMessages);
+                else this.pendingStreamingClientMessages.delete(session);
+              } else {
+                directRunPending = Boolean(pending && !pending.queued && !this.cachedSessionIsStreaming(session));
+                deferredDirectRun = directRunPending && initialPromptReturned;
+                if (directRunPending) {
+                  // A later queue_update belongs to another request, not this
+                  // direct input, even if its agent_start hook is still pending.
+                  directClientMessage = pending;
+                  this.pendingStreamingClientMessages.set(session, pendingMessages.filter(({ token }) => token !== queuedClientMessageToken));
+                }
+              }
+              releaseStreamingDispatch();
+              if (success) reportPreflight(true);
+              resolveSdkPreflight();
+            },
+          })).finally(() => { initialPromptReturned = true; });
+          const queueTask = Promise.all([initialPromptTask, sdkPreflight]).then(async () => {
+            if (preflightError) throw preflightError;
+            if (deferredDirectRun) await directRunFinished;
+          });
           await setupSupervisor.watch(queueTask, {
             session,
             accepted: () => true,
@@ -807,14 +895,17 @@ export class PiBridge {
           acceptedIsActivity: !extensionCommand,
           requireSettled: extensionCommand,
         });
-        if (terminalSdkError) {
+        // A replacement may already be inside an async start hook, before its
+        // public agent_start can transfer the relay's ownership.
+        if (!extensionCommand && this.cachedSessionIsStreaming(session)) promptSuperseded = true;
+        if (terminalSdkError && !promptSuperseded) {
           const report = this.recoverRuntimeSession(projectPath, body.sessionId, session, terminalSdkError);
           throw new AgentRuntimeRecoveryError(terminalSdkError, report);
         }
         if (!extensionCommand) reportPreflight(true);
       } else if (typeof session?.followUp === 'function') {
         await streamingDispatchReady;
-        await setupSupervisor.watch(Promise.resolve().then(() => session.followUp(prompt, images.length ? images : undefined)), {
+        await setupSupervisor.watch(Promise.resolve().then(() => session.followUp(prompt, images.length ? images : undefined, { source: 'rpc' })), {
           session,
           accepted: () => true,
           settled: () => agentSettled,
@@ -857,7 +948,7 @@ export class PiBridge {
       const commandReportedError = extensionCommand && this.extensionErrorCount(session) !== extensionErrorCountBefore;
       const completedMirroredLifecycle = extensionCommand && lifecycle.started && lifecycle.finished;
       const needsSyntheticFinish = !queuedStreamingPrompt && !commandReportedError && (!extensionCommand || (commandBusyStarted && !lifecycle.finished) || (!lifecycle.started && options.startEvent === false));
-      if (!commandReportedError && (completedMirroredLifecycle || needsSyntheticFinish)) this.broadcast(key, { type: 'agent:finish', operationId, sessionId: body.sessionId });
+      if (!commandReportedError && !promptSuperseded && (completedMirroredLifecycle || needsSyntheticFinish)) this.broadcast(key, { type: 'agent:finish', operationId, sessionId: body.sessionId });
       else if (!commandReportedError && lifecycle.started && !lifecycle.finished && !this.cachedSessionInUse(session)) {
         this.broadcast(key, { type: 'agent:finish', operationId, sessionId: body.sessionId });
       } else if (!commandReportedError && extensionCommand && !lifecycle.started) {
@@ -867,6 +958,7 @@ export class PiBridge {
       }
     } catch (error) {
       clearCommandBusyTimer();
+      if (!(error instanceof AgentRuntimeRecoveryError) && subscription && runtimeSession && this.cachedSessionIsStreaming(runtimeSession)) promptSuperseded = true;
       subscription?.();
       if (runtimeSession && queuedClientMessageToken) {
         const pendingMessages = this.pendingStreamingClientMessages.get(runtimeSession);
@@ -877,15 +969,16 @@ export class PiBridge {
       if (!preflightReported) reportPreflight(false, error);
       if (error instanceof AgentRuntimeRecoveryError && !error.report) throw error;
       const message = error instanceof Error ? error.message : 'Agent failed';
-      const warning = !(error instanceof AgentRuntimeRecoveryError) && (isAgentAlreadyProcessingMessage(message) || queuedStreamingPrompt);
+      const warning = !(error instanceof AgentRuntimeRecoveryError) && (promptSuperseded || isAgentAlreadyProcessingMessage(message) || queuedStreamingPrompt);
       this.broadcast(key, warning
         ? { type: 'agent:notice', operationId, sessionId: body.sessionId, message, data: { level: 'warning' } }
         : { type: 'agent:error', operationId, sessionId: body.sessionId, message });
       throw error;
     } finally {
       clearCommandBusyTimer();
+      stopQueueObserver?.();
       setupSupervisor?.release();
-      if (!queuedStreamingPrompt && runtimeSession) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false, session: runtimeSession });
+      if (!queuedStreamingPrompt && !promptSuperseded && runtimeSession && !this.cachedSessionIsStreaming(runtimeSession)) this.cancelExtensionUiRequests(projectPath, body.sessionId, { allWhenSessionMissing: false, session: runtimeSession });
       if (runtimeSession && this.sessionOperationIds.get(runtimeSession) === operationId) this.sessionOperationIds.delete(runtimeSession);
       releaseStreamingDispatch();
       releaseStreamKeyLock?.();
@@ -1163,8 +1256,10 @@ export class PiBridge {
         type: 'agent:notice',
         operationId,
         sessionId: body.sessionId,
-        message: 'Reloaded extensions, skills, prompts, themes, settings, and context files.',
-        data: { level: 'info' },
+        message: this.extensionLoadErrors.get(session)?.length
+          ? 'Reloaded resources, but some extensions failed to load. See the extension diagnostics.'
+          : 'Reloaded extensions, skills, prompts, themes, settings, and context files.',
+        data: { level: this.extensionLoadErrors.get(session)?.length ? 'warning' : 'info' },
       });
       this.broadcast(key, { type: 'agent:status', operationId, sessionId: body.sessionId, data: { running: false, statuses: this.statusEntries(session) } });
       return { ok: true };
@@ -1409,10 +1504,11 @@ export class PiBridge {
     return pending.request;
   }
 
-  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void; onEvent?: (event: unknown, type: string | undefined) => void; syntheticStartActive?: () => boolean; operationId?: string } = {}) {
+  private subscribeSessionEvents(session: any, key: string | string[], sessionId: string | undefined, options: { mirrorLifecycle?: boolean; lifecycle?: { started: boolean; finished: boolean }; onActivityStart?: () => void; onEvent?: (event: unknown, type: string | undefined) => void; syntheticStartActive?: () => boolean; operationId?: string; onSuperseded?: () => void } = {}) {
     if (typeof session?.subscribe !== 'function') return undefined;
-    return session.subscribe((event: unknown) => {
-      if (session && typeof session === 'object' && this.sessionCannotPublish(session)) return;
+    const relay = this.sessionEventRelay(session);
+    const listener = (event: unknown) => {
+      if (this.sessionCannotPublish(session)) return;
       const type = agentEventType(event);
       options.onEvent?.(event, type);
       if (options.mirrorLifecycle && type === 'agent_start' && options.lifecycle) options.lifecycle.finished = false;
@@ -1423,12 +1519,107 @@ export class PiBridge {
       }
       this.broadcast(key, { type: 'agent:event', operationId: options.operationId, sessionId, data: this.agentEventWithClientMessageId(session, event, type) });
       if (options.mirrorLifecycle && type === 'agent_settled' && options.lifecycle) options.lifecycle.finished = true;
+    };
+    const subscription = { onEvent: listener, operationId: options.operationId, onSuperseded: options.onSuperseded };
+    relay.listeners.add(subscription);
+    return () => {
+      relay.listeners.delete(subscription);
+      if (!relay.listeners.size && !relay.background) {
+        relay.unsubscribe?.();
+        this.sessionEventRelays.delete(session);
+      }
+    };
+  }
+
+  private sessionEventRelay(session: any): SessionEventRelay {
+    const existing = this.sessionEventRelays.get(session);
+    if (existing) return existing;
+    const relay: SessionEventRelay = { listeners: new Set(), observers: new Set(), progressGeneration: 0, pendingAgentSettlements: 0, pendingNavigations: 0, nextAgentStartIsNewRun: true };
+    this.sessionEventRelays.set(session, relay);
+    relay.unsubscribe = session.subscribe((event: unknown) => {
+      if (this.sessionCannotPublish(session)) return;
+      // Publication can change owners while older SDK promises still await
+      // settlement hooks. All their watchdogs must see this session's progress.
+      relay.progressGeneration += 1;
+      const type = agentEventType(event);
+      if (type === 'agent_settled') {
+        if (!this.cachedSessionIsStreaming(session)) relay.nextAgentStartIsNewRun = true;
+        relay.pendingAgentSettlements = Math.max(0, relay.pendingAgentSettlements - 1);
+        // SDK settlement hooks can outlive their run. If queued input started
+        // another run during a hook, neither settlement may end it early.
+        if (relay.pendingAgentSettlements > 0 || this.cachedSessionIsStreaming(session)) return;
+      }
+      for (const observer of [...relay.observers]) observer(event);
+      // Retries share a settlement; deferred extension turns after settlement
+      // start distinct runs, even if an older run's settlement hook is pending.
+      if (type === 'agent_start') {
+        if (relay.nextAgentStartIsNewRun || relay.pendingAgentSettlements === 0) relay.pendingAgentSettlements += 1;
+        relay.nextAgentStartIsNewRun = false;
+      }
+      const manualCompactionEnded = type === 'compaction_end' && (event as { reason?: string }).reason === 'manual';
+      const background = relay.background;
+      const listeners = [...relay.listeners].filter((listener) => !listener.superseded);
+      if (listeners.length) {
+        // Foreground operations can interrupt a background run. They own event
+        // publication, but its terminal event must still retire background state.
+        if (type === 'agent_settled' || manualCompactionEnded) this.finishBackgroundActivity(session, relay);
+        for (const listener of listeners) listener.onEvent(event);
+        return;
+      }
+      if (!background) return;
+      const key = this.sessionStreamKeys.get(session) ?? [];
+      if (isCommandActivityStartEvent(type) && !background.operationId) {
+        background.operationId = this.sessionOperationIds.get(session) ?? randomUUID();
+        this.broadcast(key, { type: 'agent:start', sessionId: background.sessionId, operationId: background.operationId });
+      }
+      if (type === 'message_end') {
+        const message = (event as { message?: { role?: string; stopReason?: string; errorMessage?: string } }).message;
+        if (message?.role === 'assistant') background.assistantError = message.stopReason === 'error' ? message.errorMessage || 'Agent failed' : undefined;
+      }
+      if (type === 'compaction_end') {
+        const compaction = event as { reason?: string; aborted?: boolean; willRetry?: boolean; errorMessage?: string };
+        if (manualCompactionEnded && compaction.aborted) background.terminalError = 'Compaction cancelled';
+        else if (!compaction.aborted && compaction.errorMessage) background.terminalError = compaction.errorMessage;
+        else if (!compaction.aborted && compaction.willRetry) {
+          background.assistantError = undefined;
+          background.terminalError = undefined;
+        }
+      }
+      this.broadcast(key, { type: 'agent:event', sessionId: background.sessionId, operationId: background.operationId, data: this.agentEventWithClientMessageId(session, event, type) });
+      // Idle custom messages do not start a turn. Refresh persisted history without
+      // marking an unrelated operation finished or resetting the live transcript.
+      if (type === 'message_end' && !background.operationId) {
+        this.broadcast(key, { type: 'agent:history-updated', sessionId: background.sessionId });
+      }
+      if (type === 'agent_settled' || manualCompactionEnded) this.finishBackgroundActivity(session, relay);
     });
+    return relay;
+  }
+
+  private finishBackgroundActivity(session: object, relay: SessionEventRelay) {
+    const background = relay.background;
+    if (!background?.operationId || relay.pendingNavigations || relay.pendingAgentSettlements
+      || this.cachedSessionIsStreaming(session) || this.sessionCannotPublish(session)) return;
+    const operationId = background.operationId;
+    const message = background.terminalError ?? background.assistantError;
+    background.operationId = undefined;
+    background.assistantError = undefined;
+    background.terminalError = undefined;
+    if (![...relay.listeners].some((listener) => !listener.superseded)) {
+      this.broadcast(this.sessionStreamKeys.get(session) ?? [], {
+        type: message ? 'agent:error' : 'agent:finish', sessionId: background.sessionId, operationId,
+        ...(message ? { message } : {}),
+      });
+    }
   }
 
   private agentEventWithClientMessageId(session: object, event: unknown, type: string | undefined) {
     if (type === 'agent_settled') {
-      this.pendingStreamingClientMessages.delete(session);
+      // An SDK queue call can still be awaiting an input hook at settlement.
+      // Its next queue_update must retain the client's delivery identity.
+      const pending = this.pendingStreamingClientMessages.get(session)?.filter((message) => !message.queued);
+      if (pending?.length) this.pendingStreamingClientMessages.set(session, pending);
+      else this.pendingStreamingClientMessages.delete(session);
       this.deliveredStreamingClientMessages.delete(session);
       this.streamingQueueSlots.delete(session);
       return event;
@@ -1436,26 +1627,51 @@ export class PiBridge {
     if (!event || typeof event !== 'object') return event;
     if (type === 'queue_update') {
       const record = event as { steering?: unknown; followUp?: unknown };
-      const nextSizes = {
-        steer: Array.isArray(record.steering) ? record.steering.length : 0,
-        followUp: Array.isArray(record.followUp) ? record.followUp.length : 0,
+      const nextQueues = {
+        steer: Array.isArray(record.steering) ? record.steering : [],
+        followUp: Array.isArray(record.followUp) ? record.followUp : [],
       };
       const slots = this.streamingQueueSlots.get(session) ?? { steer: [], followUp: [] };
       const pendingMessages = this.pendingStreamingClientMessages.get(session) ?? [];
       const deliveredMessages = this.deliveredStreamingClientMessages.get(session) ?? [];
+      const activeInput = this.streamingInputContext.getStore();
       for (const behavior of ['steer', 'followUp'] as const) {
-        while (slots[behavior].length < nextSizes[behavior]) {
-          const pending = pendingMessages.find((message) => message.behavior === behavior && !message.queued);
+        const previous = slots[behavior];
+        const retained = new Set<number>();
+        const next: StreamingQueueSlot[] = new Array(nextQueues[behavior].length);
+        if (next.length < previous.length) {
+          let previousIndex = previous.length - 1;
+          for (let nextIndex = next.length - 1; nextIndex >= 0; nextIndex -= 1) {
+            while (previousIndex >= 0 && previous[previousIndex].text !== nextQueues[behavior][nextIndex]) previousIndex -= 1;
+            if (previousIndex < 0) break;
+            retained.add(previousIndex);
+            next[nextIndex] = previous[previousIndex];
+            previousIndex -= 1;
+          }
+        } else {
+          let previousIndex = 0;
+          for (let nextIndex = 0; nextIndex < next.length; nextIndex += 1) {
+            while (previousIndex < previous.length && previous[previousIndex].text !== nextQueues[behavior][nextIndex]) previousIndex += 1;
+            if (previousIndex >= previous.length) break;
+            retained.add(previousIndex);
+            next[nextIndex] = previous[previousIndex];
+            previousIndex += 1;
+          }
+        }
+        for (let index = 0; index < next.length; index += 1) {
+          if (next[index]) continue;
+          const pending = activeInput?.behavior === behavior && !activeInput.queued && !activeInput.inputHandled ? activeInput : undefined;
           if (pending) pending.queued = true;
-          slots[behavior].push(pending);
+          next[index] = { text: nextQueues[behavior][index], message: pending };
         }
-        while (slots[behavior].length > nextSizes[behavior]) {
-          const delivered = slots[behavior].shift();
-          if (!delivered) continue;
+        for (const [index, slot] of previous.entries()) {
+          const delivered = slot.message;
+          if (retained.has(index) || !delivered) continue;
           deliveredMessages.push(delivered);
-          const index = pendingMessages.findIndex(({ token }) => token === delivered.token);
-          if (index !== -1) pendingMessages.splice(index, 1);
+          const pendingIndex = pendingMessages.findIndex(({ token }) => token === delivered.token);
+          if (pendingIndex !== -1) pendingMessages.splice(pendingIndex, 1);
         }
+        slots[behavior] = next;
       }
       if (pendingMessages.length) this.pendingStreamingClientMessages.set(session, pendingMessages);
       else this.pendingStreamingClientMessages.delete(session);
@@ -1551,14 +1767,17 @@ export class PiBridge {
       let sawActivity = false;
       let eligibleSince: number | undefined;
       let lastProgress = options.progress?.() ?? 0;
+      let lastSessionProgress = this.sessionEventRelays.get(options.session)?.progressGeneration ?? 0;
       let lastProgressAt = Date.now();
       let timer: NodeJS.Timeout | undefined;
       const check = () => {
         if (closed || taskFinished) return;
         const now = Date.now();
         const progress = options.progress?.() ?? 0;
-        if (progress !== lastProgress) {
+        const sessionProgress = this.sessionEventRelays.get(options.session)?.progressGeneration ?? 0;
+        if (progress !== lastProgress || sessionProgress !== lastSessionProgress) {
           lastProgress = progress;
+          lastSessionProgress = sessionProgress;
           lastProgressAt = now;
         }
         const settled = options.settled();
@@ -1684,17 +1903,50 @@ export class PiBridge {
   }
 
   private wrapExtensionAsyncSessionMethods(session: any) {
-    if (!session || typeof session !== 'object' || this.extensionAsyncWrappedSessions.has(session)) return;
-    this.extensionAsyncWrappedSessions.add(session);
-    for (const method of ['sendCustomMessage', 'sendUserMessage'] as const) {
-      if (typeof session[method] !== 'function') continue;
-      const original = session[method];
-      session[method] = (...args: unknown[]) => {
-        const result = original.apply(session, args);
-        if (isPromiseLike(result)) this.trackExtensionAsyncTask(session, result);
-        return result;
-      };
+    if (!session || typeof session !== 'object') return;
+    if (!this.extensionAsyncWrappedSessions.has(session)) {
+      this.extensionAsyncWrappedSessions.add(session);
+      for (const method of ['sendCustomMessage', 'sendUserMessage'] as const) {
+        if (typeof session[method] !== 'function') continue;
+        const original = session[method];
+        session[method] = (...args: unknown[]) => {
+          const result = original.apply(session, args);
+          if (isPromiseLike(result)) this.trackExtensionAsyncTask(session, result);
+          return result;
+        };
+      }
+      if (typeof session.prompt === 'function') {
+        const prompt = session.prompt;
+        session.prompt = (text: string, options?: { source?: string; streamingBehavior?: StreamingBehavior }) => {
+          const pending = options?.source === 'rpc' && options.streamingBehavior
+            ? this.pendingStreamingClientMessages.get(session)?.find((message) => message.behavior === options.streamingBehavior && !message.queued && !message.inputHandled)
+            : undefined;
+          return this.streamingInputContext.run(pending, () => prompt.call(session, text, options));
+        };
+      }
     }
+
+    const extensionRunner = session.extensionRunner;
+    if (!extensionRunner || typeof extensionRunner !== 'object' || typeof extensionRunner.emitInput !== 'function' || this.extensionInputWrappedRunners.has(extensionRunner)) return;
+    this.extensionInputWrappedRunners.add(extensionRunner);
+    const emitInput = extensionRunner.emitInput;
+    extensionRunner.emitInput = async (text: string, images: unknown, source: string, behavior?: StreamingBehavior) => {
+      const pending = source === 'rpc'
+        ? this.streamingInputContext.getStore()
+          ?? this.pendingStreamingClientMessages.get(session)?.find((message) => message.inputPending && (!behavior || message.behavior === behavior))
+        : undefined;
+      try {
+        const result = await emitInput.call(extensionRunner, text, images, source, behavior);
+        if (pending) {
+          pending.inputPending = false;
+          pending.inputHandled = result?.action === 'handled';
+        }
+        return result;
+      } catch (error) {
+        if (pending) pending.inputPending = false;
+        throw error;
+      }
+    };
   }
 
   private trackExtensionAsyncTask(session: object, task: PromiseLike<unknown>) {
@@ -1753,6 +2005,8 @@ export class PiBridge {
       } finally {
         if (timer) clearTimeout(timer);
       }
+      this.recordExtensionLoadErrors(session);
+      this.reportExtensionLoadErrors(session, sessionId);
       this.broadcast(this.sessionStreamKeys.get(session) ?? [], {
         type: 'agent:resources-reloaded',
         operationId: this.sessionOperationIds.get(session),
@@ -1779,6 +2033,10 @@ export class PiBridge {
     if (!session || typeof session !== 'object') return;
     this.bindSessionStreamKeys(session, key);
     this.wrapExtensionAsyncSessionMethods(session);
+    if (typeof session.subscribe === 'function') {
+      const relay = this.sessionEventRelay(session);
+      relay.background ??= { sessionId };
+    }
     if (this.boundSessions.has(session) || typeof session.bindExtensions !== 'function') return;
     const pendingBinding = this.sessionBindingPromises.get(session);
     if (pendingBinding) return pendingBinding;
@@ -1799,8 +2057,32 @@ export class PiBridge {
         fork: async () => ({ cancelled: true }),
         navigateTree: async (targetId: string, options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string }) => {
           if (typeof session?.navigateTree !== 'function') return { cancelled: true };
-          const result = await session.navigateTree(targetId, options);
-          return { cancelled: Boolean(result?.cancelled) };
+          const relay = this.sessionEventRelays.get(session);
+          if (!relay || this.cachedSessionIsStreaming(session) || session.isCompacting) {
+            const result = await session.navigateTree(targetId, options);
+            return { cancelled: Boolean(result?.cancelled) };
+          }
+          // A tree hook can start a turn. Neither that turn's settlement nor
+          // navigation completion may finish the shared activity on its own.
+          relay.pendingNavigations += 1;
+          const background = relay.background;
+          if (background && ![...relay.listeners].some((listener) => !listener.superseded) && !background.operationId) {
+            background.operationId = randomUUID();
+            this.broadcast(this.sessionStreamKeys.get(session) ?? [], { type: 'agent:start', sessionId, operationId: background.operationId });
+          }
+          let errorMessage: string | undefined;
+          try {
+            const result = await session.navigateTree(targetId, options);
+            if (result?.cancelled) errorMessage = result.aborted ? 'Tree navigation aborted' : 'Tree navigation cancelled';
+            return { cancelled: Boolean(result?.cancelled) };
+          } catch (error) {
+            errorMessage = error instanceof Error ? error.message : 'Tree navigation failed';
+            throw error;
+          } finally {
+            relay.pendingNavigations -= 1;
+            if (errorMessage && relay.background?.operationId) relay.background.terminalError = errorMessage;
+            this.finishBackgroundActivity(session, relay);
+          }
         },
         switchSession: async () => ({ cancelled: true }),
         reload: () => this.reloadBoundSession(session, projectPath, sessionId),
@@ -1820,6 +2102,8 @@ export class PiBridge {
     try {
       await binding;
       this.boundSessions.add(session);
+      this.recordExtensionLoadErrors(session);
+      this.reportExtensionLoadErrors(session, sessionId);
     } finally {
       if (this.sessionBindingPromises.get(session) === binding) this.sessionBindingPromises.delete(session);
     }
@@ -2349,8 +2633,25 @@ export class PiBridge {
     });
   }
 
+  private recordExtensionLoadErrors(session: any, errors = session?.resourceLoader?.getExtensions?.()?.errors) {
+    if (!Array.isArray(errors)) return;
+    this.extensionLoadErrors.set(session, errors.map((error: { path?: string; error?: string }) =>
+      `Extension failed to load: ${[error.path, error.error].filter(Boolean).join(': ') || 'Unknown extension error'}`));
+  }
+
+  private reportExtensionLoadErrors(session: object, sessionId?: string) {
+    if (this.sessionCannotPublish(session)) return;
+    for (const message of this.extensionLoadErrors.get(session) ?? []) {
+      this.broadcast(this.sessionStreamKeys.get(session) ?? [], {
+        type: 'agent:notice', sessionId, operationId: this.sessionOperationIds.get(session), message, data: { level: 'error' },
+      });
+    }
+  }
+
   private statusEntries(session: object) {
-    return [...(this.extensionStatuses.get(session)?.entries() ?? [])]
+    return [...(this.extensionStatuses.get(session)?.entries() ?? []),
+      ...(this.extensionLoadErrors.get(session) ?? []).map((text, index): [string, string] => [`pi-web:extension-load:${index}`, text]),
+    ]
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, text]) => ({ key, text }))
       .filter((status) => status.text);
@@ -3171,6 +3472,8 @@ export class PiBridge {
       destroy?: () => unknown;
     };
     const disposal = Promise.resolve().then(async () => {
+      this.sessionEventRelays.get(session)?.unsubscribe?.();
+      this.sessionEventRelays.delete(session);
       const extensionRunner = disposable.extensionRunner;
       if (!this.extensionShutdownSessions.has(session) && extensionRunner) {
         if (typeof extensionRunner.emit === 'function'
@@ -3271,7 +3574,9 @@ export class PiBridge {
       }
 
       const result = await sdk.createAgentSession({ cwd: projectPath, sessionManager, settingsManager, resourceLoader });
-      return result.session ?? result;
+      const session = result.session ?? result;
+      this.recordExtensionLoadErrors(session, result.extensionsResult?.errors);
+      return session;
     });
     this.setCachedSession(this.runtimeSessions, projectPath, cacheKey, sessionPromise);
     try {
@@ -3740,7 +4045,7 @@ function projectIdFromStreamKey(key: string) {
 
 function isWorkspaceNotificationEvent(event: AgentEvent) {
   if (event.type === 'agent:status') return Boolean(event.data && typeof event.data === 'object' && (event.data as { running?: unknown }).running === false);
-  if (['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'agent:resources-reloaded', 'agent:resources-reload-failed', 'agent:ui-request', 'bash:start', 'bash:finish', 'bash:error', 'error'].includes(event.type)) return true;
+  if (['agent:start', 'agent:finish', 'agent:error', 'agent:notice', 'agent:history-updated', 'agent:resources-reloaded', 'agent:resources-reload-failed', 'agent:ui-request', 'bash:start', 'bash:finish', 'bash:error', 'error'].includes(event.type)) return true;
   if (event.type !== 'agent:event' || !event.data || typeof event.data !== 'object') return false;
   const type = (event.data as { type?: unknown }).type;
   if (typeof type !== 'string') return false;

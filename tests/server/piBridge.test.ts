@@ -1085,8 +1085,8 @@ test('recovers a terminal provider error from delayed extension-command activity
       setTimeout(() => {
         listener?.({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'Delayed provider failure' } });
         listener?.({ type: 'agent_end', willRetry: false });
-        listener?.({ type: 'agent_settled' });
         session.isStreaming = false;
+        listener?.({ type: 'agent_settled' });
       }, 1);
     },
     dispose: () => { disposed += 1; },
@@ -1116,7 +1116,8 @@ test('runs input hooks and tags a delivered steering message with its client mes
       listener = next;
       return () => { listener = undefined; };
     },
-    prompt: (prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+    prompt: (prompt: string, options: { preflightResult?: (success: boolean) => void; streamingBehavior?: string; source?: string; images?: unknown }) => {
+      if (options.streamingBehavior) return session.steer(prompt, options.images, { source: options.source! }).then(() => options.preflightResult?.(true));
       options.preflightResult?.(true);
       if (prompt === 'first') {
         session.isStreaming = true;
@@ -1142,7 +1143,9 @@ test('runs input hooks and tags a delivered steering message with its client mes
         return { action: 'transform', text: `transformed ${text}` };
       },
     },
-    steer: (prompt: string) => {
+    steer: async (text: string, images: unknown, options: { source: string }) => {
+      const input = await session.extensionRunner.emitInput(text, images, options.source, 'steer');
+      const prompt = input.text;
       listener?.({ type: 'queue_update', steering: [prompt], followUp: [] });
       listener?.({ type: 'queue_update', steering: [], followUp: [] });
       listener?.({ type: 'message_start', message: { role: 'user', content: [{ type: 'text', text: prompt }] } });
@@ -1195,40 +1198,6 @@ test('rejects steering when the active stream settles before dispatch', async ()
   assert.equal(promptCalls, 0);
 });
 
-test('rejects steering when the active stream settles during an input hook', async () => {
-  const bridge = new PiBridge();
-  let finishInputHook: (() => void) | undefined;
-  let steerCalls = 0;
-  const session = {
-    isStreaming: true,
-    extensionRunner: {
-      hasHandlers: (type: string) => type === 'input',
-      emitInput: async () => {
-        await new Promise<void>((resolve) => { finishInputHook = resolve; });
-        return { action: 'transform', text: 'transformed' };
-      },
-    },
-    steer: async () => { steerCalls += 1; },
-  };
-  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
-  (bridge as any).getSession = async () => session;
-  (bridge as any).broadcast = () => undefined;
-
-  const steering = bridge.prompt(process.cwd(), {
-    sessionId: 'settled-during-hook-session',
-    prompt: 'too late',
-    streamingBehavior: 'steer',
-    clientMessageId: 'client-message-1',
-  }, 'project:settled-during-hook-session');
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  session.isStreaming = false;
-  finishInputHook?.();
-
-  await assert.rejects(steering, /finished before the queued message/i);
-  assert.equal(steerCalls, 0);
-  assert.equal((bridge as any).streamingDispatchTails.size, 0);
-});
-
 test('handled streaming input releases the dispatch gate for the next prompt', async () => {
   const bridge = new PiBridge();
   const steerCalls: string[] = [];
@@ -1238,7 +1207,12 @@ test('handled streaming input releases the dispatch gate for the next prompt', a
       hasHandlers: (type: string) => type === 'input',
       emitInput: async (text: string) => text === 'handled' ? { action: 'handled' } : { action: 'continue' },
     },
-    steer: async (prompt: string) => { steerCalls.push(prompt); },
+    subscribe: () => () => undefined,
+    prompt: async (prompt: string, options: { source: string; preflightResult?: (success: boolean) => void }) => {
+      assert.equal(options.source, 'rpc');
+      if ((await session.extensionRunner.emitInput(prompt)).action !== 'handled') steerCalls.push(prompt);
+      options.preflightResult?.(true);
+    },
   };
   (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
   (bridge as any).getSession = async () => session;
@@ -1253,13 +1227,91 @@ test('handled streaming input releases the dispatch gate for the next prompt', a
   assert.equal((bridge as any).streamingDispatchTails.size, 0);
 });
 
+test('recovers a queued prompt whose SDK preflight never completes', async (t) => {
+  const bridge = new PiBridge({ runtimeNoProgressTimeoutMs: 5, runtimeWatchIntervalMs: 1 });
+  const keepAlive = setInterval(() => undefined, 100);
+  t.after(() => { clearInterval(keepAlive); });
+  const session = {
+    isStreaming: true,
+    subscribe: () => () => undefined,
+    prompt: async () => undefined,
+    dispose: () => { session.isStreaming = false; },
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = () => undefined;
+
+  await assert.rejects(
+    bridge.prompt(process.cwd(), { sessionId: 'pending-preflight-session', prompt: 'queued', streamingBehavior: 'steer' }, 'project:pending-preflight-session'),
+    /runtime was reset/i,
+  );
+  assert.equal(session.isStreaming, false);
+  assert.equal((bridge as any).pendingStreamingClientMessages.has(session), false);
+  assert.equal((bridge as any).sessionEventRelays.get(session)?.observers.size ?? 0, 0);
+  await bridge.dispose();
+});
+
+test('rejected deferred preflight cannot supply the next request client identity', async () => {
+  const bridge = new PiBridge();
+  let rejectPreflight: ((success: boolean) => void) | undefined;
+  let delivered: any;
+  const session = {
+    isStreaming: true,
+    subscribe: () => () => undefined,
+    prompt: async (prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+      if (prompt === 'rejected') {
+        rejectPreflight = options.preflightResult;
+        return;
+      }
+      (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: [prompt], followUp: [] }, 'queue_update');
+      options.preflightResult?.(true);
+      (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: [], followUp: [] }, 'queue_update');
+      delivered = (bridge as any).agentEventWithClientMessageId(session, {
+        type: 'message_start', message: { role: 'user', content: [{ type: 'text', text: prompt }] },
+      }, 'message_start');
+    },
+    dispose: () => undefined,
+  };
+  (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
+  (bridge as any).getSession = async () => session;
+  (bridge as any).broadcast = () => undefined;
+
+  const rejected = bridge.prompt(process.cwd(), {
+    sessionId: 'rejected-deferred-preflight-session',
+    prompt: 'rejected',
+    streamingBehavior: 'steer',
+    clientMessageId: 'must-not-leak',
+  }, 'project:rejected-deferred-preflight-session');
+  const next = bridge.prompt(process.cwd(), {
+    sessionId: 'rejected-deferred-preflight-session',
+    prompt: 'next',
+    streamingBehavior: 'steer',
+    clientMessageId: 'next-client',
+  }, 'project:rejected-deferred-preflight-session');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.ok(rejectPreflight);
+  rejectPreflight(false);
+  await assert.rejects(rejected, /rejected before delivery/i);
+  await next;
+  assert.equal(delivered.clientMessageId, 'next-client');
+  assert.notEqual(delivered.clientMessageId, 'must-not-leak');
+  assert.equal((bridge as any).pendingStreamingClientMessages.has(session), false);
+  assert.equal((bridge as any).deliveredStreamingClientMessages.has(session), false);
+  assert.equal((bridge as any).sessionEventRelays.get(session)?.observers.size ?? 0, 0);
+  await bridge.dispose();
+});
+
 test('keeps later steering requests behind an earlier request when the middle request fails', async () => {
   const bridge = new PiBridge();
   const steerCalls: string[] = [];
   let releaseFirstPreparation: (() => void) | undefined;
   const session = {
     isStreaming: true,
-    steer: async (prompt: string) => { steerCalls.push(prompt); },
+    subscribe: () => () => undefined,
+    prompt: async (prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
+      steerCalls.push(prompt);
+      options.preflightResult?.(true);
+    },
   };
   (bridge as any).markSessionActiveWithState = async () => ({ wasActive: false, release: () => undefined });
   (bridge as any).getSession = async () => session;
@@ -1317,11 +1369,13 @@ test('matches client ids to dequeued SDK messages', () => {
   const followUp = { token: 'follow-up', behavior: 'followUp', queued: true };
   const steer = { token: 'tagged-steer', behavior: 'steer', clientMessageId: 'client-message-1', queued: false };
   (bridge as any).pendingStreamingClientMessages.set(session, [followUp, steer]);
-  (bridge as any).streamingQueueSlots.set(session, { steer: [], followUp: [followUp] });
+  (bridge as any).streamingQueueSlots.set(session, { steer: [], followUp: [{ text: 'old follow-up', message: followUp }] });
   const userStart = { type: 'message_start', message: { role: 'user', content: [] } };
 
   (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: [], followUp: [] }, 'queue_update');
-  (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: ['new steer'], followUp: [] }, 'queue_update');
+  (bridge as any).streamingInputContext.run(steer, () => {
+    (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: ['new steer'], followUp: [] }, 'queue_update');
+  });
   const deliveredFollowUp = (bridge as any).agentEventWithClientMessageId(session, userStart, 'message_start');
   (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: [], followUp: [] }, 'queue_update');
   const deliveredSteer = (bridge as any).agentEventWithClientMessageId(session, userStart, 'message_start');
@@ -1330,12 +1384,49 @@ test('matches client ids to dequeued SDK messages', () => {
   assert.equal(deliveredSteer.clientMessageId, 'client-message-1');
 });
 
+test('matches duplicate queue text to the SDK message that was removed', () => {
+  const bridge = new PiBridge();
+  const session = {};
+  const web = { token: 'web', behavior: 'steer', clientMessageId: 'web-client', queued: false };
+  (bridge as any).pendingStreamingClientMessages.set(session, [web]);
+  const queue = (steering: string[]) => (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering, followUp: [] }, 'queue_update');
+  const start = { type: 'message_start', message: { role: 'user', content: [{ type: 'text', text: 'same' }] } };
+
+  queue(['same']);
+  (bridge as any).streamingInputContext.run(web, () => queue(['same', 'same']));
+  queue(['same']);
+  const extensionMessage = (bridge as any).agentEventWithClientMessageId(session, start, 'message_start');
+  queue([]);
+  const webMessage = (bridge as any).agentEventWithClientMessageId(session, start, 'message_start');
+
+  assert.equal(extensionMessage.clientMessageId, undefined);
+  assert.equal(webMessage.clientMessageId, 'web-client');
+});
+
+test('tracks queued client identity after SDK prompt expansion', () => {
+  const bridge = new PiBridge();
+  const session = {};
+  const web = { token: 'expanded', behavior: 'steer', clientMessageId: 'web-client', queued: false };
+  (bridge as any).pendingStreamingClientMessages.set(session, [web]);
+
+  (bridge as any).streamingInputContext.run(web, () => {
+    (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: ['expanded prompt text'], followUp: [] }, 'queue_update');
+  });
+  (bridge as any).agentEventWithClientMessageId(session, { type: 'queue_update', steering: [], followUp: [] }, 'queue_update');
+  const delivered = (bridge as any).agentEventWithClientMessageId(session, {
+    type: 'message_start', message: { role: 'user', content: [{ type: 'text', text: 'expanded prompt text' }] },
+  }, 'message_start');
+
+  assert.equal(delivered.clientMessageId, 'web-client');
+});
+
 test('reports queued prompt recovery as a terminal error', async () => {
   const bridge = new PiBridge({ runtimeIdleGraceMs: 5, runtimeWatchIntervalMs: 1 });
   const events: Array<{ type?: string; message?: string }> = [];
   let promptCalls = 0;
   const session = {
     isStreaming: false,
+    subscribe: () => () => undefined,
     prompt: (_prompt: string, options: { preflightResult?: (success: boolean) => void }) => {
       promptCalls += 1;
       session.isStreaming = true;
