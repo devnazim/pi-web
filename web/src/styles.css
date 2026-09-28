@@ -529,6 +529,16 @@ body {
 
   .confirm-dialog {
     @apply grid grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden;
+    max-width: var(--container-xl);
+    max-height: min(50vh, calc(100vh - 3rem));
+    max-height: min(50dvh, calc(100dvh - 3rem));
+  }
+
+  @media (max-width: 767px) {
+    .confirm-dialog {
+      max-height: min(80vh, calc(100vh - 3rem));
+      max-height: min(80dvh, calc(100dvh - 3rem));
+    }
   }
 
   .confirm-dialog-body {
