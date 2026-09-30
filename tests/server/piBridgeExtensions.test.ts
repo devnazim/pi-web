@@ -538,6 +538,86 @@ for (const parentSettlesFirst of [true, false]) {
   });
 }
 
+test('a real SDK settlement still recovers when its operation promise never resolves', { timeout: 10_000 }, async (t) => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage('Answer')]);
+  const { bridge, session, sessionId, cwd, key, events } = await extensionFixture(t, () => undefined, faux, {
+    runtimeSettledGraceMs: 15, runtimeIdleGraceMs: 500, runtimeNoProgressTimeoutMs: 500, runtimeWatchIntervalMs: 2,
+  });
+  const sdkPrompt = session.prompt.bind(session);
+  session.prompt = (async (...args: Parameters<typeof session.prompt>) => {
+    await sdkPrompt(...args);
+    await new Promise<void>(() => undefined);
+  }) as typeof session.prompt;
+  const keepAlive = setInterval(() => undefined, 100);
+  t.after(() => { clearInterval(keepAlive); });
+  await assert.rejects(bridge.prompt(cwd, { sessionId, prompt: 'first' }, key), /runtime was reset/i);
+  assert.equal(events.some((event) => event.data?.type === 'agent_settled'), true);
+  assert.equal((bridge as any).runtimeRecoveries.size, 1);
+});
+
+test('real SDK deferred prompt can wait in a start hook past the prior settled grace', { timeout: 10_000 }, async (t) => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage('First answer'), fauxAssistantMessage('Second answer')]);
+  let releaseStart!: () => void;
+  let startPending!: () => void;
+  const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+  const startReady = new Promise<void>((resolve) => { startPending = resolve; });
+  t.after(() => { releaseStart(); });
+  let session!: Awaited<ReturnType<typeof createAgentSession>>['session'];
+  let settlements = 0;
+  let deferredError: unknown;
+  const fixture = await extensionFixture(t, (pi) => {
+    pi.on('agent_settled', () => {
+      if (++settlements === 1) void session.prompt('second', { source: 'rpc' }).catch((error) => { deferredError = error; });
+    });
+    pi.on('before_agent_start', async (event) => {
+      if (event.prompt === 'second') { startPending(); await startGate; }
+    });
+  }, faux, { runtimeSettledGraceMs: 15, runtimeIdleGraceMs: 500, runtimeNoProgressTimeoutMs: 500, runtimeWatchIntervalMs: 2 });
+  session = fixture.session;
+  const prompt = fixture.bridge.prompt(fixture.cwd, { sessionId: fixture.sessionId, prompt: 'first' }, fixture.key);
+  void prompt.catch(() => undefined);
+  await startReady;
+  assert.equal(session.isStreaming, false);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal((fixture.bridge as any).runtimeRecoveries.size, 0);
+  releaseStart();
+  await prompt;
+  assert.equal(deferredError, undefined);
+  assert.equal(faux.state.callCount, 2);
+});
+
+test('real SDK continuation is not reset under the previous settled deadline', { timeout: 10_000 }, async (t) => {
+  const faux = fauxProvider();
+  faux.setResponses([fauxAssistantMessage('First answer'), fauxAssistantMessage('Continued answer')]);
+  let releaseStart!: () => void;
+  let startPending!: () => void;
+  const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+  const startReady = new Promise<void>((resolve) => { startPending = resolve; });
+  t.after(() => { releaseStart(); });
+  let starts = 0;
+  let settlements = 0;
+  const { bridge, session, sessionId, cwd, key, events } = await extensionFixture(t, (pi) => {
+    pi.on('agent_settled', () => {
+      if (++settlements === 1) pi.sendMessage({ customType: 'continuation', content: 'Continue', display: true }, { triggerTurn: true });
+    });
+    pi.on('agent_start', async () => {
+      if (++starts === 2) { startPending(); await startGate; }
+    });
+  }, faux, { runtimeSettledGraceMs: 15, runtimeNoProgressTimeoutMs: 500, runtimeWatchIntervalMs: 2 });
+  const prompt = bridge.prompt(cwd, { sessionId, prompt: 'first' }, key);
+  void prompt.catch(() => undefined);
+  await startReady;
+  assert.equal(session.isStreaming, true);
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal((bridge as any).runtimeRecoveries.size, 0);
+  releaseStart();
+  await prompt;
+  assert.equal(faux.state.callCount, 2);
+  assert.equal(events.some((event) => event.type === 'agent:error'), false);
+});
+
 for (const parentSettlesBeforeStart of [false, true]) {
   test(`a deferred extension turn keeps activity open when the parent settles ${parentSettlesBeforeStart ? 'before' : 'after'} its start hook`, { timeout: 10_000 }, async (t) => {
     const faux = fauxProvider();
@@ -941,7 +1021,7 @@ test('SDK-deferred direct run retains its client id through an asynchronous star
         await deferredStartGate;
       }
     });
-  }, faux);
+  }, faux, { runtimeSettledGraceMs: 15, runtimeIdleGraceMs: 500, runtimeNoProgressTimeoutMs: 500, runtimeWatchIntervalMs: 2 });
 
   const first = bridge.prompt(cwd, { sessionId, prompt: 'first' }, key);
   await firstReady;
@@ -967,9 +1047,13 @@ test('SDK-deferred direct run retains its client id through an asynchronous star
   assert.equal(events.some((event) => event.data?.clientMessageId === 'deferred-direct-client'), false);
 
   releaseParentSettlement();
+  await first;
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  assert.equal((bridge as any).runtimeRecoveries.size, 0);
+  assert.equal(deferredSettled, false);
   releaseDeferredStart();
   await deferred;
-  await Promise.all([first, replacement]);
+  await replacement;
   assert.deepEqual(inputs.filter(({ text }) => text === 'deferred direct'), [{ text: 'deferred direct', source: 'rpc' }]);
   const delivered = events.filter((event) => event.data?.type === 'message_start' && event.data.clientMessageId === 'deferred-direct-client');
   assert.equal(delivered.length, 1);

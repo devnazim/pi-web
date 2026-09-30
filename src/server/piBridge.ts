@@ -285,6 +285,7 @@ export class PiBridge {
   private readonly extensionAsyncWrappedSessions = new WeakSet<object>();
   private readonly extensionInputWrappedRunners = new WeakSet<object>();
   private readonly extensionAsyncTasks = new WeakMap<object, Set<Promise<unknown>>>();
+  private readonly pendingSdkPrompts = new WeakMap<object, Set<Promise<unknown>>>();
   private readonly extensionErrorCounts = new WeakMap<object, number>();
   private readonly extensionStatuses = new WeakMap<object, Map<string, string>>();
   private readonly pendingExtensionUiRequests = new Map<string, PendingExtensionUiRequest<any>>();
@@ -1796,7 +1797,10 @@ export class PiBridge {
         const terminalError = options.terminalError?.();
         const hasUiRequest = [...this.pendingExtensionUiRequests.values()].some((item) => item.session === options.session && item.projectPath === projectPath && item.request.sessionId === sessionId)
           || [...this.pendingExtensionCustomUi.values()].some((item) => item.session === options.session && item.projectPath === projectPath && item.sessionId === sessionId);
-        const inUse = this.cachedSessionInUse(options.session);
+        // Pi can recurse into a deferred prompt after agent_settled. Its async
+        // input/start hook runs before isStreaming turns true or agent_start fires.
+        const inUse = this.cachedSessionInUse(options.session)
+          || (settled && (this.pendingSdkPrompts.get(options.session)?.size ?? 0) > 1);
         if (inUse) sawActivity = true;
         const eligible = options.accepted()
           && (settled || sawActivity || options.acceptedIsActivity)
@@ -1807,10 +1811,16 @@ export class PiBridge {
           lastProgressAt = now;
         } else {
           eligibleSince ??= now;
-          const timeout = terminalError || settled
-            ? this.runtimeSettledGraceMs
-            : inUse ? this.runtimeNoProgressTimeoutMs : this.runtimeIdleGraceMs;
-          if (now - Math.max(eligibleSince, lastProgressAt) >= timeout) {
+          const reason = terminalError ? 'terminal-error' : inUse ? 'no-progress' : settled ? 'settled' : 'idle';
+          const timeout = terminalError ? this.runtimeSettledGraceMs
+            : inUse ? this.runtimeNoProgressTimeoutMs
+            : settled ? this.runtimeSettledGraceMs : this.runtimeIdleGraceMs;
+          const idleMs = now - Math.max(eligibleSince, lastProgressAt);
+          if (idleMs >= timeout) {
+            console.warn('[pi-web] Runtime watchdog recovery', {
+              reason, idleMs, timeoutMs: timeout, sessionId: sessionId ?? null,
+              accepted: options.accepted(), settled, inUse, sawActivity, requireSettled: Boolean(options.requireSettled),
+            });
             operation.recover(terminalError ?? AGENT_RUNTIME_RECOVERY_MESSAGE);
             return;
           }
@@ -1934,6 +1944,16 @@ export class PiBridge {
             ? this.pendingStreamingClientMessages.get(session)?.find((message) => message.behavior === options.streamingBehavior && !message.queued && !message.inputHandled)
             : undefined;
           const task = this.streamingInputContext.run(pending, () => prompt.call(session, text, options));
+          if (isPromiseLike(task)) {
+            const tracked = Promise.resolve(task);
+            const prompts = this.pendingSdkPrompts.get(session) ?? new Set<Promise<unknown>>();
+            prompts.add(tracked);
+            this.pendingSdkPrompts.set(session, prompts);
+            void tracked.finally(() => {
+              prompts.delete(tracked);
+              if (!prompts.size) this.pendingSdkPrompts.delete(session);
+            }).catch(() => undefined);
+          }
           const preflightResult = options?.preflightResult;
           if (!preflightResult) return task;
           return Promise.resolve(task).catch((error: unknown) => {

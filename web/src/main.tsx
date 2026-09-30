@@ -87,6 +87,7 @@ import {
 } from './composerHistory';
 import { appUrl, appWebSocketUrl } from './appUrl';
 import { StaleAgentStatusError, isCurrentAgentStatusTarget, shouldRetryAgentRefresh, shouldSuppressAgentUiRequests, withRequestTimeout } from './agentRefresh';
+import { createTerminalHistoryRefresh, type TerminalRefreshStatus } from './terminalHistoryRefresh';
 import { markSessionActivityStarted, pendingUserMessagesAfterTerminalRefresh, shouldRefreshCompletedSession, unresolvedPendingUserMessages, type PendingUserMessageHandoff } from './chatHandoff';
 import {
   appendLiveActivityDelta,
@@ -5823,9 +5824,6 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
   let runningCommandToken: symbol | undefined;
   let localCommandGeneration = 0;
   let pendingUserMessageSequence = 0;
-  const pendingTerminalRefreshCounts = new Map<string, number>();
-  const pendingTerminalRefreshRetryTimers = new Map<string, number>();
-  const blockedTerminalRefreshKeys = new Set<string>();
   let terminalSubmissionGeneration = 0;
   let handledPendingTerminalError = '';
   let liveTurnActivityActive = false;
@@ -5881,11 +5879,12 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
   const [composerSubmissions, setComposerSubmissions] = createSignal<Map<string, { submission: boolean; steering: boolean }>>(new Map());
-  const [pendingTerminalRefreshKeys, setPendingTerminalRefreshKeys] = createSignal<Set<string>>(new Set<string>());
-  const pendingTerminalRefreshActive = createMemo(() => {
+  const [terminalRefreshStatuses, setTerminalRefreshStatuses] = createSignal<Map<string, TerminalRefreshStatus>>(new Map());
+  const terminalRefreshStatus = createMemo(() => {
     const sessionId = props.sessionId ?? commandSessionId();
-    return Boolean(sessionId && pendingTerminalRefreshKeys().has(`${props.project.id}\u0000${sessionId}`));
+    return sessionId ? terminalRefreshStatuses().get(`${props.project.id}\u0000${sessionId}`) : undefined;
   });
+  const pendingTerminalRefreshActive = () => terminalRefreshStatus() !== undefined;
   const [attachBusy, setAttachBusy] = createSignal(false);
   const [attachErrorToast, setAttachErrorToast] = createSignal<{ id: number; message: string }>();
   const [extensionUiResponding, setExtensionUiResponding] = createSignal<string>();
@@ -6471,8 +6470,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     if (transcriptScrollFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFrame);
     if (transcriptScrollFollowupFrame !== undefined) window.cancelAnimationFrame(transcriptScrollFollowupFrame);
     if (composerLayoutFrame !== undefined) window.cancelAnimationFrame(composerLayoutFrame);
-    for (const timer of pendingTerminalRefreshRetryTimers.values()) window.clearTimeout(timer);
-    pendingTerminalRefreshRetryTimers.clear();
+    terminalHistoryRefresh.dispose();
     clearAttachToastTimer();
   });
 
@@ -7194,23 +7192,10 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
     setUploads((items) => items.filter((item) => item.path !== path));
   }
 
-  async function reconcilePendingUserMessagesAfterTerminal(projectId: string, sessionId: string, pendingAtTerminal: PendingUserMessage[], retry = true, terminalError = Boolean(liveActivity().error)) {
-    const refreshKey = `${projectId}\u0000${sessionId}`;
-    pendingTerminalRefreshCounts.set(refreshKey, (pendingTerminalRefreshCounts.get(refreshKey) ?? 0) + 1);
-    setPendingTerminalRefreshKeys((keys) => {
-      if (keys.has(refreshKey)) return keys;
-      const next = new Set(keys);
-      next.add(refreshKey);
-      return next;
-    });
-    try {
-      const detail = await apiWithTimeout<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}`);
-      const retryTimer = pendingTerminalRefreshRetryTimers.get(refreshKey);
-      if (retryTimer !== undefined) {
-        window.clearTimeout(retryTimer);
-        pendingTerminalRefreshRetryTimers.delete(refreshKey);
-      }
-      blockedTerminalRefreshKeys.delete(refreshKey);
+  const terminalHistoryRefresh = createTerminalHistoryRefresh<PendingUserMessage, SessionDetail>({
+    request: (projectId, sessionId) => apiWithTimeout<SessionDetail>(`/api/projects/${projectId}/session?sessionId=${encodeURIComponent(sessionId)}`),
+    onChange: setTerminalRefreshStatuses,
+    reconcile: (projectId, sessionId, detail, pendingAtTerminal, terminalError) => {
       queryClient.setQueryData(['session', projectId, sessionId], detail);
       const retainedIds = new Set(pendingUserMessagesAfterTerminalRefresh(
         branchForEntry(detail.entries, detail.leafId).filter(isUserMessageEntry).map((entry) => ({ id: entry.id, text: entryText(entry) })),
@@ -7220,31 +7205,11 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
       setPendingUserMessages((pending) => pending.filter(({ id }) => !terminalIds.has(id) || retainedIds.has(id)));
       const activity = liveActivity();
       if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId && (terminalError || (!activity.running && !activity.streaming))) setLiveTurnRetired(true);
-    } catch {
-      if (retry) {
-        const existingTimer = pendingTerminalRefreshRetryTimers.get(refreshKey);
-        if (existingTimer !== undefined) window.clearTimeout(existingTimer);
-        pendingTerminalRefreshRetryTimers.set(refreshKey, window.setTimeout(() => {
-          pendingTerminalRefreshRetryTimers.delete(refreshKey);
-          void reconcilePendingUserMessagesAfterTerminal(projectId, sessionId, pendingAtTerminal, false, terminalError);
-        }, 1_000));
-      } else {
-        blockedTerminalRefreshKeys.add(refreshKey);
-        if (props.project.id === projectId && (props.sessionId ?? commandSessionId()) === sessionId) showAttachErrorToast('Could not refresh the finished conversation. Reload this session before sending another prompt.');
-      }
-    } finally {
-      const remaining = (pendingTerminalRefreshCounts.get(refreshKey) ?? 1) - 1;
-      if (remaining > 0) pendingTerminalRefreshCounts.set(refreshKey, remaining);
-      else pendingTerminalRefreshCounts.delete(refreshKey);
-      if (remaining <= 0 && !pendingTerminalRefreshRetryTimers.has(refreshKey) && !blockedTerminalRefreshKeys.has(refreshKey)) {
-        setPendingTerminalRefreshKeys((keys) => {
-          if (!keys.has(refreshKey)) return keys;
-          const next = new Set(keys);
-          next.delete(refreshKey);
-          return next;
-        });
-      }
-    }
+    },
+  });
+
+  function reconcilePendingUserMessagesAfterTerminal(projectId: string, sessionId: string, pendingAtTerminal: PendingUserMessage[], terminalError = Boolean(liveActivity().error)) {
+    return terminalHistoryRefresh.refresh(projectId, sessionId, pendingAtTerminal, terminalError);
   }
 
   async function interruptAgent() {
@@ -7260,7 +7225,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId }),
       });
-      await reconcilePendingUserMessagesAfterTerminal(projectId, sessionId, pendingAtInterrupt, true, true);
+      await reconcilePendingUserMessagesAfterTerminal(projectId, sessionId, pendingAtInterrupt, true);
       setRunningCommand(undefined);
     } finally {
       setAborting(false);
@@ -8016,6 +7981,24 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
             />
           </div>
           <AgentStatusBar status={agentStatus.data?.status} loading={agentStatus.isLoading || agentStatus.isFetching} error={agentStatus.error} mobileOpen={mobileStatusOpen()} />
+          <Show when={terminalRefreshStatus()}>
+            {(status) => (
+              <div class="flex flex-wrap items-center gap-2 px-3 py-2 text-xs text-muted-foreground" role="status">
+                <Show when={status() === 'pending'} fallback={
+                  <>
+                    <span>Could not refresh the finished conversation. Sending is paused until the conversation is refreshed.</span>
+                    <button class="button ml-auto shrink-0" type="button" onClick={() => {
+                      const sessionId = props.sessionId ?? commandSessionId();
+                      if (sessionId) terminalHistoryRefresh.retry(props.project.id, sessionId);
+                    }}>Retry conversation refresh</button>
+                  </>
+                }>
+                  <LoaderCircle class="size-3.5 shrink-0 animate-spin" />
+                  <span>Refreshing conversation before you can send...</span>
+                </Show>
+              </div>
+            )}
+          </Show>
           <div class="composer-toolbar">
             <div class="composer-toolbar-leading">
               <label class="ghost h-8 w-8 cursor-pointer px-0" title="Add files" aria-disabled={attachBusy()}><Plus class="size-4" /><input class="hidden" type="file" multiple disabled={attachBusy()} accept={COMPOSER_UPLOAD_ACCEPT} onChange={(event) => { const files = event.currentTarget.files ? [...event.currentTarget.files] : null; event.currentTarget.value = ''; void attach(files); }} /></label>
@@ -8051,7 +8034,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
               >
                 <Show when={voiceListening()} fallback={<Mic class="size-4" />}><MicOff class="size-4" /></Show>
               </button>
-              <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={busy() && composerCanSubmit() ? 'Send steering message' : composerSubmissionPending() ? 'Sending...' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><Show when={!busy() && composerSubmissionPending()} fallback={<ArrowUp class="size-4" />}><LoaderCircle class="size-4 animate-spin" /></Show></button>}>
+              <Show when={busy() && !composerCanSubmit()} fallback={<button class="button h-8 w-8 px-0" type="submit" title={terminalRefreshStatus() ? 'Conversation refresh required before sending' : busy() && composerCanSubmit() ? 'Send steering message' : composerSubmissionPending() ? 'Sending...' : busy() ? 'Agent is busy' : 'Send'} disabled={!composerCanSubmit()}><Show when={!busy() && composerSubmissionPending()} fallback={<ArrowUp class="size-4" />}><LoaderCircle class="size-4 animate-spin" /></Show></button>}>
                 <button class="button-danger h-8 w-8 px-0" type="button" title="Interrupt agent (Esc, or double Esc anywhere)" onClick={() => void interruptAgent()} disabled={aborting()}><Square class="size-3.5 fill-current" /></button>
               </Show>
             </div>
