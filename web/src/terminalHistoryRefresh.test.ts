@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createTerminalHistoryRefresh, type TerminalRefreshStatus } from './terminalHistoryRefresh';
+import { createTerminalHistoryRefresh, type TerminalRefreshState } from './terminalHistoryRefresh';
 
 type Message = { id: number };
 
@@ -22,7 +22,7 @@ async function waitFor(predicate: () => boolean) {
 test('failed terminal refresh stays locked until a successful retry reconciles the pending messages', async () => {
   const requests = [deferred<string>(), deferred<string>(), deferred<string>(), deferred<string>()];
   let count = 0;
-  let statuses = new Map<string, TerminalRefreshStatus>();
+  let statuses = new Map<string, TerminalRefreshState>();
   const reconciled: { detail: string; ids: number[]; terminalError: boolean }[] = [];
   const refresh = createTerminalHistoryRefresh<Message, string>({
     request: () => requests[count++].promise,
@@ -33,26 +33,42 @@ test('failed terminal refresh stays locked until a successful retry reconciles t
   try {
     const key = 'project\u0000session';
     const first = refresh.refresh('project', 'session', [{ id: 1 }], true);
-    assert.equal(statuses.get(key), 'pending');
+    assert.equal(statuses.get(key)?.status, 'pending');
     requests[0].reject(new Error('offline'));
     await waitFor(() => count === 2);
     requests[1].reject(new Error('still offline'));
     await first;
-    assert.equal(statuses.get(key), 'failed');
+    assert.deepEqual(statuses.get(key), { status: 'failed', phase: 'request', error: 'still offline' });
     assert.deepEqual(reconciled, []);
 
     refresh.retry('project', 'session');
-    assert.equal(statuses.get(key), 'pending');
+    assert.equal(statuses.get(key)?.status, 'pending');
     refresh.retry('project', 'session');
     assert.equal(count, 3, 'concurrent retry does not start another GET');
     requests[2].reject(new Error('retry failed'));
-    await waitFor(() => statuses.get(key) === 'failed');
+    await waitFor(() => statuses.get(key)?.status === 'failed');
     assert.deepEqual(reconciled, []);
     refresh.retry('project', 'session');
-    assert.equal(statuses.get(key), 'pending');
+    assert.equal(statuses.get(key)?.status, 'pending');
     requests[3].resolve('saved history');
     await waitFor(() => !statuses.has(key));
     assert.deepEqual(reconciled, [{ detail: 'saved history', ids: [1], terminalError: true }]);
+  } finally {
+    refresh.dispose();
+  }
+});
+
+test('a reconcile failure reports its phase and keeps sending locked', async () => {
+  let states = new Map<string, TerminalRefreshState>();
+  const refresh = createTerminalHistoryRefresh<Message, string>({
+    request: async () => 'saved',
+    reconcile: () => { throw new Error('Could not apply saved history'); },
+    onChange: (next) => { states = next; },
+    retryDelayMs: 1,
+  });
+  try {
+    await refresh.refresh('p', 's', [{ id: 1 }], false);
+    assert.deepEqual(states.get('p\u0000s'), { status: 'failed', phase: 'reconcile', error: 'Could not apply saved history' });
   } finally {
     refresh.dispose();
   }
@@ -63,7 +79,7 @@ test('a newer terminal event cannot reconcile against an older in-flight snapsho
   const newRead = deferred<string>();
   const requests = [oldRead, newRead];
   let count = 0;
-  let statuses = new Map<string, TerminalRefreshStatus>();
+  let statuses = new Map<string, TerminalRefreshState>();
   const reconciled: { detail: string; ids: number[] }[] = [];
   const refresh = createTerminalHistoryRefresh<Message, string>({
     request: () => requests[count++].promise,
@@ -79,7 +95,7 @@ test('a newer terminal event cannot reconcile against an older in-flight snapsho
     void second.then(() => { awaitCompleted = true; });
     oldRead.resolve('snapshot before message 2');
     await waitFor(() => count === 2);
-    assert.equal(statuses.get('p\u0000s'), 'pending');
+    assert.equal(statuses.get('p\u0000s')?.status, 'pending');
     assert.deepEqual(reconciled, []);
     assert.equal(awaitCompleted, false);
     newRead.resolve('snapshot after message 2');
@@ -95,7 +111,7 @@ test('a newer terminal event cannot reconcile against an older in-flight snapsho
 test('refresh state and retry stay scoped to the project and session', async () => {
   const requests = [deferred<string>(), deferred<string>(), deferred<string>(), deferred<string>(), deferred<string>()];
   let count = 0;
-  let statuses = new Map<string, TerminalRefreshStatus>();
+  let statuses = new Map<string, TerminalRefreshState>();
   const reconciled: string[] = [];
   const refresh = createTerminalHistoryRefresh<Message, string>({
     request: () => requests[count++].promise,
@@ -115,14 +131,14 @@ test('refresh state and retry stay scoped to the project and session', async () 
     await waitFor(() => count === 4);
     requests[3].reject(new Error('offline'));
     await Promise.all([first, joined]);
-    assert.equal(statuses.get('p1\u0000s1'), 'failed');
+    assert.equal(statuses.get('p1\u0000s1')?.status, 'failed');
     refresh.retry('p2', 's1');
     refresh.retry('p1', 'another-session');
     assert.equal(count, 4, 'retry for another target does not refresh the blocked session');
     requests[1].resolve('p2 history');
     await second;
     assert.equal(statuses.has('p2\u0000s1'), false);
-    assert.equal(statuses.get('p1\u0000s1'), 'failed');
+    assert.equal(statuses.get('p1\u0000s1')?.status, 'failed');
     refresh.retry('p1', 's1');
     requests[4].resolve('p1 history');
     await waitFor(() => !statuses.has('p1\u0000s1'));

@@ -1,4 +1,5 @@
 export type TerminalRefreshStatus = 'pending' | 'failed';
+export type TerminalRefreshState = { status: TerminalRefreshStatus; phase?: 'request' | 'reconcile'; error?: string };
 
 type RefreshEntry<TPending> = {
   projectId: string;
@@ -6,6 +7,7 @@ type RefreshEntry<TPending> = {
   pending: TPending[];
   terminalError: boolean;
   status: TerminalRefreshStatus;
+  failure?: { phase: 'request' | 'reconcile'; error: string };
   generation: number;
   settled: Promise<void>;
   resolveSettled: () => void;
@@ -15,16 +17,17 @@ type RefreshEntry<TPending> = {
 export function createTerminalHistoryRefresh<TPending extends { id: number }, TDetail>(options: {
   request: (projectId: string, sessionId: string) => Promise<TDetail>;
   reconcile: (projectId: string, sessionId: string, detail: TDetail, pending: TPending[], terminalError: boolean) => void;
-  onChange: (statuses: Map<string, TerminalRefreshStatus>) => void;
+  onChange: (statuses: Map<string, TerminalRefreshState>) => void;
   retryDelayMs?: number;
 }) {
   const entries = new Map<string, RefreshEntry<TPending>>();
   let disposed = false;
   const keyFor = (projectId: string, sessionId: string) => `${projectId}\u0000${sessionId}`;
-  const notify = () => options.onChange(new Map([...entries].map(([key, entry]) => [key, entry.status])));
+  const notify = () => options.onChange(new Map([...entries].map(([key, entry]) => [key, { status: entry.status, ...entry.failure }])));
 
   async function attempt(key: string, entry: RefreshEntry<TPending>, retry: boolean) {
     const generation = entry.generation;
+    let phase: 'request' | 'reconcile' = 'request';
     try {
       const detail = await options.request(entry.projectId, entry.sessionId);
       if (disposed || entries.get(key) !== entry) return;
@@ -34,11 +37,12 @@ export function createTerminalHistoryRefresh<TPending extends { id: number }, TD
         void attempt(key, entry, true);
         return;
       }
+      phase = 'reconcile';
       options.reconcile(entry.projectId, entry.sessionId, detail, entry.pending, entry.terminalError);
       entries.delete(key);
       notify();
       entry.resolveSettled();
-    } catch {
+    } catch (error) {
       if (disposed || entries.get(key) !== entry) return;
       if (generation !== entry.generation) {
         void attempt(key, entry, true);
@@ -49,6 +53,7 @@ export function createTerminalHistoryRefresh<TPending extends { id: number }, TD
         }, options.retryDelayMs ?? 1_000);
       } else {
         entry.status = 'failed';
+        entry.failure = { phase, error: error instanceof Error ? error.message : String(error) };
         notify();
         entry.resolveSettled();
       }

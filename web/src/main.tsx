@@ -87,7 +87,8 @@ import {
 } from './composerHistory';
 import { appUrl, appWebSocketUrl } from './appUrl';
 import { StaleAgentStatusError, isCurrentAgentStatusTarget, shouldRetryAgentRefresh, shouldSuppressAgentUiRequests, withRequestTimeout } from './agentRefresh';
-import { createTerminalHistoryRefresh, type TerminalRefreshStatus } from './terminalHistoryRefresh';
+import { createTerminalHistoryRefresh, type TerminalRefreshState } from './terminalHistoryRefresh';
+import { createProjectRecovery, isUnknownProjectResponse, recoveryProjectsFromWorkspaces, retainKnownRoots } from './projectRecovery';
 import { markSessionActivityStarted, pendingUserMessagesAfterTerminalRefresh, shouldRefreshCompletedSession, unresolvedPendingUserMessages, type PendingUserMessageHandoff } from './chatHandoff';
 import {
   appendLiveActivityDelta,
@@ -313,7 +314,7 @@ type LiveTranscriptSnapshot = { entryIds: string[]; userMessageCount: number; as
 type AssistantEntryPreview = { text: string; thinking: string; error: string };
 type AssistantAggregatePreview = AssistantEntryPreview & { userMessageCount: number; latestAssistantId?: string };
 type BashActivity = { running: boolean; error?: string; command?: string; output: string };
-type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: (send: ExtensionCustomUiSender) => void; onDisconnect?: () => void; heartbeat?: boolean };
+type ReconnectingWebSocketOptions = { onMessage: (event: MessageEvent) => void; onOpen?: (send: ExtensionCustomUiSender) => void; onDisconnect?: () => void; heartbeat?: boolean; beforeConnect?: (signal: AbortSignal) => Promise<void> };
 type SelectOption = { value: string; label: JSX.Element; disabled?: boolean; searchText?: string };
 const REVIEW_NOTES_FILTER_OPTIONS: SelectOption[] = [
   { value: 'relevant', label: 'Relevant' },
@@ -897,7 +898,9 @@ function Shell() {
   }
 
   function connectWorkspaceSocket(workspaceId: string, url: string, options: ReconnectingWebSocketOptions): WorkspaceSocketCleanup {
-    return workspaceSocketRegistry.track(workspaceId, connectReconnectingWebSocket(url, options));
+    return workspaceSocketRegistry.track(workspaceId, connectReconnectingWebSocket(url, {
+      ...options, beforeConnect: (signal) => projectRecovery.beforeConnect(workspaceId, signal),
+    }));
   }
   const [sessionSidebarOpen, setSessionSidebarOpen] = createSignal(localStorage.getItem(SESSION_SIDEBAR_OPEN_KEY) !== 'false');
   const [restoredOpenProjects, setRestoredOpenProjects] = createSignal(false);
@@ -938,7 +941,17 @@ function Shell() {
   });
 
   const auth = createQuery(() => ({ queryKey: ['auth'], queryFn: ({ signal }) => api<{ authenticated: boolean; required: boolean }>('/api/auth/status', { signal }) }));
-  const projects = createQuery(() => ({ queryKey: ['projects'], queryFn: ({ signal }) => api<{ projects: Project[] }>('/api/projects', { signal }), enabled: auth.data?.authenticated !== false }));
+  const cachedVisibleProjects = new Map<string, Project>();
+  const projects = createQuery(() => ({
+    queryKey: ['projects'],
+    queryFn: async ({ signal }) => {
+      const listed = await api<{ projects: Project[] }>('/api/projects', { signal });
+      // The registry can be empty after restart. Keep the roots already open in this
+      // tab until their requests recover them, instead of switching the active project.
+      return { projects: retainKnownRoots(listed.projects, cachedVisibleProjects, projectRecovery.isForgotten) };
+    },
+    enabled: auth.data?.authenticated !== false,
+  }));
   const orderedProjects = createMemo(() => orderProjects(projects.data?.projects ?? [], readProjectOrder()));
   const activeProject = createMemo(() => {
     const currentProjects = orderedProjects();
@@ -978,6 +991,35 @@ function Shell() {
     }
     return byId;
   });
+  const projectRecovery = createProjectRecovery(
+    rawApi,
+    (url, init) => withRequestTimeout((signal) => rawApi(url, { ...init, signal }), init?.signal, AGENT_REFRESH_TIMEOUT_MS),
+    (id) => !workspaceSocketsSuspended(id),
+    () => { void queryClient.invalidateQueries({ queryKey: ['projects'] }); },
+  );
+  activeProjectRecovery = projectRecovery;
+  onCleanup(() => { if (activeProjectRecovery === projectRecovery) activeProjectRecovery = undefined; });
+  createEffect(() => {
+    for (const project of recoveryProjectsFromWorkspaces(projects.data?.projects ?? [], knownWorkspacesByRootId())) {
+      projectRecovery.remember(project);
+    }
+  });
+  async function removeRecoveryRoot(rootId: string) {
+    const ids = projectRecovery.idsForRoot(rootId);
+    const resume = await projectRecovery.pause(ids);
+    try {
+      await api(`/api/projects/${rootId}`, { method: 'DELETE' });
+      projectRecovery.closeRoot(rootId);
+      cachedVisibleProjects.delete(rootId);
+      setKnownWorkspacesByRootId((current) => {
+        const next = { ...current };
+        delete next[rootId];
+        return next;
+      });
+    } finally {
+      resume();
+    }
+  }
   const restoredAbandonedPendingSessionKeys = new Set<string>();
   createEffect(() => {
     const knownWorkspaceIds = new Set(Object.keys(workspaceLookup()));
@@ -1484,7 +1526,7 @@ function Shell() {
       setActiveSession(id, workspaceId);
     } catch (error) {
       if (workspaceSessionRestoreRequest !== request || workspaceProjectId() !== workspaceId) return;
-      if (apiErrorStatus(error) === 404) {
+      if (apiErrorStatus(error) === 404 && !isUnknownProjectResponse(error)) {
         forgetWorkspaceLastSession(workspaceId);
         setActiveSession(undefined, workspaceId);
         if (toolPanel() === 'tree') setToolPanel(undefined);
@@ -1918,14 +1960,6 @@ function Shell() {
   });
 
   createEffect(() => {
-    const projectIds = new Set((projects.data?.projects ?? []).map((project) => project.id));
-    setKnownWorkspacesByRootId((current) => {
-      const next = Object.fromEntries(Object.entries(current).filter(([rootId]) => projectIds.has(rootId)));
-      return Object.keys(next).length === Object.keys(current).length ? current : next;
-    });
-  });
-
-  createEffect(() => {
     if (auth.data?.authenticated === false || restoredOpenProjects() || restoringOpenProjects() || !projects.data) return;
     setRestoringOpenProjects(true);
     const currentPaths = projects.data.projects.map((project) => project.path);
@@ -2290,9 +2324,10 @@ function Shell() {
       });
       rememberRecentProject(project.path);
       rememberOpenProject(project.path);
+      projectRecovery.remember({ id: project.id, path: project.path, rootId: project.id, rootPath: project.path }, true);
       const closedProject = options?.closeProjectId ? projects.data?.projects.find((item) => item.id === options.closeProjectId) : undefined;
       if (options?.closeProjectId && options.closeProjectId !== project.id) {
-        await api(`/api/projects/${options.closeProjectId}`, { method: 'DELETE' });
+        await removeRecoveryRoot(options.closeProjectId);
         if (closedProject) forgetOpenProject(closedProject.path);
       }
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
@@ -2352,8 +2387,9 @@ function Shell() {
 
     rememberRecentProject(nextProject.path);
     rememberOpenProject(nextProject.path);
+    projectRecovery.remember({ id: nextProject.id, path: nextProject.path, rootId: nextProject.id, rootPath: nextProject.path }, true);
     if (pathChanged && project.id !== nextProject.id) {
-      await api(`/api/projects/${project.id}`, { method: 'DELETE' });
+      await removeRecoveryRoot(project.id);
       forgetOpenProject(project.path);
     }
     await queryClient.invalidateQueries({ queryKey: ['projects'] });
@@ -2368,7 +2404,7 @@ function Shell() {
 
   async function closeProject(project: Project) {
     if (project.id === projectId() && requestFileWorkspaceLeave(() => void closeProject(project))) return;
-    await api(`/api/projects/${project.id}`, { method: 'DELETE' });
+    await removeRecoveryRoot(project.id);
     forgetOpenProject(project.path);
     await queryClient.invalidateQueries({ queryKey: ['projects'] });
     if (project.id === projectId()) {
@@ -2671,6 +2707,7 @@ function Shell() {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
     });
+    projectRecovery.remember({ id: workspace.id, path: workspace.path, rootId: project.id, rootPath: project.path }, true);
     queryClient.setQueryData<{ workspaces: ProjectWorkspace[] }>(['workspaces', project.id], (current) => current ? {
       workspaces: current.workspaces.some((item) => item.id === workspace.id)
         ? current.workspaces.map((item) => item.id === workspace.id ? workspace : item)
@@ -2699,8 +2736,17 @@ function Shell() {
       async () => {
         const query = new URLSearchParams({ scope: scopeToken });
         if (options?.force) query.set('force', 'true');
-        await api(`/api/projects/${project.id}/workspaces/${workspace.id}?${query}`, { method: 'DELETE' });
+        const resumeRecovery = await projectRecovery.pause([...new Set([...workspaceIds, ...participantIds])]);
+        try {
+          await api(`/api/projects/${project.id}/workspaces/${workspace.id}?${query}`, { method: 'DELETE' });
+        } catch (error) {
+          resumeRecovery();
+          throw error;
+        }
         const affectedWorkspaceIds = new Set(workspaceIds);
+        projectRecovery.forget(affectedWorkspaceIds);
+        for (const id of affectedWorkspaceIds) cachedVisibleProjects.delete(id);
+        resumeRecovery();
         const affectedProjectPaths = new Set(projectPaths);
         const affectedRootProjectIds = new Set([project.id]);
         const lookup = workspaceLookup();
@@ -5879,7 +5925,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
   const [composerShellHistory, setComposerShellHistory] = createSignal<ComposerHistoryItem[]>(readComposerHistory(props.project.id, 'shell'));
   const [aborting, setAborting] = createSignal(false);
   const [composerSubmissions, setComposerSubmissions] = createSignal<Map<string, { submission: boolean; steering: boolean }>>(new Map());
-  const [terminalRefreshStatuses, setTerminalRefreshStatuses] = createSignal<Map<string, TerminalRefreshStatus>>(new Map());
+  const [terminalRefreshStatuses, setTerminalRefreshStatuses] = createSignal<Map<string, TerminalRefreshState>>(new Map());
   const terminalRefreshStatus = createMemo(() => {
     const sessionId = props.sessionId ?? commandSessionId();
     return sessionId ? terminalRefreshStatuses().get(`${props.project.id}\u0000${sessionId}`) : undefined;
@@ -6136,7 +6182,7 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
 
   createEffect(() => {
     const id = props.sessionId;
-    if (id && apiErrorStatus(session.error) === 404) props.onSessionNotFound(id, props.project.id);
+    if (id && apiErrorStatus(session.error) === 404 && !isUnknownProjectResponse(session.error)) props.onSessionNotFound(id, props.project.id);
   });
 
   createEffect(() => {
@@ -7984,9 +8030,9 @@ function Chat(props: { project: Project; sessionId?: string; sessionNavigationRe
           <Show when={terminalRefreshStatus()}>
             {(status) => (
               <div class="flex flex-wrap items-center gap-2 px-3 py-2 text-xs text-muted-foreground" role="status">
-                <Show when={status() === 'pending'} fallback={
+                <Show when={status().status === 'pending'} fallback={
                   <>
-                    <span>Could not refresh the finished conversation. Sending is paused until the conversation is refreshed.</span>
+                    <span>Could not refresh the finished conversation ({status().phase}): {status().error}. Sending is paused until the conversation is refreshed.</span>
                     <button class="button ml-auto shrink-0" type="button" onClick={() => {
                       const sessionId = props.sessionId ?? commandSessionId();
                       if (sessionId) terminalHistoryRefresh.retry(props.project.id, sessionId);
@@ -15952,6 +15998,7 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
   let reconnectAttempt = 0;
   let disposed = false;
   let disposePromise: Promise<void> | undefined;
+  let probe: AbortController | undefined;
 
   const clearReconnectTimer = () => {
     if (reconnectTimer === undefined) return;
@@ -16012,9 +16059,20 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
       connect();
     }, delay + Math.round(delay * 0.2 * Math.random()));
   };
-  function connect() {
+  async function connect() {
     if (disposed) return;
     clearReconnectTimer();
+    const controller = new AbortController();
+    probe = controller;
+    try {
+      await options.beforeConnect?.(controller.signal);
+    } catch {
+      if (!disposed) scheduleReconnect();
+      return;
+    } finally {
+      if (probe === controller) probe = undefined;
+    }
+    if (disposed || controller.signal.aborted) return;
     let current: WebSocket;
     try {
       current = new WebSocket(url);
@@ -16059,6 +16117,7 @@ function connectReconnectingWebSocket(url: string, options: ReconnectingWebSocke
   return () => {
     if (disposePromise) return disposePromise;
     disposed = true;
+    probe?.abort();
     clearReconnectTimer();
     clearHeartbeatTimers();
     const current = socket;
@@ -16106,7 +16165,13 @@ async function apiAgentRefresh<T>(url: string, init: RequestInit = {}): Promise<
   }
 }
 
+let activeProjectRecovery: ReturnType<typeof createProjectRecovery> | undefined;
+
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
+  return activeProjectRecovery?.get<T>(url, init) ?? rawApi<T>(url, init);
+}
+
+async function rawApi<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(appUrl(url), init);
   if (!response.ok) {
     const body = await response.json().catch(() => ({})) as { error?: unknown };
