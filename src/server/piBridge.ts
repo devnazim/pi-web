@@ -1,4 +1,4 @@
-import { getAgentDir, parseFrontmatter, resizeImage, type ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { getAgentDir, parseFrontmatter, resizeImage, type ModelRuntime, type PromptOptions } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
@@ -28,6 +28,7 @@ type WebSocket = {
 type TreeSummaryOptions = { mode?: 'none' | 'summary' | 'custom'; instructions?: string; replace?: boolean };
 type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 type StreamingBehavior = 'steer' | 'followUp';
+type PromptDisposition = Parameters<NonNullable<PromptOptions['preflightResult']>>[0];
 type PendingStreamingClientMessage = {
   token: string;
   behavior: StreamingBehavior;
@@ -288,6 +289,7 @@ export class PiBridge {
   private readonly extensionStatuses = new WeakMap<object, Map<string, string>>();
   private readonly pendingExtensionUiRequests = new Map<string, PendingExtensionUiRequest<any>>();
   private readonly pendingExtensionCustomUi = new Map<string, PendingExtensionCustomUi<any>>();
+  private readonly deferredPromptPreflights = new WeakMap<NonNullable<PromptOptions['preflightResult']>, (error: unknown) => void>();
   private readonly extensionCustomUiCancellationGenerations = new WeakMap<object, number>();
   private customUiRuntimePromise?: Promise<CustomUiRuntime>;
   private readonly activeRuntimeSessions = new Map<string, number>();
@@ -821,49 +823,59 @@ export class PiBridge {
           // prompt() rechecks streaming after asynchronous input hooks. Unlike
           // steer()/followUp(), it starts a run if the previous one has settled.
           let resolveSdkPreflight!: () => void;
-          let preflightError: Error | undefined;
-          const sdkPreflight = new Promise<void>((resolve) => { resolveSdkPreflight = resolve; });
-          const initialPromptTask = Promise.resolve(session.prompt(prompt, {
-            source: 'rpc', images: images.length ? images : undefined, streamingBehavior,
-            preflightResult: (success: boolean) => {
-              const pendingMessages = this.pendingStreamingClientMessages.get(session) ?? [];
-              const pending = pendingMessages.find(({ token }) => token === queuedClientMessageToken);
-              if (!success) {
-                preflightError = new Error('Queued prompt was rejected before delivery.');
-                const nextMessages = pendingMessages.filter(({ token }) => token !== queuedClientMessageToken);
-                if (nextMessages.length) this.pendingStreamingClientMessages.set(session, nextMessages);
-                else this.pendingStreamingClientMessages.delete(session);
-              } else if (pending?.inputHandled) {
-                const nextMessages = pendingMessages.filter(({ token }) => token !== queuedClientMessageToken);
-                if (nextMessages.length) this.pendingStreamingClientMessages.set(session, nextMessages);
-                else this.pendingStreamingClientMessages.delete(session);
-              } else {
-                directRunPending = Boolean(pending && !pending.queued && !this.cachedSessionIsStreaming(session));
-                deferredDirectRun = directRunPending && initialPromptReturned;
-                if (directRunPending) {
-                  // A later queue_update belongs to another request, not this
-                  // direct input, even if its agent_start hook is still pending.
-                  directClientMessage = pending;
-                  this.pendingStreamingClientMessages.set(session, pendingMessages.filter(({ token }) => token !== queuedClientMessageToken));
-                }
+          let rejectSdkPreflight!: (error: unknown) => void;
+          const sdkPreflight = new Promise<void>((resolve, reject) => {
+            resolveSdkPreflight = resolve;
+            rejectSdkPreflight = reject;
+          });
+          const rejectDeferredPreflight = (error: unknown) => {
+            this.deferredPromptPreflights.delete(onSdkPreflight);
+            rejectSdkPreflight(error);
+          };
+          const onSdkPreflight = (disposition: PromptDisposition) => {
+            this.deferredPromptPreflights.delete(onSdkPreflight);
+            const pendingMessages = this.pendingStreamingClientMessages.get(session) ?? [];
+            const pending = pendingMessages.find(({ token }) => token === queuedClientMessageToken);
+            if (disposition === 'handled' || pending?.inputHandled) {
+              const nextMessages = pendingMessages.filter(({ token }) => token !== queuedClientMessageToken);
+              if (nextMessages.length) this.pendingStreamingClientMessages.set(session, nextMessages);
+              else this.pendingStreamingClientMessages.delete(session);
+            } else if (disposition === 'started') {
+              directRunPending = Boolean(pending && !pending.queued);
+              deferredDirectRun = directRunPending && initialPromptReturned;
+              if (directRunPending) {
+                // A later queue_update belongs to another request, not this
+                // direct input, even if its agent_start hook is still pending.
+                directClientMessage = pending;
+                this.pendingStreamingClientMessages.set(session, pendingMessages.filter(({ token }) => token !== queuedClientMessageToken));
               }
-              releaseStreamingDispatch();
-              if (success) reportPreflight(true);
-              resolveSdkPreflight();
-            },
-          })).finally(() => { initialPromptReturned = true; });
-          const queueTask = Promise.all([initialPromptTask, sdkPreflight]).then(async () => {
-            if (preflightError) throw preflightError;
-            if (deferredDirectRun) await directRunFinished;
-          });
-          await setupSupervisor.watch(queueTask, {
-            session,
-            accepted: () => true,
-            settled: () => agentSettled,
-            progress: () => progressGeneration,
-            terminalError: () => terminalSdkError,
-            acceptedIsActivity: true,
-          });
+            }
+            releaseStreamingDispatch();
+            reportPreflight(true);
+            resolveSdkPreflight();
+          };
+          // Register before calling Pi: recursive deferred input can reject before
+          // the original prompt's fulfillment callback runs.
+          this.deferredPromptPreflights.set(onSdkPreflight, rejectDeferredPreflight);
+          try {
+            const initialPromptTask = Promise.resolve(session.prompt(prompt, {
+              source: 'rpc', images: images.length ? images : undefined, streamingBehavior,
+              preflightResult: onSdkPreflight,
+            })).finally(() => { initialPromptReturned = true; });
+            const queueTask = Promise.all([initialPromptTask, sdkPreflight]).then(async () => {
+              if (deferredDirectRun) await directRunFinished;
+            });
+            await setupSupervisor.watch(queueTask, {
+              session,
+              accepted: () => true,
+              settled: () => agentSettled,
+              progress: () => progressGeneration,
+              terminalError: () => terminalSdkError,
+              acceptedIsActivity: true,
+            });
+          } finally {
+            this.deferredPromptPreflights.delete(onSdkPreflight);
+          }
           releaseStreamingDispatch();
           if (runtimeSession && queuedClientMessageToken) {
             const pendingMessages = this.pendingStreamingClientMessages.get(runtimeSession);
@@ -881,9 +893,9 @@ export class PiBridge {
         const promptTask = Promise.resolve().then(() => session.prompt(prompt, {
           source: 'rpc',
           images: images.length ? images : undefined,
-          preflightResult: (success: boolean) => {
-            if (success) releaseStreamingDispatch();
-            if (success && !extensionCommand) reportPreflight(true);
+          preflightResult: (_disposition: PromptDisposition) => {
+            releaseStreamingDispatch();
+            if (!extensionCommand) reportPreflight(true);
           },
         }));
         await setupSupervisor.watch(promptTask, {
@@ -1917,11 +1929,19 @@ export class PiBridge {
       }
       if (typeof session.prompt === 'function') {
         const prompt = session.prompt;
-        session.prompt = (text: string, options?: { source?: string; streamingBehavior?: StreamingBehavior }) => {
+        session.prompt = (text: string, options?: PromptOptions) => {
           const pending = options?.source === 'rpc' && options.streamingBehavior
             ? this.pendingStreamingClientMessages.get(session)?.find((message) => message.behavior === options.streamingBehavior && !message.queued && !message.inputHandled)
             : undefined;
-          return this.streamingInputContext.run(pending, () => prompt.call(session, text, options));
+          const task = this.streamingInputContext.run(pending, () => prompt.call(session, text, options));
+          const preflightResult = options?.preflightResult;
+          if (!preflightResult) return task;
+          return Promise.resolve(task).catch((error: unknown) => {
+            // Pi recursively calls this.prompt() with the same options for deferred input.
+            // Its original promise has already resolved, but this invocation holds the error.
+            this.deferredPromptPreflights.get(preflightResult)?.(error);
+            throw error;
+          });
         };
       }
     }

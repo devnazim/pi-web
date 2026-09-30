@@ -978,6 +978,107 @@ test('SDK-deferred direct run retains its client id through an asynchronous star
   assert.equal((bridge as any).sessionEventRelays.get(session).observers.size, 0);
 });
 
+for (const parent of ['bridge', 'extension'] as const) {
+  test(`rejected SDK-deferred prompt under ${parent} parent fails without a runtime reset or client identity leak`, { timeout: 10_000 }, async (t) => {
+  const faux = fauxProvider();
+  let firstStarted!: () => void;
+  let releaseFirst!: () => void;
+  let replacementInputStarted!: () => void;
+  let releaseReplacementInput!: () => void;
+  let parentSettling!: () => void;
+  let releaseParentSettlement!: () => void;
+  let replacementStarted!: () => void;
+  let releaseReplacement!: () => void;
+  const firstReady = new Promise<void>((resolve) => { firstStarted = resolve; });
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const replacementInputReady = new Promise<void>((resolve) => { replacementInputStarted = resolve; });
+  const replacementInputGate = new Promise<void>((resolve) => { releaseReplacementInput = resolve; });
+  const parentSettlementReady = new Promise<void>((resolve) => { parentSettling = resolve; });
+  const parentSettlementGate = new Promise<void>((resolve) => { releaseParentSettlement = resolve; });
+  const replacementReady = new Promise<void>((resolve) => { replacementStarted = resolve; });
+  const replacementGate = new Promise<void>((resolve) => { releaseReplacement = resolve; });
+  t.after(() => { releaseFirst(); releaseReplacementInput(); releaseParentSettlement(); releaseReplacement(); });
+  faux.setResponses([
+    async () => { firstStarted(); await firstGate; return fauxAssistantMessage('First answer'); },
+    async () => { replacementStarted(); await replacementGate; return fauxAssistantMessage('Replacement answer'); },
+    fauxAssistantMessage('Next answer'),
+  ]);
+  let settlements = 0;
+  let api!: ExtensionAPI;
+  const { bridge, session, sessionId, cwd, key, events } = await extensionFixture(t, (pi) => {
+    api = pi;
+    pi.on('input', async (event) => {
+      if (event.text === 'replacement') {
+        replacementInputStarted();
+        await replacementInputGate;
+      }
+      return { action: 'continue' };
+    });
+    pi.on('agent_settled', async () => {
+      if (++settlements === 1) {
+        parentSettling();
+        await parentSettlementGate;
+      }
+    });
+  }, faux, { runtimeNoProgressTimeoutMs: 30_000, runtimeIdleGraceMs: 30_000 });
+
+  const first = bridge.prompt(cwd, { sessionId, prompt: 'first' }, key);
+  await firstReady;
+  let replacement: Promise<unknown>;
+  if (parent === 'bridge') {
+    replacement = bridge.prompt(cwd, { sessionId, prompt: 'replacement', streamingBehavior: 'steer' }, key);
+  } else {
+    api.sendUserMessage('replacement', { deliverAs: 'steer' });
+    [replacement] = (bridge as any).extensionAsyncTasks.get(session);
+    assert.ok(replacement);
+  }
+  const replacementResult = assert.rejects(replacement, /no model/i);
+  await replacementInputReady;
+  releaseFirst();
+  await parentSettlementReady;
+  releaseReplacementInput();
+  await replacementReady;
+
+  let deferredPreflight: { accepted: boolean; error?: unknown } | undefined;
+  const deferred = bridge.prompt(cwd, {
+    sessionId, prompt: 'deferred rejected', streamingBehavior: 'steer', clientMessageId: 'rejected-client',
+  }, key, { preflightResult: (accepted, error) => { deferredPreflight = { accepted, error }; } });
+  const deferredResult = assert.rejects(deferred, /no model/i);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(deferredPreflight, undefined);
+  // Pi resolved the original SDK promise while the first settlement hook waited.
+  // The replacement run executes the deferred action after it settles.
+  const model = session.model;
+  (session.agent.state as any).model = undefined;
+  releaseReplacement();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      Promise.all([replacementResult, deferredResult]),
+      new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('Deferred rejection waited for the watchdog')), 1_000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    session.agent.state.model = model!;
+  }
+
+  releaseParentSettlement();
+  await first;
+  assert.equal(deferredPreflight?.accepted, false);
+  assert.match(String(deferredPreflight?.error), /no model/i);
+  assert.equal((bridge as any).streamingDispatchTails.size, 0);
+  assert.equal((bridge as any).pendingStreamingClientMessages.has(session), false);
+  assert.equal((bridge as any).runtimeRecoveries.size, 0);
+  assert.equal(events.some((event) => event.data?.clientMessageId === 'rejected-client'), false);
+  await bridge.prompt(cwd, { sessionId, prompt: 'next' }, key);
+  const next = events.find((event) => event.data?.type === 'message_start' && event.data.message?.role === 'user'
+    && event.data.message.content[0]?.text === 'next');
+  assert.ok(next);
+  assert.equal(next.data.clientMessageId, undefined);
+  assert.equal(faux.state.callCount, 3);
+  });
+}
+
 test('idle SDK-deferred input keeps its identity when its hook starts an extension run', { timeout: 10_000 }, async (t) => {
   const faux = fauxProvider();
   let firstStarted!: () => void;
