@@ -36,7 +36,7 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@earendil-works/pi-coding-agent": "^0.99.2",
     "@fastify/compress": "^9.2.0",
     "@fastify/cookie": "^11.1.2",
     "@fastify/multipart": "^10.1.2",
@@ -61,7 +61,7 @@
   },
   "overrides": {
     "brace-expansion": "^5.0.9",
-    "dompurify": "^3.4.14"
+    "dompurify": "^3.4.16"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",
