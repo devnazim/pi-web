@@ -1,4 +1,4 @@
-import { getAgentDir, parseFrontmatter, resizeImage, type ModelRuntime, type PromptOptions } from '@earendil-works/pi-coding-agent';
+import { getAgentDir, parseFrontmatter, resizeImage, type ExtensionContext, type ModelRuntime, type PromptOptions } from '@earendil-works/pi-coding-agent';
 import type { FastifyInstance } from 'fastify';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
@@ -284,6 +284,7 @@ export class PiBridge {
   private readonly streamingInputContext = new AsyncLocalStorage<PendingStreamingClientMessage | undefined>();
   private readonly extensionAsyncWrappedSessions = new WeakSet<object>();
   private readonly extensionInputWrappedRunners = new WeakSet<object>();
+  private readonly extensionCompactionWrappedRunners = new WeakSet<object>();
   private readonly extensionAsyncTasks = new WeakMap<object, Set<Promise<unknown>>>();
   private readonly pendingSdkPrompts = new WeakMap<object, Set<Promise<unknown>>>();
   private readonly extensionErrorCounts = new WeakMap<object, number>();
@@ -1989,6 +1990,69 @@ export class PiBridge {
     };
   }
 
+  private wrapExtensionCompactionCallbacks(session: any, sessionId?: string) {
+    const runner = session.extensionRunner;
+    if (!runner || typeof runner.createContext !== 'function' || this.extensionCompactionWrappedRunners.has(runner)) return;
+    this.extensionCompactionWrappedRunners.add(runner);
+    const isActive = () => {
+      if (this.sessionCannotPublish(session) || session.extensionRunner !== runner) return false;
+      try {
+        runner.assertActive?.();
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const createContext = runner.createContext;
+    runner.createContext = (...args: unknown[]) => {
+      // Keep the SDK's lazy getters. Command and tool contexts copy these descriptors.
+      const context: ExtensionContext = createContext.apply(runner, args);
+      const compact = context.compact;
+      context.compact = (options) => {
+        if (!options) return compact.call(context, options);
+        const guard = <T>(name: 'onComplete' | 'onError', callback: ((value: T) => void) | undefined) => {
+          if (!callback) return undefined;
+          const report = (error: unknown) => {
+            if (!isActive()) return;
+            let message = 'Extension compaction callback failed';
+            try {
+              message = String(error instanceof Error ? error.message : error);
+            } catch { /* Keep the fallback for errors that cannot be converted to a string. */ }
+            this.reportExtensionError(session, sessionId, { event: `compact.${name}`, error: message });
+          };
+          return (value: T) => {
+            if (!isActive()) return;
+            try {
+              const result = callback.call(options, value);
+              // The SDK does not await callback results in its detached compaction task.
+              if (isPromiseLike(result)) void Promise.resolve(result).catch(report);
+              return result;
+            } catch (error) {
+              report(error);
+            }
+          };
+        };
+        return compact.call(context, {
+          ...options,
+          onComplete: guard('onComplete', options.onComplete),
+          onError: guard('onError', options.onError),
+        });
+      };
+      return context;
+    };
+  }
+
+  private reportExtensionError(session: object, sessionId: string | undefined, error: { extensionPath?: string; event?: string; error?: string }) {
+    if (this.sessionCannotPublish(session)) return;
+    this.incrementExtensionErrorCount(session);
+    this.broadcast(this.sessionStreamKeys.get(session) ?? [], {
+      type: 'agent:error',
+      operationId: this.sessionOperationIds.get(session),
+      sessionId,
+      message: [error.extensionPath, error.event, error.error].filter(Boolean).join(': ') || 'Extension failed',
+    });
+  }
+
   private trackExtensionAsyncTask(session: object, task: PromiseLike<unknown>) {
     const tracked = Promise.resolve(task);
     const tasks = this.extensionAsyncTasks.get(session) ?? new Set<Promise<unknown>>();
@@ -2028,6 +2092,7 @@ export class PiBridge {
         beforeSessionStart: () => {
           this.cancelExtensionUiRequests(projectPath, sessionId, { allWhenSessionMissing: false, session });
           this.extensionStatuses.delete(session);
+          this.wrapExtensionCompactionCallbacks(session, sessionId);
         },
       })).finally(() => {
         if (this.sessionReloadTasks.get(session) === reloadTask) this.sessionReloadTasks.delete(session);
@@ -2073,6 +2138,7 @@ export class PiBridge {
     if (!session || typeof session !== 'object') return;
     this.bindSessionStreamKeys(session, key);
     this.wrapExtensionAsyncSessionMethods(session);
+    this.wrapExtensionCompactionCallbacks(session, sessionId);
     if (typeof session.subscribe === 'function') {
       const relay = this.sessionEventRelay(session);
       relay.background ??= { sessionId };
@@ -2127,16 +2193,7 @@ export class PiBridge {
         switchSession: async () => ({ cancelled: true }),
         reload: () => this.reloadBoundSession(session, projectPath, sessionId),
       },
-      onError: (error: { extensionPath?: string; event?: string; error?: string }) => {
-        if (this.sessionCannotPublish(session)) return;
-        this.incrementExtensionErrorCount(session);
-        this.broadcast(this.sessionStreamKeys.get(session) ?? key, {
-          type: 'agent:error',
-          operationId: this.sessionOperationIds.get(session),
-          sessionId,
-          message: [error.extensionPath, error.event, error.error].filter(Boolean).join(': ') || 'Extension failed',
-        });
-      },
+      onError: (error: { extensionPath?: string; event?: string; error?: string }) => this.reportExtensionError(session, sessionId, error),
     })).then(() => undefined);
     this.sessionBindingPromises.set(session, binding);
     try {

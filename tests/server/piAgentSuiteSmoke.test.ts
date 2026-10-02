@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import test from 'node:test';
@@ -10,15 +10,25 @@ import { PiBridge } from '../../src/server/piBridge.js';
 // Run only with an explicit published package directory. npm test stays offline.
 const suitePath = process.env.PI_WEB_SUITE_PATH;
 
-test('published pi-agent-suite 2.13.0 loads and runs through the RPC bridge', {
+test('published pi-agent-suite 2.13.3 loads and runs through the RPC bridge', {
   skip: !suitePath && 'Set PI_WEB_SUITE_PATH to the extracted published package directory',
   timeout: 90_000,
 }, async (t) => {
   const packageDir = path.resolve(suitePath!);
   const manifest = JSON.parse(await readFile(path.join(packageDir, 'package.json'), 'utf8'));
   assert.equal(manifest.name, 'pi-agent-suite');
-  assert.equal(manifest.version, '2.13.0');
+  assert.equal(manifest.version, '2.13.3');
   assert.ok(manifest.pi.extensions.length > 20, 'Expected the published package extension list');
+  for (const name of ['pi-agent-core', 'pi-ai', 'pi-coding-agent', 'pi-tui']) {
+    const peer = `@earendil-works/${name}`;
+    assert.equal(manifest.peerDependencies[peer], '1.0.0', `Unexpected suite peer requirement: ${peer}`);
+    const projectManifestPath = new URL(`../../node_modules/${peer}/package.json`, import.meta.url);
+    assert.equal(JSON.parse(await readFile(projectManifestPath, 'utf8')).version, '1.0.0', `Unexpected project peer: ${peer}`);
+    assert.equal(await realpath(path.join(packageDir, 'node_modules', peer, 'package.json')),
+      await realpath(projectManifestPath), `Suite must use this project's peer: ${peer}`);
+  }
+  assert.equal(await realpath(path.join(packageDir, 'node_modules', 'typebox')),
+    await realpath(new URL('../../node_modules/typebox', import.meta.url)), 'Suite must use this project\'s typebox');
   const root = await mkdtemp('/tmp/pi-web-suite-smoke-');
   const home = process.env.HOME;
   const agentDir = process.env.PI_CODING_AGENT_DIR;

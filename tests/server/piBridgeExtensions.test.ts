@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { test, type TestContext } from 'node:test';
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI, type ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
 import { fauxAssistantMessage, fauxProvider, type FauxProviderHandle } from '@earendil-works/pi-ai';
 import { PiBridge } from '../../src/server/piBridge.js';
 
@@ -202,6 +202,185 @@ test('real SDK extension load errors remain visible in status and clear after a 
   assert.ok(events.some((event) => event.message === 'Reloaded extensions, skills, prompts, themes, settings, and context files.'));
   assert.ok(session.extensionRunner?.getCommand('healthy'));
 });
+
+for (const outcome of ['success', 'error'] as const) {
+  for (const behavior of ['normal', 'throw', 'reject', 'throw-unprintable', 'reject-unprintable'] as const) {
+    test(`real SDK extension compaction ${outcome} callback ${behavior} is contained and reported`, async (t) => {
+      let context!: ExtensionCommandContext;
+      const { bridge, session, sessionId, cwd, key, events } = await extensionFixture(t, (pi) => {
+        pi.registerCommand('capture-compact', { description: 'Capture context', handler: async (_args, ctx) => { context = ctx; } });
+      });
+      await bridge.prompt(cwd, { sessionId, prompt: '/capture-compact' }, key);
+      const createContext = session.extensionRunner!.createContext;
+      await (bridge as any).bindWebExtensions(session, cwd, sessionId, key);
+      assert.equal(session.extensionRunner!.createContext, createContext, 'Binding must not wrap the runner twice');
+      const result = { summary: 'Summary', firstKeptEntryId: 'entry', tokensBefore: 100 };
+      const failure = new Error('Summary failed');
+      const calls: unknown[] = [];
+      let instructions: string | undefined;
+      // Keep the real SDK runner and its detached compaction callback dispatch.
+      session.compact = async (customInstructions) => {
+        instructions = customInstructions;
+        if (outcome === 'error') throw failure;
+        return result;
+      };
+      const callback = (value: unknown) => {
+        calls.push(value);
+        if (behavior === 'throw') throw new Error('Callback threw');
+        if (behavior === 'reject') return Promise.reject(new Error('Callback rejected'));
+        if (behavior === 'throw-unprintable') throw Object.create(null);
+        if (behavior === 'reject-unprintable') return Promise.reject(Object.create(null));
+        return Promise.resolve();
+      };
+      let unexpectedCalls = 0;
+      events.length = 0;
+      assert.equal(context.compact({
+        customInstructions: 'Keep the decisions',
+        onComplete: outcome === 'success' ? callback : () => { unexpectedCalls += 1; },
+        onError: outcome === 'error' ? callback : () => { unexpectedCalls += 1; },
+      }), undefined);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(instructions, 'Keep the decisions');
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0], outcome === 'success' ? result : failure);
+      assert.equal(unexpectedCalls, 0);
+      const errors = events.filter((event) => event.type === 'agent:error');
+      assert.equal(errors.length, behavior === 'normal' ? 0 : 1);
+      assert.equal((bridge as any).extensionErrorCount(session), behavior === 'normal' ? 0 : 1);
+      if (behavior !== 'normal') {
+        assert.equal(errors[0].sessionId, sessionId);
+        assert.equal(errors[0].message, `compact.${outcome === 'success' ? 'onComplete' : 'onError'}: ${behavior.endsWith('unprintable') ? 'Extension compaction callback failed' : `Callback ${behavior === 'throw' ? 'threw' : 'rejected'}`}`);
+      }
+    });
+  }
+}
+
+for (const outcome of ['success', 'error'] as const) {
+  test(`watchdog disposal suppresses a real SDK extension compaction ${outcome} callback`, { timeout: 10_000 }, async (t) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let shutdownStarted!: () => void;
+    let releaseShutdown!: () => void;
+    const shutdownReady = new Promise<void>((resolve) => { shutdownStarted = resolve; });
+    const shutdownGate = new Promise<void>((resolve) => { releaseShutdown = resolve; });
+    const keepAlive = setInterval(() => undefined, 100);
+    t.after(() => { clearInterval(keepAlive); release(); releaseShutdown(); });
+    let callbacks = 0;
+    const { bridge, session, sessionId, cwd, key, events } = await extensionFixture(t, (pi) => {
+      const callback = () => {
+        callbacks += 1;
+        // This is the failing send made by the external compaction extension.
+        pi.sendMessage({ customType: 'compaction-feedback', content: 'Finished', display: true }, { triggerTurn: false });
+      };
+      pi.on('session_shutdown', async () => { shutdownStarted(); await shutdownGate; });
+      pi.registerCommand('compact-stall', {
+        description: 'Start delayed compaction',
+        handler: async (_args, ctx) => { ctx.compact({ onComplete: callback, onError: callback }); },
+      });
+    }, undefined, { runtimeNoProgressTimeoutMs: 30, runtimeWatchIntervalMs: 2 });
+    const controller = new AbortController();
+    session.compact = async () => {
+      (session as any)._compactionAbortController = controller;
+      (session as any)._emit({ type: 'compaction_start', reason: 'manual' });
+      await gate;
+      (session as any)._compactionAbortController = undefined;
+      if (outcome === 'error') throw new Error('Compaction cancelled');
+      return { summary: 'Late summary', firstKeptEntryId: 'entry', tokensBefore: 100 };
+    };
+    await assert.rejects(bridge.prompt(cwd, { sessionId, prompt: '/compact-stall' }, key), /runtime was reset/i);
+    await shutdownReady;
+    if (outcome === 'success') {
+      releaseShutdown();
+      await Promise.all([...(bridge as any).deferredRuntimeDisposals]);
+    } else {
+      // Recovery retires the context before shutdown handlers or SDK disposal finish.
+      assert.equal(controller.signal.aborted, false);
+    }
+    const count = events.length;
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(callbacks, 0);
+    assert.equal(events.length, count, 'Retired compaction must not publish callback errors or feedback');
+    releaseShutdown();
+    await Promise.all([...(bridge as any).deferredRuntimeDisposals]);
+    // The late error cleared the stub's compaction controller before disposal.
+    if (outcome === 'success') assert.equal(controller.signal.aborted, true);
+    assert.throws(() => session.extensionRunner!.createContext().isIdle(), /stale/);
+  });
+}
+
+test('a pending extension compaction callback rejection is contained after retirement', async (t) => {
+  let context!: ExtensionCommandContext;
+  let rejectCallback!: (error: Error) => void;
+  const callbackResult = new Promise<void>((_resolve, reject) => { rejectCallback = reject; });
+  const { bridge, session, sessionId, cwd, key, events } = await extensionFixture(t, (pi) => {
+    pi.registerCommand('capture-compact', { description: 'Capture context', handler: async (_args, ctx) => { context = ctx; } });
+  });
+  await bridge.prompt(cwd, { sessionId, prompt: '/capture-compact' }, key);
+  session.compact = async () => ({ summary: 'Summary', firstKeptEntryId: 'entry', tokensBefore: 100 });
+  let calls = 0;
+  context.compact({ onComplete: () => { calls += 1; return callbackResult; } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  await (bridge as any).disposeCachedSession(session);
+  const count = events.length;
+  rejectCallback(new Error('Late callback rejection'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.length, count);
+  assert.equal((bridge as any).extensionErrorCount(session), 0);
+});
+
+for (const outcome of ['success', 'error'] as const) {
+  test(`reload suppresses old compaction ${outcome} callbacks and guards the new session_start context`, async (t) => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let reloadPending!: () => void;
+    let releaseReload!: () => void;
+    const reloadReady = new Promise<void>((resolve) => { reloadPending = resolve; });
+    const reloadGate = new Promise<void>((resolve) => { releaseReload = resolve; });
+    t.after(() => { release(); releaseReload(); });
+    let oldCalls = 0;
+    let newCalls = 0;
+    const { bridge, session, sessionId, cwd, key, events, resourceLoader } = await extensionFixture(t, (pi) => {
+      pi.on('session_start', (event, ctx) => {
+        if (event.reason === 'reload') ctx.compact({ onError: async () => { newCalls += 1; throw new Error('Reload callback rejected'); } });
+        else ctx.compact({ onComplete: () => { oldCalls += 1; }, onError: () => { oldCalls += 1; } });
+      });
+    });
+    let compactions = 0;
+    session.compact = async () => {
+      if (++compactions === 1) {
+        await gate;
+        if (outcome === 'error') throw new Error('Old compaction failed');
+        return { summary: 'Old summary', firstKeptEntryId: 'entry', tokensBefore: 100 };
+      }
+      throw new Error('New compaction failed');
+    };
+    await (bridge as any).bindWebExtensions(session, cwd, sessionId, key);
+    const oldRunner = session.extensionRunner;
+    const reloadResources = resourceLoader.reload.bind(resourceLoader);
+    resourceLoader.reload = async () => {
+      reloadPending();
+      await reloadGate;
+      await reloadResources();
+    };
+    const reloading = bridge.reload(cwd, { sessionId }, key);
+    await reloadReady;
+    assert.equal(session.extensionRunner, oldRunner, 'The old runner remains installed during resource loading');
+    assert.throws(() => oldRunner!.createContext().isIdle(), /stale/);
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(oldCalls, 0);
+    releaseReload();
+    await reloading;
+    assert.notEqual(session.extensionRunner, oldRunner);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(newCalls, 1);
+    const errors = events.filter((event) => event.type === 'agent:error');
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].message, 'compact.onError: Reload callback rejected');
+  });
+}
 
 for (const outcome of ['success', 'error', 'cancelled'] as const) {
   test(`background manual compaction ${outcome} clears activity before idle feedback and the next run`, async (t) => {
