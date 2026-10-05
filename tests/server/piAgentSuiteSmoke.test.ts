@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { PiBridge } from '../../src/server/piBridge.js';
@@ -10,7 +11,7 @@ import { PiBridge } from '../../src/server/piBridge.js';
 // Run only with an explicit published package directory. npm test stays offline.
 const suitePath = process.env.PI_WEB_SUITE_PATH;
 
-test('published pi-agent-suite 2.13.5 loads and runs through the RPC bridge', {
+test('published pi-agent-suite 2.13.5 loads and runs through the RPC bridge with Pi 1.0.3', {
   skip: !suitePath && 'Set PI_WEB_SUITE_PATH to the extracted published package directory',
   timeout: 90_000,
 }, async (t) => {
@@ -23,17 +24,25 @@ test('published pi-agent-suite 2.13.5 loads and runs through the RPC bridge', {
     const peer = `@earendil-works/${name}`;
     assert.equal(manifest.peerDependencies[peer], '1.0.2', `Unexpected suite peer requirement: ${peer}`);
     const projectManifestPath = new URL(`../../node_modules/${peer}/package.json`, import.meta.url);
-    assert.equal(JSON.parse(await readFile(projectManifestPath, 'utf8')).version, '1.0.2', `Unexpected project peer: ${peer}`);
+    // Suite still declares 1.0.2 peers. Check runtime compatibility with the newer project SDK explicitly.
+    assert.equal(JSON.parse(await readFile(projectManifestPath, 'utf8')).version, '1.0.3', `Unexpected project peer: ${peer}`);
     assert.equal(await realpath(path.join(packageDir, 'node_modules', peer, 'package.json')),
       await realpath(projectManifestPath), `Suite must use this project's peer: ${peer}`);
   }
   assert.equal(await realpath(path.join(packageDir, 'node_modules', 'typebox')),
     await realpath(new URL('../../node_modules/typebox', import.meta.url)), 'Suite must use this project\'s typebox');
-  const root = await mkdtemp('/tmp/pi-web-suite-smoke-');
   const home = process.env.HOME;
   const agentDir = process.env.PI_CODING_AGENT_DIR;
   const suiteDir = process.env.PI_AGENT_SUITE_DIR;
   const offline = process.env.PI_OFFLINE;
+  const previousPath = process.env.PATH;
+  const projectBin = new URL('../../node_modules/.bin/', import.meta.url);
+  const piManifestUrl = new URL('../../node_modules/@earendil-works/pi-coding-agent/package.json', import.meta.url);
+  const piManifest = JSON.parse(await readFile(piManifestUrl, 'utf8'));
+  assert.equal(await realpath(new URL('pi', projectBin)),
+    await realpath(new URL(piManifest.bin.pi, piManifestUrl)),
+    'Suite children must use this project\'s Pi CLI');
+  const root = await mkdtemp('/tmp/pi-web-suite-smoke-');
   const requests: { url: string | undefined; model: unknown }[] = [];
   const server = createServer(async (request, response) => {
     try {
@@ -71,6 +80,8 @@ test('published pi-agent-suite 2.13.5 loads and runs through the RPC bridge', {
       else process.env.PI_AGENT_SUITE_DIR = suiteDir;
       if (offline === undefined) delete process.env.PI_OFFLINE;
       else process.env.PI_OFFLINE = offline;
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
       for (const [name, value] of childEnv) process.env[name] = value;
       server.closeAllConnections();
       if (server.listening) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -81,6 +92,8 @@ test('published pi-agent-suite 2.13.5 loads and runs through the RPC bridge', {
   process.env.PI_CODING_AGENT_DIR = path.join(root, 'agent');
   process.env.PI_AGENT_SUITE_DIR = path.join(root, 'agent', 'agent-suite');
   process.env.PI_OFFLINE = '1';
+  // The published suite spawns "pi" from PATH. Do not test an unrelated global install.
+  process.env.PATH = `${fileURLToPath(projectBin)}${path.delimiter}${previousPath ?? ''}`;
   server.listen(0, '127.0.0.1');
   await new Promise<void>((resolve, reject) => {
     server.once('listening', resolve);
